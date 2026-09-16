@@ -101,24 +101,40 @@ public static unsafe class TankMitigation
     private const float RawDamageVarianceFraction = 0.05f;
     private static readonly Random rawDamageRng = new();
 
+    // A real party layers Divine Veil, Heart of Light, Addle, Feint, Troubadour and the rest
+    // onto a tankbuster. No bot casts any of them, so a bot tank would meet one with nothing but
+    // its own cooldowns and die to hits a real group survives. This flat fraction stands in for
+    // the lot, folded into the damage rather than faked as a status: a synthetic status id has
+    // no row in the game's Status sheet, so it never reached the native status array the
+    // mitigation math reads, and the 20% silently did nothing.
+    //
+    // TODO: when bots actually cast party mitigation, delete this and let the real statuses
+    // carry it -- leaving both would double-count. The same gap applies to a human tank
+    // practising here, who gets no party mitigation at all and no compensation for it.
+    public const float BotPartyMitigationFraction = 0.20f;
+
     // Checked against the target's current HP, so two close hits stack. Order matches real
     // FFXIV: flat-% mitigation first, then the shield absorbs, then real HP is spent.
     // TankShieldTracker works in fraction-of-max-HP terms, hence the conversion around Consume.
     public static unsafe bool ApplyTankBusterDamage(SimParty party, PartyRole role, float rawDamage, SimEnemy? mitigationSource = null)
     {
-        var bc = party.Get(role)?.BattleCharaPtr;
+        var member = party.Get(role);
+        var bc = member?.BattleCharaPtr;
         if (bc == null) return true;
         var beforeHp = bc->Health;
         var variance = 1f + (float)(rawDamageRng.NextDouble() * 2.0 - 1.0) * RawDamageVarianceFraction;
         var rolledDamage = rawDamage * variance;
         var fraction = SurvivalFraction(party, role, mitigationSource);
+        var botParty = IsBotDriven(party, member!);
+        if (botParty) fraction *= 1f - BotPartyMitigationFraction;
         var afterPercentMitigation = rolledDamage * fraction;
         var absorbedFraction = TankShieldTracker.Consume(role, afterPercentMitigation / bc->MaxHealth);
         var landingHp = afterPercentMitigation - absorbedFraction * bc->MaxHealth;
         var survives = landingHp < beforeHp;
         if (survives) bc->Health -= (uint)landingHp;
         DiagnosticLog.Info(
-            $"[TankMitigation] ApplyTankBusterDamage: {role} baseRawDamage={rawDamage:F0} rolledDamage={rolledDamage:F0} mitigationFraction={fraction:F3} "
+            $"[TankMitigation] ApplyTankBusterDamage: {role} baseRawDamage={rawDamage:F0} rolledDamage={rolledDamage:F0} "
+            + $"survivingFraction={fraction:F3} (own cooldowns{(botParty ? $" x {1f - BotPartyMitigationFraction:F2} stand-in party mitigation" : "")}) "
             + $"shieldAbsorbed={absorbedFraction * bc->MaxHealth:F0}hp landingHp={landingHp:F0} maxHp={bc->MaxHealth} hp {beforeHp}->{(survives ? bc->Health : 0)} "
             + $"survives={survives}");
         return survives;

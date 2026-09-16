@@ -400,15 +400,42 @@ public class MultiplayerWindow : Window, IDisposable
         ImGui.EndPopup();
     }
 
-    private void DrawKickButton(Guid peerId)
+    private void DrawKickButton(Guid peerId) => DrawKickBanButtons(mp, peerId);
+
+    // Both sit a few pixels from Claim, and neither is something to do by accident, so each
+    // asks first. Shared with RunningSimWindow so the wording can't drift.
+    internal static void DrawKickBanButtons(MultiplayerManager mp, Guid peerId)
     {
-        if (ImGui.SmallButton("Kick")) mp.KickPeer(peerId);
+        ImGui.PushID(peerId.ToString());
+        var who = mp.Session.NameOf(peerId);
+
+        if (ImGui.SmallButton("Kick")) ImGui.OpenPopup("##confirmkick");
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip($"Remove {mp.Session.NameOf(peerId)} from the session; mid-fight it ends the run for everyone.");
+            ImGui.SetTooltip($"Remove {who} from the session; mid-fight it ends the run for everyone. Asks first.");
+        if (ImGui.BeginPopup("##confirmkick"))
+        {
+            ImGui.TextUnformatted($"Kick {who}?");
+            ImGui.TextDisabled("They can come back with the session code.");
+            if (ImGui.Button("Kick them")) { mp.KickPeer(peerId); ImGui.CloseCurrentPopup(); }
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel##kick")) ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+
         ImGui.SameLine();
-        if (ImGui.SmallButton("Ban")) mp.BanPeer(peerId);
+        if (ImGui.SmallButton("Ban")) ImGui.OpenPopup("##confirmban");
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip($"Remove {mp.Session.NameOf(peerId)} and keep them out of this session until you unban them (see the banned list below).");
+            ImGui.SetTooltip($"Remove {who} and keep them out of this session until you unban them. Asks first.");
+        if (ImGui.BeginPopup("##confirmban"))
+        {
+            ImGui.TextUnformatted($"Ban {who}?");
+            ImGui.TextDisabled("They stay out until you unban them in the Multiplayer window.");
+            if (ImGui.Button("Ban them")) { mp.BanPeer(peerId); ImGui.CloseCurrentPopup(); }
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel##ban")) ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+        ImGui.PopID();
     }
 
     // A ban lasts the session.

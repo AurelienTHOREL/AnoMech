@@ -81,6 +81,10 @@ public sealed partial class MultiplayerManager : IDisposable
     private const long NoHostFoundTimeoutMs = 4000;
     private float pingTimer;
     private readonly Dictionary<Guid, long> peerLastSeenMs = new();
+
+    // When each peer last registered. A leave that arrives right after one crossed the peer's
+    // own rejoin and must not evict them again -- see the SessionEndedMessage case.
+    private readonly Dictionary<Guid, long> peerLastHelloMs = new();
     private readonly Dictionary<Guid, float> peerLatencyMs = new();
     private readonly HashSet<Guid> warnedStalePeers = new();
     // Host-only: each peer's self-reported mitigation statuses (SelfMitigationMessage); read by
@@ -241,13 +245,16 @@ public sealed partial class MultiplayerManager : IDisposable
 
     public void JoinSession(string relayUrl, string code)
     {
-        LeaveSession();
+        var normalized = code.Trim().ToUpperInvariant();
+        // Rejoining the code we are already on must not announce a leave first: that message
+        // races our own Hello, and a host that reads it second drops us straight back out.
+        LeaveSessionInternal(notifyOthers: SessionCode != normalized);
         ConnectionError = null;
         MyPeerId = Plugin.Config.LocalPeerId;
         IsHost = false;
         RelayUrl = relayUrl;
         relayAccessToken = Plugin.Config.RelayAccessToken;
-        SessionCode = code.Trim().ToUpperInvariant();
+        SessionCode = normalized;
         Session = new MultiplayerSession();
         // Seeded to now, or the host reads as silent since 1970 until its first broadcast.
         lastHostMessageMs = Environment.TickCount64;
@@ -624,6 +631,7 @@ public sealed partial class MultiplayerManager : IDisposable
         // Otherwise a prompt rejoin reads as impersonation until the old connection has gone quiet.
         if (peerConnectionIds.Remove(peerId, out var connection)) connectionLastSeenMs.Remove(connection);
         peerLastSeenMs.Remove(peerId);
+        peerLastHelloMs.Remove(peerId);
         peerLatencyMs.Remove(peerId);
         peerStatuses.Remove(peerId);
         peerMitigationStatusIds.Remove(peerId);
