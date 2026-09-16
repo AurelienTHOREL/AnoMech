@@ -8,53 +8,45 @@ using FFXIVClientStructs.FFXIV.Client.Game.Character;
 
 namespace AnoMech.Scenarios;
 
-// A tankbuster a scenario wants the multiplayer host to be able to pre-plan mitigation for.
-// Id is a stable per-scenario key (e.g. "p3-thunder3-1") the host's plan and AiReplayState
-// messages are keyed on -- not an index that shifts if a cast is reordered. RawDamage is the
-// unmitigated hit size in actual HP, a FIXED number like a real tankbuster -- mitigating it
-// down to something survivable is the tank's job. 0f means "any tank survives," the old behavior.
+// A tankbuster the multiplayer host can pre-plan mitigation for. Id is a stable per-scenario
+// key (e.g. "p3-thunder3-1"), not an index that shifts if a cast is reordered. RawDamage is
+// the unmitigated hit in actual HP, a fixed number like a real tankbuster; 0f = any tank survives.
 public readonly record struct TankBusterCastInfo(string Id, string Label, float RawDamage);
 
-// Shared tankbuster-survival resolution any scenario can call instead of DamageSolver's old
-// pure role gate (any tank survives any hit, no matter what they did).
-//
-// A human's real mitigation press is INTERCEPTED, not observed (LocalPlayerInputHooks.
-// UseActionDetour) -- the real ability is never touched, so there's nothing to reset. In its
-// place, interception applies a synthetic status via AddStatus and fakes the hotbar's
-// cooldown sweep. A bot doppel gets the same AddStatus call from ApplyPlannedMitigationIfBot,
-// so both read identically via ActiveTrackedStatusIds. The one exception: a multiplayer
-// peer's own intercepted press lands on their own client, not the host's puppet copy -- see
-// SelfMitigationMessage for how that crosses the network.
+// Tankbuster-survival resolution. A human's mitigation press is intercepted, not observed
+// (LocalPlayerInputHooks.UseActionDetour): the real ability is never touched, and a synthetic
+// status is applied instead. A bot gets the same AddStatus from ApplyPlannedMitigationIfBot,
+// so both read identically via ActiveTrackedStatusIds. A multiplayer peer's press lands on
+// their own client, not the host's puppet (see SelfMitigationMessage).
 public static unsafe class TankMitigation
 {
-    // Derived from TankMitigationChart -- only entries with a confirmed status id and a
-    // target-side percentage (SourceSide entries like Reprisal debuff the enemy, not the
-    // tank, so ComputeMitigation below can't check them yet). See the chart for sourcing
-    // notes and everything still missing a status id.
+    // Target-side percentages only; SourceSide entries (Reprisal) debuff the enemy instead.
     public static readonly IReadOnlyDictionary<ushort, float> Percent = TankMitigationChart.All
         .Where(a => a.StatusId != 0 && !a.SourceSide && a.Percent is > 0f)
         .ToDictionary(a => a.StatusId, a => a.Percent!.Value);
 
-    // The enemy-side counterpart to Percent -- SourceSide entries like Reprisal debuff the
-    // enemy dealing the hit rather than buffing the tank. Checked separately in
-    // SurvivalFraction against whichever SimEnemy a caller identifies as the source.
+    // Checked against whichever SimEnemy a caller identifies as the hit's source.
     public static readonly IReadOnlyDictionary<ushort, float> SourceSidePercent = TankMitigationChart.All
         .Where(a => a.StatusId != 0 && a.SourceSide && a.Percent is > 0f)
         .ToDictionary(a => a.StatusId, a => a.Percent!.Value);
 
-    // Interception lookup -- an ability needs a known Percent OR an explicit Shield opt-in to
-    // be intercepted; otherwise it's a no-op illusion (real ability blocked, nothing gained),
-    // so it's left alone. Shield covers a no-Percent absorption ability (Divine Veil) that
-    // still needs blocking so it doesn't eat its real cooldown outside the sim's control.
+    // An ability needs a known Percent or an explicit Shield opt-in to be intercepted;
+    // otherwise blocking it would gain nothing.
     public static readonly IReadOnlyDictionary<uint, TankMitigationAbility> ByActionId = TankMitigationChart.All
         .Where(a => a.ActionId != 0 && a.StatusId != 0 && (a.Percent is > 0f || a.Shield))
         .ToDictionary(a => a.ActionId);
 
     public static bool IsInvuln(ushort statusId) => Percent.TryGetValue(statusId, out var pct) && pct >= 1f;
 
-    // Public so callers outside this class (MultiplayerManager's peer self-report, the
-    // interception point, DebugMenu) can read the same real-status list this resolves
-    // mitigation from, without duplicating the native pointer walk.
+    // The only ids a peer's mitigation report may put on the host's characters.
+    private static readonly HashSet<ushort> KnownTargetSideStatusIds = TankMitigationChart.All
+        .Where(a => a.StatusId != 0 && !a.SourceSide)
+        .Select(a => a.StatusId)
+        .ToHashSet();
+
+    public static bool IsKnownTargetSideStatus(ushort statusId) => KnownTargetSideStatusIds.Contains(statusId);
+    public static bool IsKnownSourceSideStatus(ushort statusId) => SourceSidePercent.ContainsKey(statusId);
+
     public static IReadOnlyList<ushort> ActiveTrackedStatusIds(SimCharacter member)
     {
         var bc = member.BattleCharaPtr;
@@ -80,10 +72,8 @@ public static unsafe class TankMitigation
         return fraction;
     }
 
-    // The role-based entry point scenario code should use -- reads real native statuses for a
-    // local player/bot doppel, and the peer's self-reported set for a multiplayer puppet
-    // (whose native StatusManager never sees the owning peer's own press). mitigationSource,
-    // when given, folds in that enemy's own SourceSide debuffs.
+    // A puppet's native StatusManager never sees the owning peer's press, so it reads the
+    // peer's self-reported set instead. mitigationSource folds in that enemy's SourceSide debuffs.
     public static float SurvivalFraction(SimParty party, PartyRole role, SimEnemy? mitigationSource = null)
     {
         var member = party.Get(role);
@@ -96,8 +86,6 @@ public static unsafe class TankMitigation
         return fraction;
     }
 
-    // No invuln case expected among SourceSide debuffs, so this only ever multiplies down --
-    // unlike the target-side SurvivalFraction, nothing here short-circuits to 0f.
     private static float SourceSideFraction(SimEnemy source)
     {
         var bc = source.BattleCharaPtr;
@@ -109,23 +97,13 @@ public static unsafe class TankMitigation
         return fraction;
     }
 
-    // Observed real-game variance on a tankbuster's own unmitigated hit -- +/-5%, uniform.
-    // Applied once per resolved hit in ApplyTankBusterDamage, on top of whatever fixed
-    // rawDamage a scenario declares, the same "roll a real number, don't just use the flat
-    // constant" idea TankHpRegen already applies to its own heal amount.
+    // Observed real-game variance on an unmitigated tankbuster hit: +/-5%, uniform.
     private const float RawDamageVarianceFraction = 0.05f;
     private static readonly Random rawDamageRng = new();
 
-    // rawDamage is the unmitigated hit size, in actual HP -- a FIXED number, like a real
-    // tankbuster, rolled ±5% (RawDamageVarianceFraction). Checked against the target's
-    // CURRENT HP, not a fresh 100%-of-max baseline -- so two close hits genuinely stack, with
-    // TankHpRegen only closing the gap if there's time. 0f damage always survives trivially.
-    //
-    // Order matches real FFXIV: flat-% mitigation reduces the hit first, THEN a shield
-    // absorbs what's left, THEN real HP is spent. TankShieldTracker banks/consumes in
-    // fraction-of-max-HP terms, so the hit is converted to a fraction just for that call and
-    // back to HP immediately after. This is also where the shield is actually spent and
-    // bc->Health actually written (called once per resolved hit, from DamageSolver.CheckLethal).
+    // Checked against the target's current HP, so two close hits stack. Order matches real
+    // FFXIV: flat-% mitigation first, then the shield absorbs, then real HP is spent.
+    // TankShieldTracker works in fraction-of-max-HP terms, hence the conversion around Consume.
     public static unsafe bool ApplyTankBusterDamage(SimParty party, PartyRole role, float rawDamage, SimEnemy? mitigationSource = null)
     {
         var bc = party.Get(role)?.BattleCharaPtr;
@@ -146,16 +124,12 @@ public static unsafe class TankMitigation
         return survives;
     }
 
-    // True for party slots nothing real is pressing buttons for: a plain AI bot doppel, or
-    // the local player's own character while DebugBotControl puppets its movement (that flag
-    // only drives MoveTo/Intercept, never presses). A normal player and a peer's puppet both
-    // have their own intercepted/reported statuses instead (see SurvivalFraction).
+    // Slots nothing real presses buttons for: a bot, or the local player under DebugBotControl
+    // (which drives movement only).
     public static bool IsBotDriven(SimParty party, SimCharacter member)
         => (!ReferenceEquals(member, party.Player) || DebugBotControl.Enabled) && member is not SimNetworkPuppet;
 
-    // Called right before resolving a tankbuster, so a bot-driven target's mitigation
-    // reflects the host's plan for this cast, the same way an intercepted human press
-    // applies its own synthetic status. No-op for a real player or a network puppet.
+    // Right before a tankbuster resolves: a bot-driven target gets the host's planned status.
     public static void ApplyPlannedMitigationIfBot(SimParty party, SimCharacter target, string castId)
     {
         if (!IsBotDriven(party, target)) return;

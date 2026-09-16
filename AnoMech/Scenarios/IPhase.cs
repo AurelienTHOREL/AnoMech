@@ -11,6 +11,9 @@ public interface IPhase
     IZone Zone { get; }
     byte? Weather => null;
     ushort Bgm => 0;
+    // Optional per-frame hold of the zone's environment fog value (ZoneSession.FogHold);
+    // null = let the engine's own weather transition run.
+    float? FogHold => null;
 
     // Optional phase-wide setup, between zone and scenario Run. Default no-op.
     void Run(SimWorld world) { }
@@ -21,12 +24,13 @@ public sealed class Phase : IPhase
 {
     private readonly Action<SimWorld>? init;
 
-    public Phase(IZone zone, string name, byte? weather, ushort bgm, Action<SimWorld>? init = null)
+    public Phase(IZone zone, string name, byte? weather, ushort bgm, Action<SimWorld>? init = null, float? fogHold = null)
     {
         Zone = zone;
         Name = name;
         Weather = weather;
         Bgm = bgm;
+        FogHold = fogHold;
         this.init = init;
     }
 
@@ -34,6 +38,7 @@ public sealed class Phase : IPhase
     public string Name { get; }
     public byte? Weather { get; }
     public ushort Bgm { get; }
+    public float? FogHold { get; }
 
     public void Run(SimWorld world) => init?.Invoke(world);
 }

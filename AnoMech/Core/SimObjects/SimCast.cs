@@ -29,8 +29,13 @@ public sealed unsafe class SimCast : ISimObject
     private float elapsed;
     private float total;
     private float omenDelay;
+    // Retail resolves an NPC action ~0.3s after its bar fills: callers pass the real bar as
+    // castTime and that gap as fireDelay, counted on our own clock since the engine may clear
+    // CastInfo once the bar completes.
     private float fireDelay;
     private float fireDelayElapsed;
+    private float castClock;
+    private bool barComplete;
     private Vector3? targetLocation;   // scenario-local coords
     private GameObjectId? targetId;
     private byte animationVariation;
@@ -38,8 +43,8 @@ public sealed unsafe class SimCast : ISimObject
     private float animationLock;
     private float remainingAnimationLock;
 
-    // Set by NativeCast, consumed by the next NativeActionEffect on this caster -- distinguishes
-    // "this is the resolve of the telegraph I just started" from "no telegraph behind this".
+    // Set by NativeCast, consumed by the next NativeActionEffect on this caster: "the resolve
+    // of the telegraph just started" versus "no telegraph behind this".
     private bool pendingNativeResolve;
 
     public bool IsCasting => parent.BattleCharaPtr != null && parent.BattleCharaPtr->CastInfo.IsCasting;
@@ -47,91 +52,63 @@ public sealed unsafe class SimCast : ISimObject
     public uint ActionId { get; private set; }
     public float Progress => total <= 0f ? 0f : Math.Clamp(elapsed / total, 0f, 1f);
 
-    // Scenario-local ground target for the current cast, if it's ground-targeted --
-    // read by MultiplayerManager's host-side sampler so a peer's replayed Cast()
-    // can pass the same targetLocation instead of defaulting to the caster's own
-    // position (see NativeCast's `position ?? parent.Position` fallback).
+    // Scenario-local ground target, sampled for peers so a replayed Cast() lands in the same spot.
     public Vector3? TargetLocation => targetLocation;
 
-    // The entity target for the current cast, if it's entity-targeted (e.g. UMAD P3's
-    // Thunder III tankbuster, cast with targetId: target?.GameObjectId so the hit
-    // lands on -- and the native hit-react animation plays on -- that specific tank).
-    // A raw GameObjectId isn't portable across the network: host and peer each spawn
-    // their own local party doppels, so the same role's GameObjectId differs between
-    // them. MultiplayerManager's host-side sampler resolves this to a PartyRole or
-    // enemy NetId instead (same approach as TetherState's A/B ends), and a peer
-    // resolves that back to whichever local SimCharacter/SimEnemy actually holds that
-    // role/NetId on its own side before replaying Cast(). Omitting this entirely (as
-    // the original TargetLocation-only fix did) leaves the peer's replayed Cast()
-    // with no entity target at all -- NativeActionEffect's NumTargets goes to 0, and
-    // the animation that plays off whoever got hit never appears on a peer's screen.
+    // Entity target. A raw GameObjectId isn't portable across the network (each client spawns
+    // its own doppels), so MultiplayerManager resolves it to a role/NetId; without an entity
+    // target the hit-react animation never plays on a peer.
     public GameObjectId? TargetId => targetId;
 
-    // The actual cast duration this cast is running with -- whatever Start() resolved
-    // castTime to, whether that was the caller's explicit override or the Lumina sheet
-    // lookup. Read by MultiplayerManager's host-side sampler for the same reason as
-    // TargetLocation above: a peer's replayed Cast() must pass this through explicitly
-    // instead of re-deriving it. Re-deriving isn't just "possibly a different number" --
-    // many of these scenario-scripted casts run on synthetic helper-enemy action IDs
-    // that either aren't in the real Action sheet at all (Start()'s sheet lookup then
-    // fails outright and the peer never casts anything) or whose sheet Cast100ms simply
-    // doesn't match the duration the scenario actually scripted, so the peer's telegraph
-    // runs on borrowed timing that has nothing to do with when the host's damage
-    // actually resolves.
+    // The duration this cast runs with, sampled for peers: many scripted casts use synthetic ids
+    // the Action sheet lacks, or whose Cast100ms doesn't match the script.
     public float Total => total;
 
-    // The omenDelay this cast started with -- read by MultiplayerManager's host-side
-    // sampler for the same reason as TargetLocation/Total above. Left at its 0f default
-    // (peer never passes one through), a cast like UMAD P3's Damning Edict -- which is
-    // scripted with omenDelay: 4.1f so its ground telegraph only appears for the final
-    // ~0.9s of its 5s cast -- would instead show that telegraph for the whole 5s on a
-    // peer's screen, since the native ActorCastPacket controls exactly when the omen
-    // fades in and nothing else about the cast conveys that.
+    // Sampled for peers; the ActorCast packet is the only thing that controls when the omen
+    // fades in.
     public float OmenDelay => omenDelay;
 
-    // Monotonically-incrementing counter bumped every time a real (non-instant)
-    // cast starts -- the telegraphed-cast counterpart to LastInstantCastSeq below.
-    // A peer's replay used to dedupe a telegraphed cast purely off IsCasting's
-    // rising edge (host says casting, my own doppel doesn't think it is), but that
-    // compares two independently-running clocks: the host's real cast timer and
-    // the peer's own replayed one, which starts however many hundred ms of network
-    // latency later and then runs the SAME fixed duration from there. Confirmed via
-    // AnoMech-DamageDebug dumps (UMAD P3's Look upon Me and Despair): the peer's own
-    // replay timer ran out slightly after the host's real one already had, and the
-    // next snapshot -- still reporting the host's now-stale IsCasting=true from
-    // just before it too finished -- read as a fresh rising edge and replayed the
-    // exact same cast a second time, 5.000s after the first (the cast's own
-    // duration to the millisecond). CastSeq sidesteps the whole comparison: a peer
-    // dedupes on this value actually changing instead of on two clocks agreeing.
+    // Bumped per telegraphed cast. A peer dedupes on this changing rather than on IsCasting's
+    // rising edge, which compared two independent clocks and replayed a cast twice.
     public int CastSeq { get; private set; }
 
-    // Instant casts (castTimeValue <= 0, see Start() below) fire and reset ActionId/
-    // TargetLocation back to their empty state within the same tick they ran in --
-    // CastInfo.IsCasting (what IsCasting reads) never goes true for them either, since
-    // NativeCast is skipped entirely for instants. That makes them structurally
-    // invisible to a level-sampled snapshot: MultiplayerManager's peer replay is a
-    // rising-edge check on IsCasting, and there is no edge to catch, and even if there
-    // were, ActionId/TargetLocation would already be cleared by the time the next
-    // snapshot samples them. LastInstantCast* mirrors AnimationTimelineId/LastLockonVfxId's
-    // own answer to this same shape of problem: a monotonically-incrementing counter the
-    // peer can edge-trigger on instead of a level value, paired with a snapshot of what
-    // that particular instant cast actually was (taken here, before ResetCastState wipes
-    // it) so the peer has something to replay. Confirmed via AnoMech-DamageDebug dumps:
-    // Nothingness (an instant cast) never appears anywhere in a peer's own diagnostic
-    // log, not even with wrong timing -- it just never ran there at all.
+    // An instant cast never sets IsCasting and clears ActionId within the tick, so a
+    // level-sampled snapshot can't see it; the counter plus a snapshot of what it was is what
+    // a peer replays.
     public int LastInstantCastSeq { get; private set; }
     public uint LastInstantCastActionId { get; private set; }
     public Vector3? LastInstantCastTargetLocation { get; private set; }
     public GameObjectId? LastInstantCastTargetId { get; private set; }
+    // A bare NativeActionEffect (no Cast around it) is replayed by a peer field for field: a
+    // Cast() would re-face the caster at the target position and use its own lock.
+    public bool LastInstantCastIsNativeEffect { get; private set; }
+    public float LastInstantCastAnimationLock { get; private set; } = 0.6f;
+    public GameObjectId? LastInstantCastActionTargetId { get; private set; }
+    // Set instead when the resolve was delivered as a captured raw packet, so a peer delivers
+    // its own copy the same way (see Core.Native.RawActionEffect).
+    public string? LastInstantCastRawPacket { get; private set; }
 
-    // True while the cast bar is up or the release animation is still playing. A
-    // following boss roots itself while busy so the action animation finishes in
-    // place instead of sliding.
-    public bool IsBusy => IsCasting || remainingAnimationLock > 0f;
+    // Records a raw-packet delivery the caller performed: the packet bypasses this class
+    // entirely, so nothing else would mark the caster as having just acted.
+    public void NoteRawActionEffect(uint actionId, string captureName, float animationLock)
+    {
+        LastInstantCastActionId = actionId;
+        LastInstantCastTargetLocation = null;
+        LastInstantCastTargetId = null;
+        LastInstantCastActionTargetId = null;
+        LastInstantCastIsNativeEffect = true;
+        LastInstantCastAnimationLock = animationLock;
+        LastInstantCastRawPacket = captureName;
+        LastInstantCastSeq++;
+        remainingAnimationLock = animationLock;
+    }
 
-    // SimCast is a persistent subsystem of its caster: the owning SimEnemy holds it
-    // as a direct field and ticks/despawns it explicitly, never reaping it by
-    // liveness. Always active while it exists.
+    // True while the cast bar is up (or a delayed fire is still pending) or the release
+    // animation is still playing. A following boss roots itself while busy so the action
+    // animation finishes in place instead of sliding.
+    public bool IsBusy => IsCasting || casting || remainingAnimationLock > 0f;
+
+    // Owned and ticked by its SimEnemy, never reaped by liveness.
     public bool IsActive => true;
 
     internal SimCast(SimCharacter parent, Coordinates coordinates)
@@ -170,12 +147,9 @@ public sealed unsafe class SimCast : ISimObject
         var castTimeValue = castTime.Value;
 
 
-        // Instant actions (castTimeValue <= 0): retail sends only the ActionEffect, never a
-        // StartCasting packet (verified against the Dancing Mad replay — 0 cast packets for the
-        // auto-attack 0xC252). Dispatching a cast-begin (HandleActorCastPacket) on the same frame
-        // as the release clobbers the action's body animation — invisible on VFX/cast abilities,
-        // but it's the whole show for a VFX-less auto-attack, so the boss never swings. Skip the
-        // cast packet entirely for instants and fire the effect directly below.
+        // Instant actions get only the ActionEffect (retail sends no cast packet for them):
+        // a cast-begin on the same frame clobbers the body animation, which is the whole show
+        // for a VFX-less auto-attack.
         if (castTimeValue > 0)
         {
             var target = targetId ?? chara->GetGameObjectId();
@@ -189,6 +163,8 @@ public sealed unsafe class SimCast : ISimObject
         }
 
         elapsed = 0f;
+        castClock = 0f;
+        barComplete = false;
 
         casting = true;
         targetLocation = localTargetLocation;
@@ -197,6 +173,7 @@ public sealed unsafe class SimCast : ISimObject
         ActionId = actionId;
         this.omenDelay = omenDelay;
         this.fireDelay = fireDelay ?? 0;
+        fireDelayElapsed = 0f;
 
         if (castTimeValue <= 0)
         {
@@ -205,6 +182,10 @@ public sealed unsafe class SimCast : ISimObject
             LastInstantCastActionId = actionId;
             LastInstantCastTargetLocation = targetLocation;
             LastInstantCastTargetId = targetId;
+            LastInstantCastActionTargetId = targetId;
+            LastInstantCastIsNativeEffect = false;
+            LastInstantCastAnimationLock = animationLock;
+            LastInstantCastRawPacket = null;
             LastInstantCastSeq++;
             ResetCastState();
         }
@@ -247,11 +228,9 @@ public sealed unsafe class SimCast : ISimObject
 
         PacketDispatcherPointers.HandleActorCastPacket(parent.GameObjectId.ObjectId, &actorCastPacket);
 
-        // A caller going through NativeCast directly gets none of Start()'s bookkeeping --
-        // CastSeq never bumps, so a peer's edge-triggered replay never sees this cast.
-        // `casting` stays false deliberately: the caller schedules its own separate
-        // NativeActionEffect for the resolve (see pendingNativeResolve below), so Tick()'s
-        // auto-resolve must stay off or the host fires the release twice.
+        // The bookkeeping Start() would do. `casting` stays false: the caller schedules its own
+        // NativeActionEffect for the resolve (pendingNativeResolve), or Tick would fire the
+        // release twice.
         ActionId = actionId;
         total = castTime;
         this.omenDelay = omenDelay;
@@ -313,22 +292,27 @@ public sealed unsafe class SimCast : ISimObject
 
         remainingAnimationLock = animationLock;
 
-        // Pending flag set: this is the resolve of the telegraph just started -- CastSeq
-        // already covers replaying it, so skip LastInstantCastSeq. Not set: no telegraph
-        // behind this (e.g. a standalone effect like Viscous Aetheroplasm) -- give it the
-        // same bookkeeping Start()'s instant branch (castTime <= 0) gives a real Cast() call.
+        // The resolve of a telegraph just started is already covered by CastSeq; a standalone
+        // effect gets the instant-cast bookkeeping instead. FireActionEffect's own call is
+        // recorded by Start/Tick as a Cast, so `firingCast` keeps it out of here.
         if (pendingNativeResolve)
         {
             pendingNativeResolve = false;
         }
-        else
+        else if (!firingCast)
         {
             LastInstantCastActionId = actionId;
             LastInstantCastTargetLocation = position;
             LastInstantCastTargetId = animationTargetId ?? actionTargetId;
+            LastInstantCastActionTargetId = actionTargetId;
+            LastInstantCastIsNativeEffect = true;
+            LastInstantCastAnimationLock = animationLock;
+            LastInstantCastRawPacket = null;
             LastInstantCastSeq++;
         }
     }
+
+    private bool firingCast;
 
     public void Tick(float deltaSeconds)
     {
@@ -351,28 +335,22 @@ public sealed unsafe class SimCast : ISimObject
 
         var castInfo = chara->CastInfo;
         elapsed = castInfo.CurrentCastTime;
+        castClock += deltaSeconds;
 
-        if (elapsed >= total)
+        // With a fire delay our own clock also counts as completion: the engine may clear
+        // CastInfo once the bar fills.
+        if (elapsed >= total || (fireDelay > 0f && castClock >= total)) barComplete = true;
+        if (!barComplete) return;
+
+        if (fireDelay > 0f)
         {
-            var fire = true;
-
-            if (fireDelay > 0)
-            {
-                fireDelayElapsed += deltaSeconds;
-
-                if (fireDelayElapsed < fireDelay)
-                {
-                    fire = false;
-                }
-            }
-
-            if (fire)
-            {
-                FaceTarget(chara);
-                FireActionEffect(chara, ActionId, ActionType.Action, animationLock, targetLocation, targetId, animationVariation);
-                ResetCastState();
-            }
+            fireDelayElapsed += deltaSeconds;
+            if (fireDelayElapsed < fireDelay) return;
         }
+
+        FaceTarget(chara);
+        FireActionEffect(chara, ActionId, ActionType.Action, animationLock, targetLocation, targetId, animationVariation);
+        ResetCastState();
     }
 
     // Teardown for caster despawn: drop the telegraph, stop any pending delayed
@@ -402,6 +380,8 @@ public sealed unsafe class SimCast : ISimObject
         ActionId = 0;
         fireDelay = 0;
         fireDelayElapsed = 0;
+        castClock = 0f;
+        barComplete = false;
     }
 
     // targetLocation is stored scenario-local; lift to world only for native
@@ -444,6 +424,14 @@ public sealed unsafe class SimCast : ISimObject
         }
 
         var pos = localTargetLocation ?? parent.Position;
-        NativeActionEffect(actionId, animationLock, (ushort)actionId, animationVariation, actionType, 0, chara->Rotation, pos, deliverTo, deliverTo);
+        firingCast = true;
+        try
+        {
+            NativeActionEffect(actionId, animationLock, (ushort)actionId, animationVariation, actionType, 0, chara->Rotation, pos, deliverTo, deliverTo);
+        }
+        finally
+        {
+            firingCast = false;
+        }
     }
 }

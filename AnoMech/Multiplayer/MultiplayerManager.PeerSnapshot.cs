@@ -11,9 +11,13 @@ using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Geometry;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
+using AnoMech.Core.Native;
 using AnoMech.Core.SimObjects;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
+using AnoMech.Scenarios.Umad;
 using AnoMech.Scenarios.Umad.P3BlackHole;
 using static AnoMech.Scenarios.Umad.UmadConstants;
 
@@ -23,8 +27,7 @@ public sealed partial class MultiplayerManager
 {
     // ---- Peer: reporting our own pose --------------------------------------
 
-    // Same backpressure gating as SampleAndBroadcastSnapshot -- a peer's own upload
-    // can be just as bad as the host's connection.
+    // Backpressure-gated like SampleAndBroadcastSnapshot.
     private Task? pendingSelfPoseSend;
 
     private void SendSelfPose()
@@ -35,11 +38,8 @@ public sealed partial class MultiplayerManager
         pendingSelfPoseSend = relay!.SendAsync(new SelfPoseMessage(MyPeerId, player.Position.X, player.Position.Y, player.Position.Z, player.Rotation));
     }
 
-    // Peer -> host, event-driven (only on change, not every tick) -- how the host's
-    // DamageSolver learns about a peer's own real Rampart/invuln press. Reads the real native
-    // StatusManager (TankMitigation.ActiveTrackedStatusIds), not ActiveStatusSnapshot, since a
-    // real button press never populates that internal list. Shield fraction comes from
-    // TankShieldTracker (Self-scope grants already applied locally) and just needs reporting too.
+    // Reads the native StatusManager (ActiveTrackedStatusIds), not ActiveStatusSnapshot: a real
+    // button press never populates the latter.
     private HashSet<ushort> lastSentMitigationStatusIds = new();
     private float lastSentShieldFraction;
 
@@ -57,8 +57,6 @@ public sealed partial class MultiplayerManager
         _ = relay!.SendAsync(new SelfMitigationMessage(MyPeerId, current.ToList(), shieldFraction));
     }
 
-    // Peer-only: reports enemies a SourceSide mitigation (Reprisal) was just applied to
-    // locally. No-op on the host (already authoritative) or when not connected.
     public void ReportAppliedEnemyStatus(IReadOnlyList<SimEnemy> enemies, ushort statusId, float duration)
     {
         if (IsHost || relay is not { IsConnected: true } || enemies.Count == 0) return;
@@ -68,8 +66,6 @@ public sealed partial class MultiplayerManager
         _ = relay.SendAsync(new PeerAppliedEnemyStatusMessage(MyPeerId, netIds, statusId, duration));
     }
 
-    // Peer-only: the Party/Ally-scope counterpart to ReportAppliedEnemyStatus above -- see
-    // PeerAppliedRoleStatusMessage's own doc comment. No-op on the host or when not connected.
     public void ReportAppliedRoleStatus(IReadOnlyList<PartyRole> roles, ushort statusId, float duration, float shieldFraction = 0f)
     {
         if (IsHost || relay is not { IsConnected: true } || roles.Count == 0) return;
@@ -88,8 +84,9 @@ public sealed partial class MultiplayerManager
             DiagnosticLog.Debug($"[Multiplayer] SelfPose from {msg.PeerId} but they hold no claimed role -- dropping.");
             return;
         }
+        if (!NetGuard.TryPosition(msg.X, msg.Y, msg.Z, out var pose)) return;
         if (Plugin.GameInstance.World.Party.Get(role) is SimNetworkPuppet puppet)
-            puppet.ApplyNetworkPose(new Vector3(msg.X, msg.Y, msg.Z), msg.Rotation);
+            puppet.ApplyNetworkPose(pose, NetGuard.Rotation(msg.Rotation));
         else
             DiagnosticLog.Debug($"[Multiplayer] SelfPose from {Session.NameOf(msg.PeerId)} ({role}) but that slot isn't a SimNetworkPuppet -- dropping.");
     }
@@ -98,26 +95,47 @@ public sealed partial class MultiplayerManager
 
     private void OnWorldSnapshotReceived(WorldSnapshotMessage snap)
     {
-        if (IsHost) return;
-        // Gated like TryStartDebugBotReplay: RunScenarioAsPeer's zone entry is deferred, so a
-        // snapshot arriving first would spawn enemies that the zone load moments later then
-        // tears down -- while peerEnemies still marks those NetIds "already spawned,"
-        // permanently losing them for the run (confirmed via a DamageDebug dump). Dropping
-        // pre-load snapshots costs nothing; the next one after entry spawns fresh.
-        if (!peerEnteredInstance) return;
+        // Before the zone entry, spawned enemies would be torn down by the load while
+        // peerEnemies still tracked them.
+        if (!PeerInRun) return;
         var world = Plugin.GameInstance.World;
 
         var seenEnemyIds = new HashSet<int>();
-        foreach (var e in snap.Enemies)
+        foreach (var e in NetGuard.Cap(snap.Enemies, NetGuard.MaxEnemiesPerSnapshot))
         {
+            if (!NetGuard.TryPosition(e.X, e.Y, e.Z, out var netPosition))
+            {
+                DiagnosticLog.Warn($"[Multiplayer] Peer: enemy NetId {e.NetId} sent an out-of-range position -- dropping.");
+                continue;
+            }
+            var placement = new Placement(netPosition, NetGuard.Rotation(e.Rotation));
+            if (!SimAssets.Allow(SimAssetKind.BNpcBase, e.BNpcBaseId, $"enemy NetId {e.NetId}")) continue;
             seenEnemyIds.Add(e.NetId);
             if (!peerEnemies.TryGetValue(e.NetId, out var enemy))
             {
+                // The template is resolved by name from this build's own captures, never from
+                // wire bytes; the plain doppel is the fallback either way.
+                byte[]? template = null;
+                var enableDraw = false;
+                if (e.NpcSpawnTemplate is { } templateName && !peerEnemyTemplateFailed.Contains(e.NetId))
+                {
+                    if (UmadRealPackets.NpcSpawnTemplates.TryGetValue(templateName, out var bytes))
+                    {
+                        template = bytes;
+                        enableDraw = e.PacketSpawnEnableDraw;
+                    }
+                    else
+                        DiagnosticLog.Warn($"[Multiplayer] Peer: enemy NetId {e.NetId} names unknown spawn template '{NetGuard.Clean(templateName)}' -- spawning the plain doppel.");
+                }
+                // ModelCharaId is always 0 (derived from the BNpcBase row): no scenario sets it,
+                // so on the wire it could only swap in a foreign model.
                 var config = new EnemySpawnConfig(
-                    e.BNpcBaseId, e.NameId, e.Level, e.Targetable, e.EnemyList, e.Visible,
-                    new Placement(new Vector3(e.X, e.Y, e.Z), e.Rotation),
-                    e.ModelCharaId, e.Scale, e.HitboxRadius, e.InitialModeAttributeFlags);
-                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of enemy NetId {e.NetId} -- BNpcBase {e.BNpcBaseId}, pos ({e.X:F2},{e.Y:F2},{e.Z:F2}), rot {e.Rotation:F2}, visible {e.Visible} -- spawning local doppel.");
+                    e.BNpcBaseId, e.NameId, e.Level, e.Targetable, Enum.IsDefined(e.EnemyList) ? e.EnemyList : EnemyListMode.Never, e.Visible,
+                    placement,
+                    ModelCharaId: 0, NetGuard.Clamp(e.Scale, 0f, 100f), NetGuard.Clamp(e.HitboxRadius, 0f, 100f),
+                    e.InitialModeAttributeFlags,
+                    NpcSpawnTemplate: template, PacketSpawnEnableDraw: enableDraw);
+                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of enemy NetId {e.NetId} -- BNpcBase {e.BNpcBaseId}, pos ({e.X:F2},{e.Y:F2},{e.Z:F2}), rot {e.Rotation:F2}, visible {e.Visible}{(template != null ? $", template {e.NpcSpawnTemplate}" : "")} -- spawning local doppel.");
                 enemy = world.SpawnEnemy(config);
                 if (enemy == null)
                 {
@@ -126,123 +144,130 @@ public sealed partial class MultiplayerManager
                 }
                 peerEnemies[e.NetId] = enemy;
             }
-            // Smoothed in Tick (SimEnemy.ApplyNetworkPosition/TickNetworkPosition), not
-            // teleported here -- a hard SetPosition every snapshot made movement stutter.
-            enemy.ApplyNetworkPosition(new Vector3(e.X, e.Y, e.Z), e.Rotation);
+            // The engine dropped the real-packet spawn: the next snapshot recreates it as a plain doppel.
+            if (enemy.PacketSpawnFailed)
+            {
+                DiagnosticLog.Warn($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) packet spawn failed locally -- falling back to the plain doppel.");
+                peerEnemyTemplateFailed.Add(e.NetId);
+                enemy.Despawn();
+                ForgetPeerEnemy(e.NetId);
+                continue;
+            }
+            // Interpolated in Tick; a hard SetPosition every snapshot stutters.
+            enemy.ApplyNetworkPosition(placement.Position, placement.Rotation);
             enemy.SetVisible(e.Visible);
-            // Reconciled every snapshot like SetVisible, not edge-triggered like SetModelState
-            // -- without this only the spawn-time config's Targetable value ever reached a
-            // peer, and a later host-side SetTargetable toggle mid-mechanic never applied.
             enemy.SetTargetable(e.Targetable);
-            // Re-issued only on change -- SetModelState's native rebuild flickers the model.
+            // Nothing below lands on an actor the engine hasn't created yet; leaving the seqs
+            // unrecorded makes the next snapshot retry.
+            if (enemy.PacketSpawnPending) continue;
+            // Only on change: SetModelState rebuilds the model.
             if (!peerEnemyModelState.TryGetValue(e.NetId, out var lastModelState) || lastModelState != e.ModelState)
             {
                 peerEnemyModelState[e.NetId] = e.ModelState;
                 DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) ModelState -> 0x{e.ModelState:X2}.");
                 enemy.SetModelState(e.ModelState);
             }
-            // Reconciled every snapshot -- AddStatus/RemoveStatus are cheap direct writes
-            // (unlike ModelState), so only the log line below is edge-triggered.
             var currentStatuses = enemy.ActiveStatusSnapshot;
-            foreach (var target in e.Statuses)
+            var enemyStatuses = NetGuard.Cap(e.Statuses, NetGuard.MaxStatusesPerEntity);
+            foreach (var target in enemyStatuses)
             {
                 if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
-                enemy.AddStatus(target.StatusId, duration: target.RemainingTime, stacks: target.Stacks, overrideStacks: true);
+                enemy.AddStatus(target.StatusId, duration: NetGuard.Clamp(target.RemainingTime, -1f, 3600f), stacks: target.Stacks, overrideStacks: true);
             }
             foreach (var current in currentStatuses)
             {
-                if (e.Statuses.Any(s => s.StatusId == current.StatusId)) continue;
+                if (enemyStatuses.Any(s => s.StatusId == current.StatusId)) continue;
                 enemy.RemoveStatus(current.StatusId);
             }
             if (!peerEnemyLastLoggedStatuses.TryGetValue(e.NetId, out var lastStatuses))
                 peerEnemyLastLoggedStatuses[e.NetId] = lastStatuses = new Dictionary<ushort, ushort>();
             LogStatusChanges($"Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId})",
-                e.Statuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
-            // Rising-edge trigger, replayed through the real SimCast pipeline (cast bar +
-            // omen VFX). targetLocation, castSeconds, and omenDelay are all threaded through
-            // explicitly -- leaving any of them at their defaults desyncs the telegraph from
-            // what the host actually scripted (wrong ground spot, wrong duration/timing, or
-            // wrong delay before the omen appears). targetId is resolved via ResolvePeerEnd
-            // since a raw GameObjectId can't cross the network -- without it, entity-targeted
-            // casts show no hit-react at all. Dedupes off CastSeq changing, not IsCasting's
-            // rising edge (see EnemyState.CastSeq), and guarded on seq > 0 so a peer that just
-            // connected doesn't replay the zero-value default.
+                enemyStatuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
+            // Replayed through the real SimCast pipeline so the cast bar and omen match. Keyed
+            // on CastSeq (see EnemyState); seq 0 is the never-cast default.
             if (e.CastSeq > 0
                 && (!peerEnemyLastCastSeq.TryGetValue(e.NetId, out var lastCastSeq) || lastCastSeq != e.CastSeq))
             {
                 peerEnemyLastCastSeq[e.NetId] = e.CastSeq;
-                // Cast()'s telegraph reads Position/Rotation directly, but
-                // ApplyNetworkPosition above only set an interpolation target that catches
-                // up gradually -- snap to the authoritative pose first so a boss that
-                // repositions and casts in the same host tick telegraphs correctly.
-                enemy.SetPosition(new Placement(new Vector3(e.X, e.Y, e.Z), e.Rotation));
-                var targetLocation = e.CastTargetX is { } tx && e.CastTargetY is { } ty && e.CastTargetZ is { } tz
-                    ? new Vector3(tx, ty, tz)
-                    : (Vector3?)null;
+                // Snap first: Cast() reads Position/Rotation directly, and ApplyNetworkPosition
+                // above only set an interpolation target.
+                enemy.SetPosition(placement);
+                var targetLocation = NetGuard.TryPosition(e.CastTargetX, e.CastTargetY, e.CastTargetZ);
                 var targetId = ResolvePeerEnd(world, e.CastTargetEnemyNetId, e.CastTargetRole)?.GameObjectId;
-                enemy.Cast(e.CastActionId, targetLocation: targetLocation, castSeconds: e.CastSeconds, omenDelay: e.CastOmenDelay, targetId: targetId);
+                if (SimAssets.Allow(SimAssetKind.Action, e.CastActionId, $"enemy NetId {e.NetId} cast"))
+                    enemy.Cast(e.CastActionId, targetLocation: targetLocation,
+                        castSeconds: NetGuard.Clamp(e.CastSeconds, 0f, 600f),
+                        omenDelay: NetGuard.Clamp(e.CastOmenDelay, 0f, 60f), targetId: targetId);
             }
-            // An instant cast never makes IsCasting go true (see SimCast.LastInstantCastSeq),
-            // so this monotonic counter is the only signal one happened. Guarded on seq > 0
-            // so a fresh connect doesn't replay the zero-value default.
             if (e.LastInstantCastSeq > 0
                 && (!peerEnemyLastInstantCastSeq.TryGetValue(e.NetId, out var lastInstantSeq) || lastInstantSeq != e.LastInstantCastSeq))
             {
                 peerEnemyLastInstantCastSeq[e.NetId] = e.LastInstantCastSeq;
-                // Same stale-pose race as the CastSeq branch above -- observed with UMAD P3's
-                // Black Hole (Face(tether) then instant Cast(Nothingness)): without snapping
-                // first, the line AOE fired along the doppel's old facing.
-                enemy.SetPosition(new Placement(new Vector3(e.X, e.Y, e.Z), e.Rotation));
-                var instantTargetLocation = e.LastInstantCastTargetX is { } itx && e.LastInstantCastTargetY is { } ity && e.LastInstantCastTargetZ is { } itz
-                    ? new Vector3(itx, ity, itz)
-                    : (Vector3?)null;
+                enemy.SetPosition(placement); // same snap as above
+                var instantTargetLocation = NetGuard.TryPosition(e.LastInstantCastTargetX, e.LastInstantCastTargetY, e.LastInstantCastTargetZ);
                 var instantTargetId = ResolvePeerEnd(world, e.LastInstantCastTargetEnemyNetId, e.LastInstantCastTargetRole)?.GameObjectId;
-                enemy.Cast(e.LastInstantCastActionId, targetLocation: instantTargetLocation, castSeconds: 0f, targetId: instantTargetId);
+                var instantLock = NetGuard.Clamp(e.LastInstantCastAnimationLock, 0f, 60f, 0.6f);
+                if (SimAssets.Allow(SimAssetKind.Action, e.LastInstantCastActionId, $"enemy NetId {e.NetId} instant cast"))
+                {
+                    // A raw delivery replays our own copy of the capture, patched onto the local
+                    // carrier; a version or actor mismatch falls through to the native effect.
+                    var rawName = NetGuard.Clean(e.LastInstantCastRawPacket);
+                    var rawDelivered = rawName.Length > 0
+                        && UmadRealPackets.RawActionEffects.TryGetValue(rawName, out var capture)
+                        && RawActionEffect.TryInject(world, enemy, capture.Body, capture.Opcode, capture.GameVersion,
+                            $"{rawName} replay, enemy NetId {e.NetId}");
+                    if (rawDelivered)
+                        DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} delivered {rawName} as a raw packet.");
+                    else if (e.LastInstantCastIsNativeEffect)
+                    {
+                        // Field for field, as the host fired it: a Cast() would re-face the caster
+                        // at the target position (world zero for Flood's waves) and use its own lock.
+                        var instantActionTargetId = ResolvePeerEnd(world, e.LastInstantCastActionTargetEnemyNetId, e.LastInstantCastActionTargetRole)?.GameObjectId;
+                        enemy.NativeActionEffect(e.LastInstantCastActionId, instantLock, (ushort)e.LastInstantCastActionId, 0, ActionType.Action, 0,
+                            position: instantTargetLocation, animationTargetId: instantTargetId, actionTargetId: instantActionTargetId);
+                    }
+                    else
+                        enemy.Cast(e.LastInstantCastActionId, targetLocation: instantTargetLocation, castSeconds: 0f, targetId: instantTargetId, animationLock: instantLock);
+                }
             }
-            // Edge-triggered like ModelState. Dedupes off AnimationTimelineSeq, not
-            // AnimationTimelineId's value -- a reused enemy (P2 Forsaken's clone) replays the
-            // same id, which the id-only comparison couldn't tell from "unchanged."
+            ApplyNewVfx(enemy, e.NewVfx, $"enemy NetId {e.NetId}");
+            ReconcilePersistentVfx(enemy, e.PersistentVfx, $"enemy NetId {e.NetId}");
+            ApplyEngineState(enemy, e.NetId, e.Engine);
+            // Keyed on the seq, not the id: a reused enemy replays the same timeline id.
             if (e.AnimationTimelineId is { } timelineId
                 && (!peerEnemyAnimationTimeline.TryGetValue(e.NetId, out var lastSeq) || lastSeq != e.AnimationTimelineSeq))
             {
                 peerEnemyAnimationTimeline[e.NetId] = e.AnimationTimelineSeq;
                 DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4} (seq {e.AnimationTimelineSeq}).");
-                enemy.PlayAnimationTimeline(timelineId);
+                if (SimAssets.Allow(SimAssetKind.Timeline, timelineId, $"enemy NetId {e.NetId} timeline"))
+                    enemy.PlayAnimationTimeline(timelineId);
             }
             if (e.NewLockonVfxIds.Count > 0)
             {
                 DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) NewLockonVfxIds -> [{string.Join(",", e.NewLockonVfxIds)}].");
-                foreach (var lockonId in e.NewLockonVfxIds)
-                    enemy.AttachLockonVfx(lockonId, persistent: false);
+                foreach (var lockonId in NetGuard.Cap(e.NewLockonVfxIds, NetGuard.MaxLockonVfxPerEntity))
+                    if (SimAssets.Allow(SimAssetKind.Lockon, lockonId, $"enemy NetId {e.NetId} lockon"))
+                        enemy.AttachLockonVfx(lockonId, persistent: false);
             }
-            // Edge-triggered like AnimationTimelineId above -- see SimEnemy.AnimationState's own
-            // doc comment for why this needs its own replication path at all.
             if (e.AnimationStateArg2 is { } arg2 && e.AnimationStateArg3 is { } arg3
                 && (!peerEnemyAnimationState.TryGetValue(e.NetId, out var lastStateSeq) || lastStateSeq != e.AnimationStateSeq))
             {
                 peerEnemyAnimationState[e.NetId] = e.AnimationStateSeq;
                 DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) AnimationState -> ({arg2},{arg3}) (seq {e.AnimationStateSeq}).");
-                enemy.SetAnimationState(arg2, arg3);
+                if (arg2 is >= 0 and <= NetGuard.MaxAnimationStateArg && arg3 is >= 0 and <= NetGuard.MaxAnimationStateArg)
+                    enemy.SetAnimationState(arg2, arg3);
             }
         }
         foreach (var staleId in peerEnemies.Keys.Where(id => !seenEnemyIds.Contains(id)).ToList())
         {
             DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {staleId} no longer in snapshot -- despawning local doppel.");
             peerEnemies[staleId].Despawn();
-            peerEnemies.Remove(staleId);
-            peerEnemyModelState.Remove(staleId);
-            peerEnemyLastLoggedStatuses.Remove(staleId);
-            peerEnemyAnimationTimeline.Remove(staleId);
-            peerEnemyAnimationState.Remove(staleId);
-            peerEnemyLastInstantCastSeq.Remove(staleId);
-            peerEnemyLastCastSeq.Remove(staleId);
+            ForgetPeerEnemy(staleId);
+            peerEnemyTemplateFailed.Remove(staleId);
         }
 
-        // UMAD P3 only (harmless no-op elsewhere). A peer never runs Run_BlackHoleObstacles,
-        // so without this a debug-bot peer's MoveTo has no avoidance data and can cut through
-        // a black hole -- rebuilt from peerEnemies so it can't drift from the host. Deliberately
-        // unconditional (unlike RefreshLiveHandles below), matching this block's
-        // pre-IMultiplayerReplayable behavior.
+        // UMAD P3 black holes: a peer never runs the scenario's obstacle setup, so a debug-bot
+        // peer's MoveTo would cut straight through one.
         world.Obstacles.Clear();
         var localPlayer = Plugin.GameInstance.World.Party.Player;
         foreach (var (netId, bh) in peerEnemies.Where(kvp => kvp.Value.BNpcBaseId == BNpcBaseId.BlackHole))
@@ -255,21 +280,22 @@ public sealed partial class MultiplayerManager
                     $"[Multiplayer] Peer: local position ({localPlayer.Position.X:F2},{localPlayer.Position.Z:F2}) is {MathF.Sqrt(distSq):F2}y from black hole NetId {netId} at ({bh.Position.X:F2},{bh.Position.Z:F2}).");
         }
 
-        // See IMultiplayerReplayable.RefreshLiveHandles.
-        if (debugShadowStateGeneric != null
-            && Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is IMultiplayerReplayable replayable)
-            replayable.RefreshLiveHandles(debugShadowStateGeneric, peerEnemies);
+        if (TryResolveScenario() is IMultiplayerReplayable replayable)
+        {
+            replayable.RebuildPeerObstacles(world.Obstacles, peerEnemies, peerEventObjects, localPlayer);
+            if (debugShadowStateGeneric != null)
+                replayable.RefreshLiveHandles(debugShadowStateGeneric, peerEnemies);
+        }
 
         var seenTetherIds = new HashSet<int>();
-        foreach (var t in snap.Tethers)
+        foreach (var t in NetGuard.Cap(snap.Tethers, NetGuard.MaxTethersPerSnapshot))
         {
+            if (!SimAssets.Allow(SimAssetKind.Tether, t.TetherId, $"tether NetId {t.NetId}")) continue;
             seenTetherIds.Add(t.NetId);
             var a = ResolvePeerEnd(world, t.AEnemyNetId, t.ARole);
             var b = ResolvePeerEnd(world, t.BEnemyNetId, t.BRole);
             if (a == null && b == null) continue;
-            // Re-create on any endpoint change -- SimTether's endpoints are fixed at
-            // construction, so there's no in-place update (e.g. a grabby tether's B going
-            // from unattached to a role once grabbed).
+            // SimTether's endpoints are fixed at construction, so an endpoint change re-creates it.
             var aDesc = t.AEnemyNetId is { } aId ? $"enemy#{aId}" : t.ARole?.ToString() ?? "null";
             var bDesc = t.BEnemyNetId is { } bId ? $"enemy#{bId}" : t.BRole?.ToString() ?? "null";
             if (peerTethers.TryGetValue(t.NetId, out var existing))
@@ -292,18 +318,33 @@ public sealed partial class MultiplayerManager
         }
 
         var seenEventObjectIds = new HashSet<int>();
-        foreach (var o in snap.EventObjects)
+        foreach (var o in NetGuard.Cap(snap.EventObjects, NetGuard.MaxEventObjectsPerSnapshot))
         {
+            if (!NetGuard.TryPosition(o.X, o.Y, o.Z, out var eoPosition))
+            {
+                DiagnosticLog.Warn($"[Multiplayer] Peer: event object NetId {o.NetId} sent an out-of-range position -- dropping.");
+                continue;
+            }
+            var eoPlacement = new Placement(eoPosition, NetGuard.Rotation(o.Rotation));
+            if (!SimAssets.Allow(SimAssetKind.EObj, o.EObjId, $"event object NetId {o.NetId}")) continue;
+            if (o.LayoutId != 0 && !SimAssets.Allow(SimAssetKind.Layout, o.LayoutId, $"event object NetId {o.NetId} layout")) continue;
+            if (o.EventId != 0 && !SimAssets.Allow(SimAssetKind.EventId, o.EventId, $"event object NetId {o.NetId} EventId")) continue;
             seenEventObjectIds.Add(o.NetId);
             if (!peerEventObjects.TryGetValue(o.NetId, out var eo))
             {
                 var config = new EventObjectSpawnConfig
                 {
                     EObjId = o.EObjId,
-                    Placement = new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation),
+                    Placement = eoPlacement,
                     TimelineState = o.TimelineState,
                     SpawnVisible = true,
                     LayoutId = o.LayoutId,
+                    EventId = o.EventId,
+                    EntityId = o.EntityId,
+                    TargetableStatus = o.TargetableStatus,
+                    Arg2 = o.Arg2,
+                    MuteSound = o.MuteSound,
+                    ForceSharedGroupActive = o.ForceSharedGroupActive,
                 };
                 DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
                 eo = world.SpawnEventObject(config);
@@ -314,14 +355,28 @@ public sealed partial class MultiplayerManager
                 }
                 peerEventObjects[o.NetId] = eo;
             }
-            eo.SetPosition(new Placement(new Vector3(o.X, o.Y, o.Z), o.Rotation));
-            // Edge-triggered like ModelState, though SetState has no rebuild to avoid --
-            // just pointless churn to re-issue it unchanged every snapshot.
-            if (!peerEventObjectState.TryGetValue(o.NetId, out var lastState) || lastState != o.CurrentState)
+            eo.SetPosition(eoPlacement);
+            // A beat writes the state itself, so the plain SetState below stays quiet for it.
+            if (o.AnimationState is { } animState && o.AnimationBitmask is { } animBitmask
+                && (!peerEventObjectAnimationSeq.TryGetValue(o.NetId, out var lastAnimSeq) || lastAnimSeq != o.AnimationSeq))
+            {
+                peerEventObjectAnimationSeq[o.NetId] = o.AnimationSeq;
+                peerEventObjectState[o.NetId] = o.CurrentState;
+                var beatMode = Enum.IsDefined(o.AnimationMode) ? o.AnimationMode : PropBeatMode.ActorControl;
+                DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) beat (0x{animState:X},0x{animBitmask:X}) via {beatMode} (seq {o.AnimationSeq}).");
+                if (animState <= ushort.MaxValue) eo.PlayBeat(animState, animBitmask, beatMode);
+            }
+            else if (!peerEventObjectState.TryGetValue(o.NetId, out var lastState) || lastState != o.CurrentState)
             {
                 peerEventObjectState[o.NetId] = o.CurrentState;
                 DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) CurrentState -> {o.CurrentState}.");
                 eo.SetState(o.CurrentState);
+            }
+            if (o.FadeOutSeq > 0 && peerEventObjectFadeSeq.GetValueOrDefault(o.NetId) != o.FadeOutSeq)
+            {
+                peerEventObjectFadeSeq[o.NetId] = o.FadeOutSeq;
+                DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) fading out (seq {o.FadeOutSeq}).");
+                eo.FadeOut();
             }
         }
         foreach (var staleId in peerEventObjects.Keys.Where(id => !seenEventObjectIds.Contains(id)).ToList())
@@ -330,67 +385,236 @@ public sealed partial class MultiplayerManager
             peerEventObjects[staleId].Despawn();
             peerEventObjects.Remove(staleId);
             peerEventObjectState.Remove(staleId);
+            peerEventObjectAnimationSeq.Remove(staleId);
+            peerEventObjectFadeSeq.Remove(staleId);
         }
     }
 
-    // Same peerEnteredInstance guard/reasoning as OnWorldSnapshotReceived below.
+    private void ForgetPeerEnemy(int netId)
+    {
+        peerEnemies.Remove(netId);
+        peerEnemyModelState.Remove(netId);
+        peerEnemyLastLoggedStatuses.Remove(netId);
+        peerEnemyAnimationTimeline.Remove(netId);
+        peerEnemyAnimationState.Remove(netId);
+        peerEnemyLastInstantCastSeq.Remove(netId);
+        peerEnemyLastCastSeq.Remove(netId);
+        peerEnemyEngineSeqs.Remove(netId);
+        peerEnemyModelHidden.Remove(netId);
+    }
+
+    // The engine-level state behind a VFX-only cue: the carrier's timeline hold, its AnimLock,
+    // and the diagnostic delivery modes. Each applies on its own seq change.
+    private void ApplyEngineState(SimEnemy enemy, int netId, ActorEngineState? engine)
+    {
+        if (engine is null) return;
+        if (!peerEnemyModelHidden.TryGetValue(netId, out var hidden) || hidden != engine.ModelHidden)
+        {
+            peerEnemyModelHidden[netId] = engine.ModelHidden;
+            DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {netId} ModelHidden -> {engine.ModelHidden}.");
+            enemy.SetModelHidden(engine.ModelHidden);
+        }
+        var applied = peerEnemyEngineSeqs.GetValueOrDefault(netId);
+        if (engine.ModeSeq > 0 && engine.ModeSeq != applied.Mode)
+        {
+            applied.Mode = engine.ModeSeq;
+            if (Enum.IsDefined((CharacterModes)engine.Mode))
+            {
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {netId} Mode -> {(CharacterModes)engine.Mode}/{engine.ModeParam} (seq {engine.ModeSeq}).");
+                enemy.SetMode((CharacterModes)engine.Mode, engine.ModeParam);
+            }
+            else
+                DiagnosticLog.Warn($"[Multiplayer] Peer: enemy NetId {netId} sent mode {engine.Mode}, which is no CharacterModes value -- dropping.");
+        }
+        if (engine.HoldSeq > 0 && engine.HoldSeq != applied.Hold)
+        {
+            applied.Hold = engine.HoldSeq;
+            if (Enum.IsDefined(engine.HoldKind)
+                && (engine.HoldKind == TimelineHoldKind.None || SimAssets.Allow(SimAssetKind.Timeline, engine.HoldTimelineId, $"enemy NetId {netId} timeline hold")))
+            {
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {netId} timeline hold {engine.HoldKind} {engine.HoldTimelineId} (seq {engine.HoldSeq}).");
+                switch (engine.HoldKind)
+                {
+                    case TimelineHoldKind.Loop: enemy.HoldTimelineLoop(engine.HoldTimelineId); break;
+                    case TimelineHoldKind.Base: enemy.HoldTimelineBase(engine.HoldTimelineId); break;
+                    default: enemy.ReleaseTimelineHold(engine.HoldTimelineId); break;
+                }
+            }
+        }
+        if (engine.DirectTimelineSeq > 0 && engine.DirectTimelineSeq != applied.Direct)
+        {
+            applied.Direct = engine.DirectTimelineSeq;
+            if (SimAssets.Allow(SimAssetKind.Timeline, engine.DirectTimelineId, $"enemy NetId {netId} direct timeline"))
+            {
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {netId} PlayTimelineDirect({engine.DirectTimelineId}) (seq {engine.DirectTimelineSeq}).");
+                enemy.PlayTimelineDirect(engine.DirectTimelineId);
+            }
+        }
+        if (engine.ForceLoadTimelineSeq > 0 && engine.ForceLoadTimelineSeq != applied.ForceLoad)
+        {
+            applied.ForceLoad = engine.ForceLoadTimelineSeq;
+            enemy.ForceLoadBaseTimeline();
+        }
+        peerEnemyEngineSeqs[netId] = applied;
+    }
+
+    // Reconciled like the statuses: the host's set is the truth, and a path that drops out of it
+    // is removed locally. Only VFX this client added persistently are ever in its own set.
+    private static void ReconcilePersistentVfx(SimCharacter target, IReadOnlyList<string>? paths, string who)
+    {
+        var wanted = NetGuard.Cap(paths, NetGuard.MaxVfxPerEntity);
+        var current = target.ActivePersistentVfxPaths;
+        if (wanted.Count == 0 && current.Count == 0) return;
+        foreach (var raw in wanted)
+        {
+            var path = NetGuard.Clean(raw);
+            if (current.Contains(path)) continue;
+            if (!SimAssets.AllowOmenPath(path, $"{who} persistent vfx")) continue;
+            DiagnosticLog.Info($"[Multiplayer] Peer: {who} attaching persistent vfx '{path}'.");
+            target.AddVfx(path, persistent: true);
+        }
+        foreach (var path in current)
+        {
+            if (wanted.Any(p => NetGuard.Clean(p) == path)) continue;
+            DiagnosticLog.Info($"[Multiplayer] Peer: {who} removing persistent vfx '{path}'.");
+            target.RemoveVfx(path);
+        }
+    }
+
+    private static void ApplyNewVfx(SimCharacter target, IReadOnlyList<AttachedVfxState>? newVfx, string who)
+    {
+        foreach (var v in NetGuard.Cap(newVfx, NetGuard.MaxVfxPerEntity))
+        {
+            var path = NetGuard.Clean(v.Path);
+            if (!SimAssets.AllowOmenPath(path, $"{who} vfx")) continue;
+            DiagnosticLog.Info($"[Multiplayer] Peer: {who} attaching vfx '{path}'.");
+            target.AddVfx(path, NetGuard.Clamp(v.DurationSeconds, 0f, 600f), persistent: false);
+        }
+    }
+
     private unsafe void OnRolesSnapshotReceived(RolesSnapshotMessage snap)
     {
-        if (IsHost) return;
-        if (!peerEnteredInstance) return;
+        if (!PeerInRun) return;
         var world = Plugin.GameInstance.World;
 
         var myRole = MyClaimedRole;
-        foreach (var r in snap.Roles)
+        foreach (var r in NetGuard.Cap(snap.Roles, Enum.GetValues<PartyRole>().Length))
         {
-            // Position is self-authoritative for our own role (SelfPoseMessage), but
-            // statuses/lockon VFX aren't -- we run no scenario logic ourselves, so
-            // reconcile those for every role including our own.
-            if (r.Role != myRole && world.Party.Get(r.Role) is SimNetworkPuppet puppet)
-                puppet.ApplyNetworkPose(new Vector3(r.X, r.Y, r.Z), r.Rotation);
+            // Position is self-authoritative for our own role; statuses, lockons and HP are not.
+            if (r.Role != myRole && world.Party.Get(r.Role) is SimNetworkPuppet puppet
+                && NetGuard.TryPosition(r.X, r.Y, r.Z, out var rolePosition))
+                puppet.ApplyNetworkPose(rolePosition, NetGuard.Rotation(r.Rotation));
 
             if (world.Party.Get(r.Role) is not { } member) continue;
 
-            // HP is host-authoritative for every role, including our own -- TankMitigation/
-            // TankHpRegen only ever run on the host, so without this write our own HP bar
-            // would sit at spawn-default full HP forever after a hit the host tracked.
+            // Our own character goes through SimPlayer so the real MaxHealth is restored on Despawn.
+            var maxHp = Math.Min(r.MaxHp, NetGuard.MaxHp);
+            var currentHp = Math.Min(r.CurrentHp, maxHp);
             var bc = member.BattleCharaPtr;
-            if (r.MaxHp > 0 && bc != null)
+            if (maxHp > 0)
             {
-                bc->MaxHealth = r.MaxHp;
-                bc->Health = r.CurrentHp;
+                if (member is SimPlayer me) me.ApplyNetworkHp(currentHp, maxHp);
+                else if (bc != null)
+                {
+                    bc->MaxHealth = maxHp;
+                    bc->Health = currentHp;
+                }
             }
             var currentStatuses = member.ActiveStatusSnapshot;
+            var roleStatuses = NetGuard.Cap(r.Statuses, NetGuard.MaxStatusesPerEntity);
             if (!peerRoleReconciledStatusIds.TryGetValue(r.Role, out var reconciledIds))
                 peerRoleReconciledStatusIds[r.Role] = reconciledIds = new HashSet<ushort>();
-            foreach (var target in r.Statuses)
+            foreach (var target in roleStatuses)
             {
-                // Tracked even when AddStatus doesn't need to run, so the removal loop
-                // below still recognizes it as host-managed on an unchanged snapshot.
+                // Tracked even when unchanged, so the removal loop still knows it is host-managed.
                 reconciledIds.Add(target.StatusId);
                 if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
-                member.AddStatus(target.StatusId, duration: target.RemainingTime, stacks: target.Stacks, overrideStacks: true);
+                member.AddStatus(target.StatusId, duration: NetGuard.Clamp(target.RemainingTime, -1f, 3600f), stacks: target.Stacks, overrideStacks: true);
             }
-            // Only removes a statusId THIS reconciliation added, not a full diff against
-            // ActiveStatusSnapshot -- a peer's own character can carry statuses nothing
-            // here put there.
             foreach (var trackedId in reconciledIds.ToList())
             {
-                if (r.Statuses.Any(s => s.StatusId == trackedId)) continue;
+                if (roleStatuses.Any(s => s.StatusId == trackedId)) continue;
                 member.RemoveStatus(trackedId);
                 reconciledIds.Remove(trackedId);
             }
             if (!peerRoleLastLoggedStatuses.TryGetValue(r.Role, out var lastStatuses))
                 peerRoleLastLoggedStatuses[r.Role] = lastStatuses = new Dictionary<ushort, ushort>();
             LogStatusChanges($"Peer: role {r.Role} ({DescribeRoleOwner(r.Role, member)})",
-                r.Statuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
+                roleStatuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
             if (r.NewLockonVfxIds.Count > 0)
             {
                 DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} NewLockonVfxIds -> [{string.Join(",", r.NewLockonVfxIds)}].");
-                foreach (var lockonId in r.NewLockonVfxIds)
-                    member.AttachLockonVfx(lockonId, persistent: false);
+                foreach (var lockonId in NetGuard.Cap(r.NewLockonVfxIds, NetGuard.MaxLockonVfxPerEntity))
+                    if (SimAssets.Allow(SimAssetKind.Lockon, lockonId, $"role {r.Role} lockon"))
+                        member.AttachLockonVfx(lockonId, persistent: false);
+            }
+            ApplyNewVfx(member, r.NewVfx, $"role {r.Role}");
+            ReconcilePersistentVfx(member, r.PersistentVfx, $"role {r.Role}");
+            // A doppel's own action animation (a bot tank's limit break). Our own seat is a
+            // SimPlayer, whose actions are its owner's real button presses.
+            if (r.PlayedActionSeq > 0 && member is SimNpc actor
+                && (!peerRolePlayedActionSeq.TryGetValue(r.Role, out var lastPlayed) || lastPlayed != r.PlayedActionSeq))
+            {
+                peerRolePlayedActionSeq[r.Role] = r.PlayedActionSeq;
+                if (SimAssets.Allow(SimAssetKind.Action, r.PlayedActionId, $"role {r.Role} action"))
+                {
+                    DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} plays action {r.PlayedActionId} (seq {r.PlayedActionSeq}).");
+                    actor.PlayAction(r.PlayedActionId, NetGuard.Clamp(r.PlayedActionAnimationLock, 0f, 60f, 0.6f));
+                }
+            }
+            // The KO pose comes with RoleKilledMessage; id 0 is a reset.
+            if (!r.Dead && r.AnimationTimelineId is { } roleTimeline
+                && (!peerRoleAnimationTimelineSeq.TryGetValue(r.Role, out var lastRoleSeq) || lastRoleSeq != r.AnimationTimelineSeq))
+            {
+                peerRoleAnimationTimelineSeq[r.Role] = r.AnimationTimelineSeq;
+                DiagnosticLog.Info($"[Multiplayer] Peer: role {r.Role} AnimationTimelineId -> {roleTimeline} (loop {r.AnimationTimelineLoopId}, seq {r.AnimationTimelineSeq}).");
+                if (roleTimeline == 0)
+                    member.ResetActionTimeline();
+                else if (SimAssets.Allow(SimAssetKind.Timeline, roleTimeline, $"role {r.Role} timeline")
+                    && (r.AnimationTimelineLoopId == 0 || SimAssets.Allow(SimAssetKind.Timeline, r.AnimationTimelineLoopId, $"role {r.Role} loop timeline")))
+                    member.PlayActionTimeline(roleTimeline, r.AnimationTimelineLoopId);
             }
         }
+    }
+
+    // Forced moves land on our own character only: every other slot is a puppet the host's
+    // pose snapshots already place.
+    private ISimPartyMember? OwnMember(PartyRole role, string what)
+    {
+        if (role != MyClaimedRole) return null;
+        if (Plugin.GameInstance.World.Party.Get(role) is ISimPartyMember member) return member;
+        DiagnosticLog.Debug($"[Multiplayer] {what} for {role} but that slot isn't an ISimPartyMember locally -- dropping.");
+        return null;
+    }
+
+    private void OnTeleportReceived(TeleportMessage msg)
+    {
+        if (!PeerInRun) return;
+        if (!NetGuard.TryPosition(msg.X, msg.Y, msg.Z, out var position)) return;
+        OwnMember(msg.Role, "Teleport")?.TeleportTo(new Placement(position, NetGuard.Rotation(msg.Rotation)));
+    }
+
+    private void OnPushReceived(PushMessage msg)
+    {
+        if (!PeerInRun) return;
+        if (OwnMember(msg.Role, "Push") is not { } member) return;
+        var heading = NetGuard.Rotation(msg.Heading);
+        var distance = NetGuard.Clamp(msg.Distance, 0f, 200f);
+        if (msg.DurationSeconds > 0f)
+            member.PushInDirectionEased(heading, distance, NetGuard.Clamp(msg.DurationSeconds, 0.01f, 60f));
+        else
+            member.PushInDirection(heading, distance, NetGuard.Clamp(msg.Speed, 0f, 500f));
+    }
+
+    private void OnFollowReceived(FollowMessage msg)
+    {
+        if (!PeerInRun) return;
+        if (OwnMember(msg.Role, "Follow") is not SimCharacter me) return;
+        var target = ResolvePeerEnd(Plugin.GameInstance.World, msg.TargetEnemyNetId, msg.TargetRole);
+        DiagnosticLog.Info($"[Multiplayer] Peer: {msg.Role} {(target == null ? "released from follow" : $"following {msg.TargetRole?.ToString() ?? $"enemy#{msg.TargetEnemyNetId}"} at {msg.Speed:F1}y/s")}.");
+        // Only forced follows are ever sent (see SimNetworkPuppet.Follow), and only a forced one
+        // may drive the real character.
+        me.Follow(target, NetGuard.Clamp(msg.Speed, 0f, 20f), forced: true);
     }
 
     private SimCharacter? ResolvePeerEnd(SimWorld world, int? enemyNetId, PartyRole? role)
@@ -402,49 +626,56 @@ public sealed partial class MultiplayerManager
 
     private void OnRoleKilledReceived(RoleKilledMessage msg)
     {
-        if (IsHost) return;
-        DiagnosticLog.Info($"[Multiplayer] {msg.Role} killed: {msg.Cause}");
+        if (!PeerInRun) return;
+        var cause = NetGuard.Clean(msg.Cause);
+        DiagnosticLog.Info($"[Multiplayer] {msg.Role} killed: {cause}");
         if (Plugin.GameInstance.World.Party.Get(msg.Role) is ISimPartyMember member)
-            Plugin.GameInstance.Kill(member, msg.Cause);
+            Plugin.GameInstance.Kill(member, cause);
         else
             DiagnosticLog.Debug($"[Multiplayer] RoleKilled for {msg.Role} but that slot isn't an ISimPartyMember locally -- dropping.");
     }
 
     private void OnKnockbackReceived(KnockbackMessage msg)
     {
-        if (IsHost) return;
+        if (!PeerInRun) return;
+        if (!NetGuard.TryPosition(msg.SourceX, msg.SourceY, msg.SourceZ, out var source)) return;
         if (Plugin.GameInstance.World.Party.Get(msg.Role) is ISimPartyMember member)
-            member.Knockback(new Vector3(msg.SourceX, msg.SourceY, msg.SourceZ), msg.Distance, msg.Speed);
+            member.Knockback(source, NetGuard.Clamp(msg.Distance, 0f, 200f), NetGuard.Clamp(msg.Speed, 0f, 500f));
         else
             DiagnosticLog.Debug($"[Multiplayer] Knockback for {msg.Role} but that slot isn't an ISimPartyMember locally -- dropping.");
     }
 
     private void OnSpawnOmenReceived(SpawnOmenMessage msg)
     {
-        if (IsHost) return;
+        if (!PeerInRun) return;
+        if (!NetGuard.TryPosition(msg.X, msg.Y, msg.Z, out var position)) return;
+        if (!Plugin.GameInstance.World.CanSpawnOmen)
+        {
+            DiagnosticLog.Warn($"[Multiplayer] Peer: dropping SpawnOmen -- already at {NetGuard.MaxLiveOmens} live omens.");
+            return;
+        }
+        var omenPath = NetGuard.Clean(msg.Path);
+        if (!SimAssets.AllowOmenPath(omenPath, "SpawnOmen")) return;
         Plugin.GameInstance.World.SpawnOmen(
-            msg.Path, new Placement(new Vector3(msg.X, msg.Y, msg.Z), msg.Rotation),
-            new Vector3(msg.ScaleX, msg.ScaleY, msg.ScaleZ), msg.DurationSeconds);
+            omenPath, new Placement(position, NetGuard.Rotation(msg.Rotation)),
+            new Vector3(NetGuard.Clamp(msg.ScaleX, 0f, 1000f), NetGuard.Clamp(msg.ScaleY, 0f, 1000f), NetGuard.Clamp(msg.ScaleZ, 0f, 1000f)),
+            NetGuard.Clamp(msg.DurationSeconds, 0f, 600f));
     }
 
     private void OnEndReceived(EndMessage msg)
     {
         if (IsHost) return;
-        // Not gated on `running`: a spectator peer who never claimed a role still has
-        // live snapshot-spawned doppels to tear down here (OnWorldSnapshotReceived runs
-        // regardless of role/running state).
-        DiagnosticLog.Info($"[Multiplayer] Peer received EndMessage (ReturnedToInn={msg.ReturnedToInn}).");
+        DiagnosticLog.Info($"[Multiplayer] Peer received EndMessage (ReturnedToInn={msg.ReturnedToInn}, Reason={msg.Reason ?? "none"}).");
+        if (NetGuard.Clean(msg.Reason) is { Length: > 0 } reason) AnnounceRunEnded(reason);
         running = false;
         StopDebugBotReplay();
-        // If our deferred zone entry hasn't completed yet, there's nothing to leave/reset --
-        // Leave() would actively teleport the real character to garbage coordinates, since
-        // Unload() assumes a zone was actually entered.
+        // Leave() assumes a zone was entered; before the deferred entry it would teleport the
+        // real character to garbage coordinates.
         if (!Plugin.GameInstance.World.Map.IsInInstance)
         {
             DiagnosticLog.Info("[Multiplayer] EndMessage received before our own deferred zone entry completed -- nothing to leave/reset.");
             return;
         }
-        // Mirror whichever the host actually did.
         if (msg.ReturnedToInn)
             Plugin.GameInstance.Leave();
         else

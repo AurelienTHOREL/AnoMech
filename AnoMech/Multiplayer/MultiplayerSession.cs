@@ -5,8 +5,8 @@ using AnoMech.Core.Game.Party;
 
 namespace AnoMech.Multiplayer;
 
-// Lobby roster, mirrored on every client from the host's LobbyStateMessage broadcasts. The
-// host owns the authoritative copy; this class is a plain data holder, not a source of truth.
+// Lobby roster, mirrored on every client from the host's LobbyStateMessage; the host's copy
+// is the authoritative one.
 public sealed class MultiplayerSession
 {
     public Guid HostId { get; set; }
@@ -15,37 +15,52 @@ public sealed class MultiplayerSession
     public Dictionary<Guid, PeerBuildInfo> Builds { get; private set; } = new();
     public bool Started { get; set; }
 
-    // Indices into Game.Scenarios and that scenario's own AiStrats/WaymarkPresets, set by the
-    // host in StartScenario so every client resolves the same scenario/strat/waymark.
-    public int ScenarioIndex { get; set; }
+    // Indices into Game.Scenarios and that scenario's AiStrats/WaymarkPresets; -1 = the host
+    // hasn't picked a scenario yet.
+    public int ScenarioIndex { get; set; } = -1;
     public int SelectedAi { get; set; }
     public int SelectedWaymark { get; set; }
 
-    // Host's pre-fight tankbuster mitigation plan, keyed by TankBusterCastInfo.Id (see
-    // Scenarios/TankMitigation.cs). 0/missing = no mitigation planned for that cast --
-    // a bot-driven tank with no plan entry just takes the hit unmitigated.
+    // Keyed by TankBusterCastInfo.Id; 0/missing = no mitigation planned for that cast.
     public Dictionary<string, ushort> TankBusterPlan { get; private set; } = new();
 
+    // Display lines from ScenarioSettingsSummary.
+    public List<string> ScenarioSettings { get; set; } = new();
+    private const int MaxScenarioSettingLines = 64;
+
+    // The same overrides as JSON, for a peer to apply (see ScenarioSettingsSync). Length-capped
+    // rather than Cleaned: stripping characters would only produce unparsable JSON.
+    public string? ScenarioSettingsJson { get; set; }
+    private const int MaxScenarioSettingsJson = 4096;
+
+    // Sanitised once here. Indices stay as sent and are validated where used
+    // (TryResolveScenario): clamping would silently run the wrong scenario.
     public void ApplyLobbyState(LobbyStateMessage msg)
     {
         HostId = msg.HostId;
-        ClaimedBy = new Dictionary<PartyRole, Guid>(msg.ClaimedBy);
-        Names = new Dictionary<Guid, string>(msg.Names);
-        Builds = new Dictionary<Guid, PeerBuildInfo>(msg.Builds);
+        ClaimedBy = new Dictionary<PartyRole, Guid>(msg.ClaimedBy.Where(kv => Enum.IsDefined(kv.Key)));
+        Names = msg.Names.Take(NetGuard.MaxSessionPeers).ToDictionary(kv => kv.Key, kv => NetGuard.Clean(kv.Value));
+        Builds = msg.Builds.Take(NetGuard.MaxSessionPeers).ToDictionary(kv => kv.Key,
+            kv => new PeerBuildInfo(NetGuard.Clean(kv.Value.Version), NetGuard.Clean(kv.Value.Checksum)));
         Started = msg.Started;
         ScenarioIndex = msg.ScenarioIndex;
         SelectedAi = msg.SelectedAi;
         SelectedWaymark = msg.SelectedWaymark;
-        TankBusterPlan = new Dictionary<string, ushort>(msg.TankBusterPlan);
+        TankBusterPlan = msg.TankBusterPlan
+            .Where(kv => !string.IsNullOrEmpty(kv.Key))
+            .Take(MaxScenarioSettingLines)
+            .ToDictionary(kv => NetGuard.Clean(kv.Key), kv => kv.Value);
+        ScenarioSettings = NetGuard.Cap(msg.ScenarioSettings, MaxScenarioSettingLines).Select(NetGuard.Clean).ToList();
+        ScenarioSettingsJson = msg.ScenarioSettingsJson is { Length: > 0 and <= MaxScenarioSettingsJson } json ? json : null;
     }
 
     public LobbyStateMessage ToMessage() => new(
         HostId, new Dictionary<PartyRole, Guid>(ClaimedBy), new Dictionary<Guid, string>(Names),
         new Dictionary<Guid, PeerBuildInfo>(Builds), Started, ScenarioIndex, SelectedAi, SelectedWaymark,
-        new Dictionary<string, ushort>(TankBusterPlan));
+        new Dictionary<string, ushort>(TankBusterPlan), new List<string>(ScenarioSettings), ScenarioSettingsJson);
 
     public PartyRole? RoleOf(Guid peerId) =>
         ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => (PartyRole?)kv.Key).FirstOrDefault();
 
-    public string NameOf(Guid peerId) => Names.GetValueOrDefault(peerId, "Player");
+    public string NameOf(Guid peerId) => Names.GetValueOrDefault(peerId, "Player") is { Length: > 0 } name ? name : "Player";
 }

@@ -37,6 +37,7 @@ public sealed class UmadP5ExaflaresScenario : IMultiplayerReplayable
     public IReadOnlyList<IScenarioAi> AiStrats => [new UmadP5ExaflaresAi()];
 
     public void DrawSettings() => settingsWindow.Draw();
+    public object SettingsOverrides => settingsWindow.Overrides;
     private readonly UmadP5ExaflaresSettingsWindow settingsWindow = new();
 
     private UmadP5ExaflaresState state = null!;

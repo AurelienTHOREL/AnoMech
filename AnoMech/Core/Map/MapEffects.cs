@@ -22,7 +22,9 @@ internal sealed unsafe class MapEffects : IDisposable
 {
     public bool Loaded { get; set; } = false;
 
-    private delegate long ProcessMapEffectDelegate(long module, uint index, ushort state, ushort flags);
+    // void(ContentDirector*, uint, ushort, ushort): Dalamud's hook verification rejects any
+    // other shape at load.
+    private delegate void ProcessMapEffectDelegate(ContentDirector* module, uint index, ushort state, ushort flags);
     private readonly Hook<ProcessMapEffectDelegate> hook;
 
     internal MapEffects()
@@ -33,28 +35,17 @@ internal sealed unsafe class MapEffects : IDisposable
         hook.Enable();
     }
 
-    private long Detour(long module, uint index, ushort state, ushort flags)
+    private void Detour(ContentDirector* module, uint index, ushort state, ushort flags)
     {
         Plugin.LogManager.LogMapEffect(index, state, flags);
-        // Was Plugin.Log.Info (invisible in dumps). This only fires for calls that reach
-        // ProcessMapEffect through the REAL hooked entry point -- i.e. the native
-        // engine/packet path, not our own Apply() below (which calls hook.Original
-        // directly and bypasses this detour entirely, logging separately as "native
-        // call:"). "REAL native call" distinguishes the two in a dump: a host's SGB was
-        // observed carrying flag bits (0x10/0x20/0x40/0x80) neither Apply() nor
-        // AddEffect's callers ever send, present before our own replayed calls ever
-        // touch that index -- if some other native/packet-driven path is setting them
-        // (e.g. as a side effect of normal zone-load pop-in a peer's client-side zone
-        // reconstruction doesn't equally trigger), this is the only place that would
-        // ever observe it.
-        var director = (ContentDirector*)module;
-        var before = ReadMapEffectItem(director, index);
-        var result = hook.Original(module, index, state, flags);
-        var after = ReadMapEffectItem(director, index);
+        // Only the real native/packet path reaches this detour (Apply calls hook.Original
+        // directly); a host's SGB has been seen carrying flag bits nothing here sends.
+        var before = ReadMapEffectItem(module, index);
+        hook.Original(module, index, state, flags);
+        var after = ReadMapEffectItem(module, index);
         AnoMech.Core.DiagnosticLog.Info(
-            $"[MapEffect] REAL native call: index=0x{index:X} state=0x{state:X} flags=0x{flags:X} module=0x{module:X} "
+            $"[MapEffect] REAL native call: index=0x{index:X} state=0x{state:X} flags=0x{flags:X} module=0x{(nint)module:X} "
             + $"item before=({Format(before)}) after=({Format(after)}).");
-        return result;
     }
 
     // packetFlags: high16=State, low8=Flags (ACT type-257 raw value).
@@ -63,67 +54,71 @@ internal sealed unsafe class MapEffects : IDisposable
     internal bool Apply(uint packetFlags, byte index)
     {
         if (!Loaded) return false;
-        var module = *(nint*)((nint)EventFramework.Instance() + 344);
-        if (module == 0) return false;
+        var modulePtr = *(nint*)((nint)EventFramework.Instance() + 344);
+        if (modulePtr == 0) return false;
+        var module = (ContentDirector*)modulePtr;
+        // ProcessMapEffect writes into MapEffects->Items[index], and index can come off the
+        // network. Not ready reads like any other not-ready case, so the caller retries.
+        if (!IsIndexInRange(module, index)) return false;
         var state = (ushort)(packetFlags >> 16);
         var flags = (ushort)(packetFlags & 0xFF);
-        // DiagnosticLog (dump-visible), placed here rather than in Detour: Apply()
-        // calls hook.Original directly, bypassing Detour, so this is the only place
-        // that actually observes our own replayed calls reaching the engine. Confirms
-        // the native call landed at all -- if a peer's arena is still wrong despite
-        // this line matching the host's, the remaining gap is downstream of this call
-        // (e.g. a missing/stale SGB), not the call itself failing or being skipped.
-        // Return value captured (previously discarded) specifically to test whether it
-        // signals "target SGB not found/not ready" -- Apply() unconditionally returned
-        // true here regardless, so a peer whose zone-load left this specific SGB still
-        // streaming in (a narrower readiness gap than the Loaded/module checks above
-        // catch) would have this call silently no-op at the native level while every
-        // layer of our own code believed it succeeded. Logged whether or not it differs
-        // from the host's so a host/peer dump pair can be compared directly.
-        // ContentDirector.MapEffects (verified via the local FFXIVClientStructs checkout,
-        // Client/Game/InstanceContent/ContentDirector.cs) is the actual per-index array
-        // ProcessMapEffect looks up: ContentDirector.MapEffectItem.LayoutId is the target SharedGroup's
-        // layout ID, .State/.Flags mirror what was last successfully applied. Read before
-        // AND after the native call so a host/guest dump pair can show, per index: whether
-        // LayoutId is even populated (0 would mean this slot's SGB was never resolved on
-        // that client at all -- the call has nothing real to act on regardless of what it
-        // returns) and whether .State/.Flags actually changed to match what we just sent.
-        var director = (ContentDirector*)module;
-        var before = ReadMapEffectItem(director, index);
-        var result = hook.Original(module, index, state, flags);
-        var after = ReadMapEffectItem(director, index);
+        // Before/after per index: whether LayoutId is populated at all and whether State/Flags took.
+        var before = ReadMapEffectItem(module, index);
+        hook.Original(module, index, state, flags);
+        var after = ReadMapEffectItem(module, index);
         AnoMech.Core.DiagnosticLog.Info(
-            $"[MapEffect] native call: index=0x{index:X} state=0x{state:X} flags=0x{flags:X} module=0x{module:X} result=0x{result:X} "
+            $"[MapEffect] native call: index=0x{index:X} state=0x{state:X} flags=0x{flags:X} module=0x{modulePtr:X} "
             + $"item before=({Format(before)}) after=({Format(after)}).");
-        // PlayMapEffectTimeline tested and ruled out (returned True, no state change, on both
-        // host and guest identically -- see prior dumps). ContentDirector.MapEffectItem.LayoutId is only an ID
-        // into ContentDirector's own bookkeeping table, not the actual renderable object --
-        // LayoutWorld.GetLayoutInstance(SharedGroup, layoutId) (verified via the local
-        // FFXIVClientStructs checkout, Client/LayoutEngine/LayoutWorld.cs) resolves that ID to
-        // the real Client::LayoutEngine::Group::SharedGroupLayoutInstance, which carries its
-        // own independent load-status fields (PrefabFlags1: "0x1 = load started; 0x3 = load
-        // failed or contents added; 0x4 = failed to add contents") and readiness methods
-        // (IsPrimaryReady/IsPrimaryLoaded/HavePrimary) -- none of which ContentDirector's own
-        // bookkeeping table can see. Every check so far (call order, LayoutId, State
-        // transitions, native return codes, PlayMapEffectTimeline) has come back byte-identical
-        // between host and guest despite the guest's arena staying visually wrong, so the
-        // remaining gap has to be in something downstream of ContentDirector -- this is that.
+        // The SharedGroupLayoutInstance behind LayoutId carries its own load state, which
+        // ContentDirector's table can't see.
         var sgState = ReadSharedGroupInstanceState(after.LayoutId);
         AnoMech.Core.DiagnosticLog.Info($"[MapEffect] SharedGroupLayoutInstance for index=0x{index:X} LayoutId=0x{after.LayoutId:X}: {sgState}.");
         return true;
     }
 
-    private static ContentDirector.MapEffectItem ReadMapEffectItem(ContentDirector* director, uint index)
+    // Hard-deactivate one arena scenery slot's SharedGroup and all its children (geometry, VFX
+    // AND sound), bypassing ProcessMapEffect's flag state machine: flag 0x04 ("hide") blanks the
+    // BgParts but leaves the SGB's Sound children playing. False until the slot's SGB resolves.
+    internal bool SuppressSlot(byte index)
+    {
+        if (!Loaded) return false;
+        var modulePtr = *(nint*)((nint)EventFramework.Instance() + 344);
+        if (modulePtr == 0) return false;
+        if (!IsIndexInRange((ContentDirector*)modulePtr, index)) return false;
+        var item = ReadMapEffectItem((ContentDirector*)modulePtr, index);
+        if (item.LayoutId == 0) return false;
+        var ok = LayoutInstanceDiagnostics.SetSharedGroupActive(item.LayoutId, active: false, recurseChildren: true);
+        if (ok)
+            AnoMech.Core.DiagnosticLog.Info($"[MapEffect] SuppressSlot index=0x{index:X} LayoutId=0x{item.LayoutId:X} -- SG + children set inactive.");
+        return ok;
+    }
+
+    // Per-frame follow-up to SuppressSlot: the SGB's own update re-arms its Sound children, so
+    // the ambient/voice loops creep back. Skips the native call unless one is active again.
+    internal void SilenceSlotSounds(byte index)
+    {
+        if (!Loaded) return;
+        var modulePtr = *(nint*)((nint)EventFramework.Instance() + 344);
+        if (modulePtr == 0) return;
+        var item = ReadMapEffectItem((ContentDirector*)modulePtr, index);
+        if (item.LayoutId != 0)
+            LayoutInstanceDiagnostics.SilenceSlotSounds(item.LayoutId);
+    }
+
+    private static bool IsIndexInRange(ContentDirector* director, uint index)
     {
         var list = director->MapEffects;
-        if (list == null || index >= list->ItemCount) return default;
-        return list->Items[(int)index];
+        return list != null && index < list->ItemCount;
+    }
+
+    private static ContentDirector.MapEffectItem ReadMapEffectItem(ContentDirector* director, uint index)
+    {
+        if (!IsIndexInRange(director, index)) return default;
+        return director->MapEffects->Items[(int)index];
     }
 
     private static string Format(ContentDirector.MapEffectItem item) => $"LayoutId=0x{item.LayoutId:X} State=0x{item.State:X} Flags=0x{item.Flags:X}";
 
-    // Extracted to AnoMech.Core.Native.LayoutInstanceDiagnostics -- SimEventObject needs the
-    // identical check (see its own doc comment), so this is no longer MapEffects-specific.
     private static string ReadSharedGroupInstanceState(uint layoutId) => LayoutInstanceDiagnostics.Describe(layoutId);
 
     public void Dispose()

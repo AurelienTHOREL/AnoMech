@@ -14,6 +14,7 @@ using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
+using AnoMech.Scenarios.Umad;
 
 namespace AnoMech.Multiplayer;
 
@@ -21,30 +22,45 @@ public sealed partial class MultiplayerManager
 {
     // ---- Host: sampling the live simulation --------------------------------
 
-    // Backpressure-gated rather than fired every Tick: a connection that can't keep up
-    // otherwise queues sends behind each other on RelayClient's unbounded FIFO. Never
-    // starting a new send while the last is in flight self-adjusts to what it can sustain.
+    // One send in flight at a time, so a slow connection paces the snapshot rate instead of
+    // queueing snapshots behind each other.
     private Task? pendingSnapshotSend;
 
     private Task SampleAndBroadcastSnapshot()
     {
         var world = Plugin.GameInstance.World;
 
-        // Lets any scenario re-sync something it only resolves mid-run -- see
-        // IMultiplayerReplayable.BuildMidRunUpdateMessage. Logging content is the implementer's job.
-        if (Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is IMultiplayerReplayable replayable
+        if (TryResolveScenario() is IMultiplayerReplayable replayable
             && replayable.BuildMidRunUpdateMessage() is { } midRunUpdateMsg)
             _ = relay!.SendAsync(midRunUpdateMsg);
 
-        // Generic (not scenario-specific): any puppet knocked back by any scenario's
-        // world.Party.Knockback/direct ISimPartyMember.Knockback call needs its owning peer told
-        // explicitly -- see SimNetworkPuppet.PendingNetworkKnockback's doc comment.
+        // See SimNetworkPuppet.PendingNetwork*. Follow before teleport before push: Umad P1's
+        // arrow releases the chase, snaps, then pushes.
         foreach (var role in Enum.GetValues<PartyRole>())
-            if (world.Party.Get(role) is SimNetworkPuppet { PendingNetworkKnockback: { } kb } puppet)
+        {
+            if (world.Party.Get(role) is not SimNetworkPuppet puppet) continue;
+            if (puppet.PendingNetworkKnockback is { } kb)
             {
                 _ = relay!.SendAsync(new KnockbackMessage(role, kb.Source.X, kb.Source.Y, kb.Source.Z, kb.Distance, kb.Speed));
                 puppet.ClearPendingNetworkKnockback();
             }
+            if (puppet.PendingNetworkFollow is { } follow)
+            {
+                var (targetEnemy, targetRole) = ResolveEnd(world, follow.Target);
+                _ = relay!.SendAsync(new FollowMessage(role, targetRole, targetEnemy, follow.Speed));
+                puppet.ClearPendingNetworkFollow();
+            }
+            if (puppet.PendingNetworkTeleport is { } teleport)
+            {
+                _ = relay!.SendAsync(new TeleportMessage(role, teleport.Position.X, teleport.Position.Y, teleport.Position.Z, teleport.Rotation));
+                puppet.ClearPendingNetworkTeleport();
+            }
+            if (puppet.PendingNetworkPush is { } push)
+            {
+                _ = relay!.SendAsync(new PushMessage(role, push.Heading, push.Distance, push.Speed, push.DurationSeconds));
+                puppet.ClearPendingNetworkPush();
+            }
+        }
 
         var liveEnemies = world.Children.OfType<SimEnemy>().Where(e => e.IsActive).ToList();
         foreach (var stale in hostEnemyNetIds.Keys.Where(e => !liveEnemies.Contains(e)).ToList())
@@ -94,6 +110,15 @@ public sealed partial class MultiplayerManager
             }
             var (castTargetEnemyNetId, castTargetRole) = ResolveTargetId(world, enemy.CastTargetId);
             var (instantTargetEnemyNetId, instantTargetRole) = ResolveTargetId(world, enemy.LastInstantCastTargetId);
+            var (instantActionTargetEnemyNetId, instantActionTargetRole) = ResolveTargetId(world, enemy.LastInstantCastActionTargetId);
+            var newVfx = DrainVfx(enemy, $"enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId})");
+            SimAssets.WarnIfUnknown(SimAssetKind.BNpcBase, enemy.BNpcBaseId, "enemy BNpcBase");
+            SimAssets.WarnIfUnknown(SimAssetKind.Action, enemy.CastActionId, "enemy cast");
+            SimAssets.WarnIfUnknown(SimAssetKind.Action, enemy.LastInstantCastActionId, "enemy instant cast");
+            if (enemy.AnimationTimelineId is { } hostTimelineId)
+                SimAssets.WarnIfUnknown(SimAssetKind.Timeline, hostTimelineId, "enemy timeline");
+            foreach (var hostLockon in newLockonVfxIds)
+                SimAssets.WarnIfUnknown(SimAssetKind.Lockon, hostLockon, "enemy lockon");
             enemies.Add(new EnemyState(
                 netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, enemy.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
@@ -106,7 +131,18 @@ public sealed partial class MultiplayerManager
                 castTargetEnemyNetId, castTargetRole,
                 enemy.LastInstantCastSeq, enemy.LastInstantCastActionId,
                 enemy.LastInstantCastTargetLocation?.X, enemy.LastInstantCastTargetLocation?.Y, enemy.LastInstantCastTargetLocation?.Z,
-                instantTargetEnemyNetId, instantTargetRole));
+                instantTargetEnemyNetId, instantTargetRole,
+                UmadRealPackets.NpcSpawnTemplateName(cfg.NpcSpawnTemplate), cfg.PacketSpawnEnableDraw,
+                enemy.LastInstantCastIsNativeEffect, enemy.LastInstantCastAnimationLock,
+                instantActionTargetEnemyNetId, instantActionTargetRole,
+                newVfx, enemy.LastInstantCastRawPacket,
+                enemy.HasEngineState
+                    ? new ActorEngineState(
+                        enemy.ModelHidden, enemy.LastMode?.Mode ?? 0, enemy.LastMode?.Param ?? 0, enemy.ModeSeq,
+                        enemy.TimelineHoldState, enemy.TimelineHoldId, enemy.TimelineHoldSeq,
+                        enemy.DirectTimelineId, enemy.DirectTimelineSeq, enemy.ForceLoadTimelineSeq)
+                    : null,
+                enemy.ActivePersistentVfxPaths));
         }
 
         var liveTethers = world.Children.OfType<SimTether>().Where(t => t.IsActive).ToList();
@@ -127,6 +163,7 @@ public sealed partial class MultiplayerManager
                 hostTetherNetIds[tether] = netId;
                 DiagnosticLog.Info($"[Multiplayer] Host: broadcasting new tether NetId {netId} (TetherId {tether.TetherId}) -- A={(aEnemy is { } ae ? $"enemy#{ae}" : aRole?.ToString() ?? "null")}, B={(bEnemy is { } be ? $"enemy#{be}" : bRole?.ToString() ?? "null")}.");
             }
+            SimAssets.WarnIfUnknown(SimAssetKind.Tether, tether.TetherId, "tether");
             tethers.Add(new TetherState(netId, tether.TetherId, aEnemy, aRole, bEnemy, bRole));
         }
 
@@ -146,16 +183,35 @@ public sealed partial class MultiplayerManager
                 hostEventObjectNetIds[eo] = netId;
                 DiagnosticLog.Info($"[Multiplayer] Host: broadcasting new event object NetId {netId} -- EObj 0x{eo.EObjRowId:X}, pos {eo.Position}, state {eo.CurrentState}.");
             }
+            SimAssets.WarnIfUnknown(SimAssetKind.EObj, eo.EObjRowId, "event object");
+            var eoConfig = eo.SpawnConfig;
+            var eventId = eoConfig is null ? 0u : (uint)eoConfig.EventId;
+            SimAssets.WarnIfUnknown(SimAssetKind.EventId, eventId, "event object EventId");
             eventObjects.Add(new EventObjectState(
                 netId, eo.EObjRowId, eo.VisibleState, eo.CurrentState,
-                eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation, eo.LayoutId));
+                eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation, eo.LayoutId,
+                eventId, eoConfig?.EntityId ?? 0u, eoConfig?.TargetableStatus ?? 1, eoConfig?.Arg2 ?? 0u, eoConfig?.MuteSound ?? false,
+                eo.LastAnimation?.State, eo.LastAnimation?.Bitmask, eo.AnimationSeq,
+                eo.LastBeatMode, eoConfig?.ForceSharedGroupActive ?? false, eo.FadeOutSeq));
         }
 
         return relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, eventObjects));
     }
 
-    // Paced independently of SampleAndBroadcastSnapshot -- see RolesSnapshotMessage's
-    // doc comment.
+    private static IReadOnlyList<AttachedVfxState> DrainVfx(SimCharacter character, string who)
+    {
+        var pending = character.DrainPendingVfx();
+        if (pending.Count == 0) return [];
+        var result = new List<AttachedVfxState>(pending.Count);
+        foreach (var (path, duration) in pending)
+        {
+            SimAssets.WarnIfUnknownPath(path, $"{who} attached VFX");
+            result.Add(new AttachedVfxState(path, duration));
+        }
+        DiagnosticLog.Info($"[Multiplayer] Host: {who} NewVfx -> [{string.Join(",", result.Select(v => v.Path))}].");
+        return result;
+    }
+
     private Task? pendingRolesSend;
 
     private unsafe Task SampleAndBroadcastRoles()
@@ -168,6 +224,7 @@ public sealed partial class MultiplayerManager
             var dead = member is ISimPartyMember { Dead: true };
             IReadOnlyList<EnemyStatusState> statuses = [];
             IReadOnlyList<uint> newLockonVfxIds = [];
+            IReadOnlyList<AttachedVfxState> newVfx = [];
             uint currentHp = 0, maxHp = 0;
             if (member != null)
             {
@@ -178,6 +235,7 @@ public sealed partial class MultiplayerManager
                 newLockonVfxIds = member.DrainPendingLockonVfxIds();
                 if (newLockonVfxIds.Count > 0)
                     DiagnosticLog.Info($"[Multiplayer] Host: role {role} NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
+                newVfx = DrainVfx(member, $"role {role}");
                 statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList();
                 var bc = member.BattleCharaPtr;
                 if (bc != null)
@@ -185,14 +243,28 @@ public sealed partial class MultiplayerManager
                     currentHp = bc->Health;
                     maxHp = bc->MaxHealth;
                 }
+                if (member is SimNpc { PlayedActionSeq: > 0 } actor)
+                    SimAssets.WarnIfUnknown(SimAssetKind.Action, actor.PlayedActionId, $"role {role} action");
+                if (member.AnimationTimelineId is { } roleTimelineId
+                    && (!hostRoleLastLoggedAnimationTimeline.TryGetValue(role, out var lastSeq) || lastSeq != member.AnimationTimelineSeq))
+                {
+                    hostRoleLastLoggedAnimationTimeline[role] = member.AnimationTimelineSeq;
+                    DiagnosticLog.Info($"[Multiplayer] Host: role {role} AnimationTimelineId -> {roleTimelineId} (loop {member.AnimationTimelineLoopId}, seq {member.AnimationTimelineSeq}).");
+                    if (roleTimelineId != 0) SimAssets.WarnIfUnknown(SimAssetKind.Timeline, roleTimelineId, "role timeline");
+                }
             }
             else
             {
                 hostRoleLastLoggedStatuses.Remove(role);
+                hostRoleLastLoggedAnimationTimeline.Remove(role);
             }
             roles.Add(new RoleState(role, member != null, dead,
                 member?.Position.X ?? 0f, member?.Position.Y ?? 0f, member?.Position.Z ?? 0f, member?.Rotation ?? 0f,
-                statuses, newLockonVfxIds, currentHp, maxHp));
+                statuses, newLockonVfxIds, currentHp, maxHp,
+                member?.AnimationTimelineId, member?.AnimationTimelineLoopId ?? 0, member?.AnimationTimelineSeq ?? 0, newVfx,
+                member?.ActivePersistentVfxPaths ?? [],
+                (member as SimNpc)?.PlayedActionId ?? 0, (member as SimNpc)?.PlayedActionAnimationLock ?? 0.6f,
+                (member as SimNpc)?.PlayedActionSeq ?? 0));
         }
         return relay!.SendAsync(new RolesSnapshotMessage(roles));
     }
@@ -206,9 +278,7 @@ public sealed partial class MultiplayerManager
         return (null, null);
     }
 
-    // Same job as ResolveEnd, but for a Cast() target: SimCast only stores a raw
-    // GameObjectId (meaningless to a peer on its own), so this resolves by ID equality
-    // instead of ResolveEnd's reference equality.
+    // ResolveEnd for a Cast() target, which SimCast stores as a raw GameObjectId.
     private (int? enemyNetId, PartyRole? role) ResolveTargetId(SimWorld world, GameObjectId? targetId)
     {
         if (targetId is not { } id) return (null, null);
@@ -227,14 +297,11 @@ public sealed partial class MultiplayerManager
             path, placement.Position.X, placement.Position.Y, placement.Position.Z, placement.Rotation,
             scale.X, scale.Y, scale.Z, durationSeconds));
 
-    // True once a claimed peer hasn't been heard from for PeerStaleTimeoutMs -- host reads
-    // its own ground truth, a peer reads the last value relayed via PeerStatusMessage.
+    // The host reads its own bookkeeping; a peer reads what the host relayed (PeerStatusMessage).
     public bool IsPeerStale(Guid peerId) => IsHost
         ? peerLastSeenMs.TryGetValue(peerId, out var lastSeen) && Environment.TickCount64 - lastSeen > PeerStaleTimeoutMs
         : peerStatuses.TryGetValue(peerId, out var entry) && entry.SecondsSinceLastSeen * 1000f > PeerStaleTimeoutMs;
 
-    // Host-only, every PingIntervalSeconds regardless of running: pings every claimed peer,
-    // rebuilds the display status from whatever was last measured, and broadcasts it.
     private void SendPingAndRefreshStatuses()
     {
         var nowMs = Environment.TickCount64;
@@ -261,9 +328,8 @@ public sealed partial class MultiplayerManager
             if (stale && warnedStalePeers.Add(peerId))
             {
                 DiagnosticLog.Warn($"[Multiplayer] {Session.NameOf(peerId)} ({role}) hasn't reported in over {PeerStaleTimeoutMs / 1000}s -- likely disconnected.");
-                // Ends the run like RemovePeer's mid-fight branch, but leaves the role claim
-                // and roster slot alone -- going stale may just be a network blip, and their
-                // own client already retries the reconnect (BeginReconnect).
+                // Ends the run but keeps the role claim: staleness may be a blip, and their
+                // client is already reconnecting.
                 if (running && Plugin.GameInstance.World.Map.IsInInstance)
                 {
                     DiagnosticLog.Info($"[Multiplayer] Ending the run because {Session.NameOf(peerId)} went stale mid-fight.");

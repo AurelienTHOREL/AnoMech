@@ -1,17 +1,16 @@
+using System;
+using System.Linq;
 using System.Numerics;
+using AnoMech.Core.Native;
+using AnoMech.Multiplayer;
+using AnoMech.Scenarios;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 
 namespace AnoMech.Windows;
 
-// Small always-on-top-ish substitute for MainWindow/MultiplayerWindow while a sim
-// is actually running -- those two are hidden for the same duration (see each
-// window's own PreOpenCheck), since a full scenario picker/lobby UI has no
-// reason to stay on screen mid-fight, but Start/Reset/Leave/Leave-session still
-// need to be reachable without alt-tabbing back to a window that's deliberately
-// hidden. Every button here just calls straight into the exact same methods
-// MainWindow/MultiplayerWindow use for their own copies, so behavior is
-// identical -- this window only changes where those buttons are drawn from.
+// Compact substitute for MainWindow/MultiplayerWindow while a sim runs (both are hidden
+// then); every button calls the same methods those windows use.
 public sealed class RunningSimWindow : Window
 {
     private readonly Plugin plugin;
@@ -35,9 +34,7 @@ public sealed class RunningSimWindow : Window
         var mp = plugin.Multiplayer;
         var inSession = mp.SessionCode != null;
 
-        // ActiveScenario is never set for a peer, so IsRunning is the only signal
-        // that works for every seat; Paused (a post-wipe freeze) is checked
-        // separately since it doesn't clear either one.
+        // ActiveScenario is never set for a peer; Paused clears neither signal.
         var scenarioActive = inSession ? mp.IsRunning : plugin.Game.ActiveScenario != null;
         var running = scenarioActive && !plugin.Game.Paused;
         ImGui.TextColored(
@@ -46,8 +43,6 @@ public sealed class RunningSimWindow : Window
 
         if (inSession)
         {
-            // Mirrors MultiplayerWindow.DrawConnectedPanel's own !Started guard --
-            // once a run has actually started, Start disappears there too.
             if (!mp.Session.Started)
             {
                 plugin.MultiplayerWindow.DrawStartButton();
@@ -64,5 +59,110 @@ public sealed class RunningSimWindow : Window
 
         if (inSession)
             plugin.MultiplayerWindow.DrawLeaveSessionButton();
+
+        // The only window on screen mid-scenario, so the test bench has to be reachable here.
+        ImGui.Separator();
+        TimelineDebug.DrawControls();
+        if (inSession)
+        {
+            DrawRoster();
+            DrawRelayUsage();
+        }
     }
+
+    // The Multiplayer window is hidden while a sim runs, so the host needs a way to remove
+    // someone from here.
+    private void DrawRoster()
+    {
+        var mp = plugin.Multiplayer;
+        if (!mp.IsHost || !ImGui.CollapsingHeader("Players")) return;
+        var others = mp.Session.Names.Keys.Where(id => id != mp.MyPeerId).ToList();
+        if (others.Count == 0)
+        {
+            ImGui.TextDisabled("Nobody else is connected.");
+            return;
+        }
+        foreach (var id in others)
+        {
+            ImGui.PushID(id.ToString());
+            var seat = mp.Session.ClaimedBy.FirstOrDefault(kv => kv.Value == id);
+            var where = mp.Session.ClaimedBy.ContainsValue(id) ? SettingsGrid.RoleLabel(seat.Key) : "no role";
+            ImGui.TextUnformatted($"{mp.Session.NameOf(id)} ({where})");
+            ImGui.SameLine(200);
+            if (ImGui.SmallButton("Kick")) mp.KickPeer(id);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip($"Remove {mp.Session.NameOf(id)} from the session; mid-fight it ends the run for everyone.");
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Ban")) mp.BanPeer(id);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip($"Remove {mp.Session.NameOf(id)} and keep them out until you unban them in the Multiplayer window.");
+            ImGui.PopID();
+        }
+    }
+
+    // What this client is spending against the relay's per-connection caps, plus the traffic
+    // either way. Debug readout: the relay enforces these, the plugin only reports them.
+    private void DrawRelayUsage()
+    {
+        if (!ImGui.CollapsingHeader("Relay usage (debug)")) return;
+        RelayStats.ObservePeers(plugin.Multiplayer.Session.Names.Count);
+        var s = RelayStats.Current;
+
+        if (ImGui.BeginTable("##relayusage", 3, ImGuiTableFlags.SizingFixedFit))
+        {
+            Header();
+            Capped("Messages/sec", s.MessagesPerSecond, RelayStats.MaxMessagesPerSecond, s.MaxMessagesPerSecond, v => v.ToString());
+            Capped("Sent/sec", s.SentBytesPerSecond, RelayStats.MaxBytesPerSecond, s.MaxSentBytesPerSecond, Bytes);
+            Capped("Message size", s.LastMessageBytes, RelayStats.MaxMessageBytes, s.LargestMessageBytes, Bytes);
+            Capped("Players in session", s.Peers, RelayStats.MaxPeersPerSession, s.MaxPeers, v => v.ToString());
+            Row("Received/sec", Bytes(s.ReceivedBytesPerSecond), Bytes(s.MaxReceivedBytesPerSecond));
+            Row("Sent total", Bytes(s.TotalSentBytes), "");
+            Row("Received total", Bytes(s.TotalReceivedBytes), "");
+            ImGui.EndTable();
+        }
+        ImGui.TextDisabled("Caps are the relay's defaults; one started with other flags differs.");
+    }
+
+    private static void Header()
+    {
+        ImGui.TableNextRow();
+        ImGui.TableSetColumnIndex(0);
+        ImGui.TextDisabled("Value");
+        ImGui.TableSetColumnIndex(1);
+        ImGui.TextDisabled("Now / cap");
+        ImGui.TableSetColumnIndex(2);
+        ImGui.TextDisabled("Max this session");
+    }
+
+    private static void Row(string label, string now, string max)
+    {
+        ImGui.TableNextRow();
+        ImGui.TableSetColumnIndex(0);
+        ImGui.TextUnformatted(label);
+        ImGui.TableSetColumnIndex(1);
+        ImGui.TextUnformatted(now);
+        ImGui.TableSetColumnIndex(2);
+        ImGui.TextUnformatted(max);
+    }
+
+    // Amber past half the cap (the relay's own [NEAR-LIMIT] point), red at it.
+    private static void Capped(string label, long now, long cap, long max, Func<long, string> format)
+    {
+        ImGui.TableNextRow();
+        ImGui.TableSetColumnIndex(0);
+        ImGui.TextUnformatted(label);
+        ImGui.TableSetColumnIndex(1);
+        var fraction = cap <= 0 ? 0d : (double)now / cap;
+        var color = fraction >= 1d ? new Vector4(1f, 0.4f, 0.4f, 1f)
+            : fraction >= 0.5d ? new Vector4(1f, 0.85f, 0.3f, 1f)
+            : new Vector4(0.8f, 0.8f, 0.8f, 1f);
+        ImGui.TextColored(color, $"{format(now)} / {format(cap)}");
+        ImGui.TableSetColumnIndex(2);
+        ImGui.TextUnformatted(format(max));
+    }
+
+    private static string Bytes(long value)
+        => value >= 1024 * 1024 ? $"{value / (1024f * 1024f):F2} MB"
+            : value >= 1024 ? $"{value / 1024f:F1} KB"
+            : $"{value} B";
 }

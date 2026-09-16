@@ -21,56 +21,46 @@ public sealed partial class MultiplayerManager
 {
     // ---- Per-frame tick (framework thread; see Plugin.OnFrameworkUpdate) ----
 
-    // Host-only local bookkeeping for "my own run just ended" -- shared by normal in-Tick
-    // detection (ActiveScenario went null, still connected, broadcasts EndMessage next) and
-    // the disconnection-timeout branch below (can't broadcast; peers already gave up on
-    // their own). Doesn't touch the relay/session/roster.
+    // Local end-of-run bookkeeping only; doesn't touch the relay, session or roster.
     private void EndHostRunLocally()
     {
         running = false;
-        DebugBotControl.Enabled = false; // mirrors StopDebugBotReplay's peer-side reset
+        DebugBotControl.Enabled = false;
         Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
         Plugin.GameInstance.World.OmenSpawned -= OnOmenSpawnedHost;
-        Session.Started = false; // otherwise the Start button (gated on !Started) stays dead
+        Session.Started = false; // or the Start button stays disabled
     }
 
-    // Host-only: finalize the local run and tell every peer it ended. Factored out because
-    // Tick()'s own edge-trigger only fires once per run (hostScenarioStarted) -- a Reset
-    // followed by a separate Leave needs this called explicitly too, or the Leave half of
-    // that sequence never reaches peers at all.
+    // Tick()'s edge trigger fires once per run (hostScenarioStarted), so a Reset followed by
+    // a separate Leave needs this called explicitly for the Leave half.
     //
-    // returnedToInn is caller-supplied, not read from World.Map.IsInInstance here: Leave()/
-    // Reset() do their real work inside a later Plugin.Framework.Run callback, so a caller
-    // invoking this right after Leave() would still see the pre-Leave IsInInstance==true and
-    // broadcast the wrong verb (Reset instead of Leave). The Tick() edge-trigger call site is
-    // the one exception where reading IsInInstance directly is safe, since it only fires
-    // after ActiveScenario has already gone null on a later tick.
-    private void BroadcastRunEnded(bool returnedToInn)
+    // returnedToInn is caller-supplied: Leave()/Reset() do their work in a deferred
+    // Framework.Run callback, so IsInInstance read right after Leave() still says true.
+    private void BroadcastRunEnded(bool returnedToInn, string? reason = null)
     {
         EndHostRunLocally();
         _ = relay?.SendAsync(Session.ToMessage());
         DiagnosticLog.Info($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
-        _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
+        _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn, Reason: reason));
+        if (reason != null) AnnounceRunEnded(reason);
         LobbyChanged?.Invoke();
 
-        // Arms Tick()'s resend loop -- the send above is fire-and-forget, so back it with a
-        // few redundant re-sends instead of trusting the one shot.
+        // Arms Tick()'s resend loop.
         pendingEndResendReturnedToInn = returnedToInn;
+        pendingEndResendReason = reason;
         endResendsRemaining = EndMessageResendCount;
         endResendTimer = 0f;
     }
 
-    // Called from the host's own Leave button right after Plugin.GameInstance.Leave() -- see
-    // BroadcastRunEnded's comment for why the Tick() edge trigger can't be relied on here.
+    // The host's own Leave button, right after Game.Leave(); see BroadcastRunEnded.
     public void NotifyLeftInstance()
     {
         if (!IsHost || relay is not { IsConnected: true }) return;
         BroadcastRunEnded(returnedToInn: true);
     }
 
-    // Subscribed lazily on first Tick (Plugin.GameInstance isn't set at field-init time),
-    // once, since World.Map is a single long-lived instance. Handlers gate on IsHost, so
-    // this is a harmless no-op for a peer or solo play.
+    // Subscribed on first Tick (Plugin.GameInstance isn't set at field-init time); the
+    // handlers gate on IsHost.
     private bool mapEventsSubscribed;
 
     private void SubscribeMapEventsOnce()
@@ -95,6 +85,17 @@ public sealed partial class MultiplayerManager
             DiagnosticLog.Info($"[Multiplayer] Host: broadcasting SetWeather weatherId={weatherId} transition={transition}.");
             _ = relay.SendAsync(new SetWeatherMessage(weatherId, transition));
         };
+        Plugin.GameInstance.World.Map.FogHoldChanged += value =>
+        {
+            if (!IsHost || relay is not { IsConnected: true }) return;
+            DiagnosticLog.Info($"[Multiplayer] Host: broadcasting SetFogHold {(value is { } v ? v.ToString("F0") : "off")}.");
+            _ = relay.SendAsync(new SetFogHoldMessage(value));
+        };
+        Plugin.GameInstance.World.Announced += text =>
+        {
+            if (!IsHost || relay is not { IsConnected: true }) return;
+            _ = relay.SendAsync(new AnnouncementMessage(text));
+        };
     }
 
     public void Tick(float deltaSeconds)
@@ -102,8 +103,7 @@ public sealed partial class MultiplayerManager
         SubscribeMapEventsOnce();
         DrainPendingMessages();
 
-        // Checked before the IsConnected early-return below -- this IS the "relay down" case.
-        // disconnectedSinceMs is nulled immediately after so this doesn't re-fire every tick.
+        // Before the IsConnected return below: this is the relay-down case.
         if (IsHost && disconnectedSinceMs is { } since && running && Plugin.GameInstance.World.Map.IsInInstance
             && Environment.TickCount64 - since > PeerStaleTimeoutMs)
         {
@@ -116,8 +116,6 @@ public sealed partial class MultiplayerManager
 
         if (relay is not { IsConnected: true }) return;
 
-        // Connection-quality tracking runs continuously, so roster status is live before
-        // anyone clicks Start, not just once running is true below.
         if (IsHost)
         {
             pingTimer += deltaSeconds;
@@ -148,16 +146,13 @@ public sealed partial class MultiplayerManager
                     endResendsRemaining--;
                     DiagnosticLog.Info($"[Multiplayer] Re-broadcasting EndMessage (ReturnedToInn={returnedToInn}), {endResendsRemaining} retries left.");
                     _ = relay?.SendAsync(Session.ToMessage());
-                    _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn));
+                    _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn, Reason: pendingEndResendReason));
                     if (endResendsRemaining <= 0) pendingEndResendReturnedToInn = null;
                 }
             }
         }
         else if (IsSessionNotFound)
         {
-            // No host-broadcast ever arrived -- likely a mistyped/nonexistent code. Fails
-            // fast on the shorter NoHostFoundTimeoutMs rather than waiting out
-            // PeerStaleTimeoutMs, which is tuned for a host that WAS present going silent.
             DiagnosticLog.Warn($"[Multiplayer] No host responded within {NoHostFoundTimeoutMs / 1000}s of joining session {SessionCode} -- session not found.");
             LeaveSession();
             SessionEndReason = "Session not found.";
@@ -166,11 +161,9 @@ public sealed partial class MultiplayerManager
         }
         else if (IsHostStale)
         {
-            // A clean Leave reaches peers via SessionEndedMessage well within
-            // PeerStaleTimeoutMs, so this only fires for a host that vanished without
-            // warning (crash, alt-F4, hard network drop). IsInInstance guard: Leave() ->
-            // Unload() assumes a zone was actually entered; `running` can briefly be true
-            // before that deferred entry completes.
+            // Only a host that vanished without a SessionEnded (crash, hard drop). IsInInstance
+            // rather than running: the deferred zone entry may not have happened yet, and
+            // Leave() assumes it has.
             DiagnosticLog.Warn($"[Multiplayer] Lost contact with the host (no message in {SecondsSinceHostMessage:F1}s, threshold {PeerStaleTimeoutMs / 1000}s) -- leaving.");
             if (running && Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
             LeaveSession();
@@ -183,9 +176,6 @@ public sealed partial class MultiplayerManager
 
         if (IsHost)
         {
-            // hostScenarioStarted gates "ActiveScenario is null" from meaning "run ended"
-            // until it's actually been seen non-null once -- RunScenarioAsHost's completion
-            // is deferred a frame past Start.
             if (Plugin.GameInstance.ActiveScenario != null)
             {
                 hostScenarioStarted = true;
@@ -196,9 +186,8 @@ public sealed partial class MultiplayerManager
             }
             else
             {
-                // Reset/Leave clears ActiveScenario -- stop broadcasting once the run has
-                // ended. Safe to read IsInInstance here (unlike the explicit call sites,
-                // see BroadcastRunEnded): by now Reset()/Leave()'s deferred work is done.
+                // Reset/Leave's deferred work is done by now, so IsInInstance is safe to read
+                // here (see BroadcastRunEnded).
                 BroadcastRunEnded(!Plugin.GameInstance.World.Map.IsInInstance);
                 return;
             }
@@ -214,10 +203,9 @@ public sealed partial class MultiplayerManager
             {
                 if (!peerEnteredInstance) DiagnosticLog.Info("[Multiplayer] Peer's deferred zone entry completed -- now sending SelfPose.");
                 peerEnteredInstance = true;
-                TryStartDebugBotReplay(); // idempotent, guarded internally on debugBotReplayStarted
-                // See IMultiplayerReplayable.TickReplay.
+                TryStartDebugBotReplay();
                 if (debugShadowStateGeneric != null && deltaSeconds > 0f
-                    && Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is IMultiplayerReplayable replayable)
+                    && TryResolveScenario() is IMultiplayerReplayable replayable)
                     replayable.TickReplay(debugShadowStateGeneric, deltaSeconds);
             }
             else if (peerEnteredInstance)
@@ -229,9 +217,7 @@ public sealed partial class MultiplayerManager
             }
             else
             {
-                // Zone load queued by RunScenarioAsPeer hasn't run yet -- wait rather than
-                // tearing down a run that hasn't truly started.
-                return;
+                return; // zone load still pending
             }
             SendSelfPose();
             SendSelfMitigationIfChanged();

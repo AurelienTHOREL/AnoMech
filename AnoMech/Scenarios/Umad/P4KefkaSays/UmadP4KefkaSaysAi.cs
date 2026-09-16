@@ -58,11 +58,8 @@ public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
         ai.Move(81f, () => Stack(new Vector2(0f, 0f)), jitter: 1f, arrivalTime: 86.5f);
         ai.Move(88f, () => StrayFlames(state.InfernoMystery), jitter: 0.5f, arrivalTime: 92f);
 
-        // Elemental wave 2 (~96.5s) folded into Mystery[3]'s Blizzard-safe wedges (~97.4s).
-        // Arrival pulled in from 96.3 to 96.0: still comfortably ahead of both the
-        // elemental resolve (~96.5) and the cones (~97.4), but that 0.3s also happens
-        // to clear an Acceleration Bomb resolve at 96.28 (see
-        // ScheduleAccelerationBombDodge) that would otherwise land mid-flight here.
+        // Elemental wave 2 (~96.5s) folded into Mystery[3]'s Blizzard-safe wedges (~97.4s);
+        // arrival at 96.0 also clears the Acceleration Bomb check at 96.28.
         ai.Move(92.5f, () => ResolveElementsUnderBlizzard(state.ElemRoles[1], state.ElemTrue[1], state.Mystery[3]), arrivalTime: 96.0f);
 
         // Wave2 Death Shriek (~104.4s): a pure positioning+facing solve in the middle,
@@ -79,26 +76,10 @@ public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
         ScheduleAccelerationBombDodge(state, world);
     }
 
-    // Acceleration Bomb (UmadP4KefkaSaysScenario.ResolveAccelerationBomb) checks
-    // party.Player.IsActing at one single scheduled instant -- itself now correctly
-    // fed by an in-flight debug-bot MoveTo (see SimPlayer.IsMoving), but nothing in
-    // this file's general choreography is guaranteed to be moving (or not) at that
-    // exact moment for whichever specific role happens to be party.Player. Mirrors
-    // the scenario's own branch selection exactly (same wave/slot -> resolve-time
-    // mapping, same real/fake source) since only one of the four ever actually
-    // applies per run.
-    //
-    // Fake (must move): a deliberate, tiny, slow in-place wiggle -- not a real
-    // relocation -- so it can't cross into whatever hazard boundary another
-    // mechanic resolving in the same window depends on. 0.3y at 0.4y/s takes 0.75s;
-    // fired 0.6s before the resolve instant, that's still in flight until 0.15s
-    // after it, comfortably bracketing the check with margin either side.
-    //
-    // Real (must stand still): needs no action here for any of the four possible
-    // resolve times -- 71.28/71.36 fall in the dead gap between the wave-1 element
-    // move (arrives 70.5) and the gaze move (fires 72), and 96.28/96.36 are now
-    // clear of the wave-2 element move's own in-flight window since its arrival
-    // above was pulled in to 96.0.
+    // Acceleration Bomb checks party.Player.IsActing at one instant (same wave/slot mapping as
+    // the scenario). Fake (must move): a tiny slow in-place wiggle that brackets the check
+    // without crossing any hazard. Real (must stand still): every possible resolve time already
+    // falls in a gap between moves.
     private static void ScheduleAccelerationBombDodge(UmadP4KefkaSaysState state, SimWorld world)
     {
         var role = world.Party.PlayerRole;

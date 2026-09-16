@@ -24,6 +24,7 @@ public unsafe class UltimatePredationScenario : IMultiplayerReplayable
     public bool SupportsMultiplayer => true;
     public IReadOnlyList<IScenarioAi> AiStrats => [new UltimatePredationAi()];
     public void DrawSettings() => settingsWindow.Draw();
+    public object SettingsOverrides => settingsWindow.Overrides;
 
     private readonly UltimatePredationSettingsWindow settingsWindow = new();
 
@@ -400,11 +401,7 @@ public unsafe class UltimatePredationScenario : IMultiplayerReplayable
         world.Events.Add(69, () =>
         {
             // TODO: Use a proper Enmity system for this
-            Plugin.ChatGui.Print(new XivChatEntry
-            {
-                Type = XivChatType.SystemMessage,
-                Message = new SeStringBuilder().AddText($"[AnoMech] {Name}: Assuming Tank Swap").Build(),
-            });
+            world.Announce($"{Name}: Assuming Tank Swap");
 
             ultima?.SetTarget(ot);
         });
@@ -454,11 +451,7 @@ public unsafe class UltimatePredationScenario : IMultiplayerReplayable
         world.Events.Add(77.34f, () =>
         {
             // TODO: Use a proper Enmity system for this
-            Plugin.ChatGui.Print(new XivChatEntry
-            {
-                Type = XivChatType.SystemMessage,
-                Message = new SeStringBuilder().AddText($"[AnoMech] {Name}: Assuming Tank Swap").Build(),
-            });
+            world.Announce($"{Name}: Assuming Tank Swap");
 
             ultima?.SetTarget(mt);
         });

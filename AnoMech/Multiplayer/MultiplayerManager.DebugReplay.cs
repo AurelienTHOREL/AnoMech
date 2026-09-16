@@ -8,34 +8,28 @@ public sealed partial class MultiplayerManager
 {
     // ---- Debug: bot-controlled peer replay ----------------------------------
 
-    // Host-only, edge-triggered once per run. Polls rather than reading synchronously since
-    // LastState isn't guaranteed set on the very first Tick() after StartScenario
-    // (RunScenarioAsHost's real work is deferred a frame).
+    // Polled from Tick until it succeeds: LastState isn't set on the first tick after Start.
     private void TrySendAiReplayState()
     {
-        if (Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is not IMultiplayerReplayable replayable) return;
+        if (TryResolveScenario() is not IMultiplayerReplayable replayable) return;
         if (replayable.BuildReplayStateMessage() is not { } msg) return;
         aiReplayStateSent = true;
         DiagnosticLog.Info("[Multiplayer] Host: broadcasting AiReplayState for this run.");
         _ = relay!.SendAsync(msg);
     }
 
-    // Guards AiStrats[Session.SelectedAi] indexing below -- StartScenario already refuses to
-    // broadcast an out-of-range SelectedAi, but a peer can't verify what the host sent.
     private bool IsValidAiIndex(IScenario scenario) =>
         Session.SelectedAi >= 0 && Session.SelectedAi < scenario.AiStrats.Count;
 
-    // Peer-only, idempotent, edge-triggered once per run: fires once both the host's replay
-    // message has arrived and our own zone/party is ready (peerEnteredInstance) -- arrival
-    // order isn't guaranteed, so both call sites (Dispatch and Tick) funnel through here.
-    // No-op unless debug-bot mode is on.
+    // Needs both the host's replay message and our own zone entry, which arrive in either
+    // order, so Dispatch and Tick both call it.
     private void TryStartDebugBotReplay()
     {
         if (!debugBotControlled || debugBotReplayStarted) return;
         if (!peerEnteredInstance) return;
         if (MyClaimedRole is not { } myRole) return;
         if (pendingGenericReplayState is not { } msg) return;
-        if (Plugin.GameInstance.Scenarios[Session.ScenarioIndex] is not IMultiplayerReplayable replayable) return;
+        if (TryResolveScenario() is not IMultiplayerReplayable replayable) return;
         var world = Plugin.GameInstance.World;
 
         debugBotReplayStarted = true;
@@ -50,11 +44,19 @@ public sealed partial class MultiplayerManager
         {
             debugShadowStateGeneric = shadowState;
             DebugBotControl.Enabled = true;
+            GiveLocalPlayerObstacles();
         }
     }
 
-    // Clears the current run's replay state, not the sticky debugBotControlled toggle --
-    // called whenever running stops, so a debug-bot peer regains normal control immediately.
+    // PartyCreator wires the obstacle field to bot doppels only; a bot-driven real character
+    // steers like one (see IMultiplayerReplayable.RebuildPeerObstacles).
+    private static void GiveLocalPlayerObstacles()
+    {
+        var world = Plugin.GameInstance.World;
+        if (world.Party.Player is { } player) player.Obstacles = world.Obstacles;
+    }
+
+    // Clears the run's replay state, not the sticky debugBotControlled toggle.
     private void StopDebugBotReplay()
     {
         if (debugBotReplayStarted) DiagnosticLog.Info("[Multiplayer] Peer: stopping debug-bot replay.");

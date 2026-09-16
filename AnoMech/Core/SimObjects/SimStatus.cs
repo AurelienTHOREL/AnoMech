@@ -1,6 +1,7 @@
 using System;
 using AnoMech.Core.Native;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using FFXIVClientStructs.FFXIV.Client.Game.Object;
 
 namespace AnoMech.Core.SimObjects;
 
@@ -11,22 +12,22 @@ public sealed unsafe class SimStatus : ISimObject
     private float elapsed;
 
     public ushort StatusId { get; }
+    public GameObjectId SourceObject { get; }
     public bool IsActive { get; private set; }
     public ushort Stacks { get; private set; }
 
-    // 0 means "no duration" (permanent until removed), matching Tick/Reapply's own
-    // duration > 0f convention below -- so a peer replicating this via AddStatus's
-    // matching default gets the same "never expires" behavior, not a bogus 0s timer.
+    // 0 = permanent until removed, so a peer replicating it gets the same behaviour.
     public float RemainingTime => duration > 0f ? Math.Max(0f, duration - elapsed) : 0f;
 
-    internal SimStatus(SimCharacter target, ushort statusId, float duration, ushort stacks)
+    internal SimStatus(SimCharacter target, ushort statusId, float duration, ushort stacks, GameObjectId sourceObject = default)
     {
         this.target = target;
         this.duration = duration;
         StatusId = statusId;
+        SourceObject = sourceObject;
         IsActive = true;
         Stacks = stacks;
-        Statuses.AddStatusInit((Character*)target.BattleCharaPtr, statusId, stacks);
+        Statuses.AddStatusInit((Character*)target.BattleCharaPtr, statusId, stacks, sourceObject);
     }
 
     public void Reapply(float duration, int stacks)
@@ -39,28 +40,28 @@ public sealed unsafe class SimStatus : ISimObject
         // Negative stacks decrement; clamp to 0 (callers handle removal at 0).
         Stacks = (ushort)Math.Max(0, Stacks + stacks);
     }
-    
+
     public void Tick(float deltaSeconds)
     {
         if (!IsActive) return;
 
-        if (duration > 0 && elapsed >= duration)
+        // Advance before checking expiry: checking first let one tick write a negative
+        // RemainingTime, which the native StatusManager showed as 20s for a frame.
+        if (duration > 0f) elapsed += deltaSeconds;
+
+        if (duration > 0f && elapsed >= duration)
         {
             Despawn();
+            return;
         }
-        else
-        {
-            if (duration > 0f)
-                elapsed += deltaSeconds;
-            // Update duration
-            Statuses.Apply((Character*)target.BattleCharaPtr, StatusId, duration - elapsed, Stacks);
-        }
+
+        Statuses.Apply((Character*)target.BattleCharaPtr, StatusId, duration - elapsed, Stacks, SourceObject);
     }
 
     public void Despawn()
     {
         if (!IsActive) return;
-        Statuses.Remove((Character*)target.BattleCharaPtr, StatusId);
+        Statuses.Remove((Character*)target.BattleCharaPtr, StatusId, SourceObject);
         IsActive = false;
     }
 }

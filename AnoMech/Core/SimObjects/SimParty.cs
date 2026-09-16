@@ -20,7 +20,7 @@ namespace AnoMech.Core.SimObjects;
 public sealed class SimParty : ISimObject
 {
     private static Random rnd = new();
-    
+
     public static readonly SimParty Empty = new();
 
     private readonly SimCharacter?[] slots = new SimCharacter?[8];
@@ -59,15 +59,11 @@ public sealed class SimParty : ISimObject
     public void WipeAllPlayers(string cause)
         => ForEachActive(m => { if (m.IsAlive()) m.Die(cause); });
 
-    // Fallback invuln status for GiveInvuln when the target's job isn't recognized (see
-    // TankMitigationChart.InvulnStatusIdByJob) -- being Holmgang's real id is incidental, it
-    // just needs to be SOME status TankMitigation.IsInvuln recognizes.
+    // Fallback for an unrecognized job; being Holmgang's id is incidental.
     public const ushort InvulnStatusId = 409;
 
-    // Makes `role` immune to death for `seconds` -- Game.Kill swallows any death (DamageSolver
-    // or direct .Die()) of a member holding a recognized invuln. Applies the target's OWN
-    // job's real invuln (TankMitigationChart.InvulnStatusIdByJob) so the icon matches its job,
-    // falling back to InvulnStatusId for an unrecognized job. No-op if the slot is empty.
+    // Game.Kill swallows any death of a member holding a recognized invuln. Uses the target's
+    // own job's real invuln so the icon matches. No-op if the slot is empty.
     public unsafe void GiveInvuln(PartyRole role, float seconds = 10f)
     {
         var member = Get(role);
@@ -92,6 +88,25 @@ public sealed class SimParty : ISimObject
         if (!KnockbackLookup.TryGet(knockbackId, out var distance, out var speed))
             return;
         ForEachActive(m => (m as ISimPartyMember)?.Knockback(source, distance, speed));
+    }
+
+    // Only slots within `radius` of `source` are pushed. `exclude` is the stack holder when
+    // `source` is their own position: Placement.Face keeps a co-located mover's current rotation,
+    // so they would still be flung along whatever they last faced. Movement only; the caller
+    // casts the hit reaction first (its movement plays out over the next 0.7s).
+    public void Knockback(Vector3 source, uint knockbackId, float radius, SimCharacter? exclude = null)
+    {
+        if (!KnockbackLookup.TryGet(knockbackId, out var distance, out var speed))
+            return;
+        var radiusSq = radius * radius;
+        ForEachActive(m =>
+        {
+            if (ReferenceEquals(m, exclude)) return;
+            var dx = m.Position.X - source.X;
+            var dz = m.Position.Z - source.Z;
+            if (dx * dx + dz * dz <= radiusSq)
+                (m as ISimPartyMember)?.Knockback(source, distance, speed);
+        });
     }
 
     internal IEnumerable<SimCharacter> ActiveMembers()

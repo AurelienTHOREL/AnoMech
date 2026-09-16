@@ -12,9 +12,7 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
 {
     private const ushort StunStatusId = 896;  // "Down for the Count" (896) — IsPermanent + LockControl variant.
 
-    // The player's HP bar (real bc->Health) is touched only on a scenario KO — dropped to a 1-HP
-    // sliver here (from OnKilled on a real death, and from Game.Kill for the godmode preview),
-    // restored in RestoreHpBar (revive / godmode heal-back).
+    // The real HP bar is only touched on a scenario KO (a 1-HP sliver), restored in RestoreHpBar.
     public void DropHpBar()
     {
         var bc = BattleCharaPtr;
@@ -27,13 +25,10 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
         if (bc != null && bc->Health < bc->MaxHealth) bc->Health = bc->MaxHealth;
     }
 
-    // Real native MaxHealth before OverrideMaxHealthForTankRole clobbered it; null if inactive.
+    // Real native MaxHealth before it was overridden; null if inactive.
     private uint? realMaxHealth;
 
-    // Overrides the real player's MaxHealth to `tankMaxHealth` (IScenario.TankMaxHealth, via
-    // PartyCreator.Populate) so TankMitigation's fixed-HP tankbuster numbers land against the
-    // same reference pool bot tanks use, not whatever the player's real gear/level produces.
-    // No-op if already overridden.
+    // So TankMitigation's fixed-HP tankbuster numbers land against the same pool bot tanks use.
     public void OverrideMaxHealthForTankRole(uint tankMaxHealth)
     {
         var bc = BattleCharaPtr;
@@ -43,8 +38,18 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
         bc->Health = tankMaxHealth;
     }
 
-    // Undoes OverrideMaxHealthForTankRole from Despawn. MUST run before RestoreHpBar: restore
-    // MaxHealth first, then clamp Health down, to avoid a frame where Health exceeds it.
+    // Host-authoritative HP for a peer's own character; the real MaxHealth is captured once so
+    // Despawn restores it no matter what a host sent.
+    public void ApplyNetworkHp(uint currentHp, uint maxHp)
+    {
+        var bc = BattleCharaPtr;
+        if (bc == null || maxHp == 0) return;
+        realMaxHealth ??= bc->MaxHealth;
+        bc->MaxHealth = maxHp;
+        bc->Health = Math.Min(currentHp, maxHp);
+    }
+
+    // Must run before RestoreHpBar: restore MaxHealth first, then clamp Health down.
     public void RestoreRealMaxHealth()
     {
         var bc = BattleCharaPtr;
@@ -60,15 +65,8 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
     public PartyRole Role { get; set; }
     public bool Dead { get; private set; }
 
-    // Player activity for stillness/movement mechanics (e.g. Pyretic, Acceleration Bomb).
-    // IsMoving = locomotion input (the engine's own RMIWalk movement sample, the same signal
-    // bossmod keys off) OR jumping OR using any action OR an in-flight debug-bot MoveTo
-    // (Movement.IsMoving, set by PlayerMovement.MoveTo only while DebugBotControl.Enabled --
-    // a no-op otherwise, so this is inert for real play) -- these "break" a don't-move mechanic
-    // in real FFXIV (or its bot-driven stand-in), so all count here. IsActing = IsMoving OR
-    // auto-attacking, i.e. the strictly-broader "is the player doing something" trigger. Both
-    // are re-sampled each tick and forced false while KO'd. Scenarios read these on
-    // Party.Player at the mechanic's resolve time.
+    // For stillness/movement mechanics: IsMoving = movement input, a jump, any action, or an
+    // in-flight debug-bot MoveTo; IsActing also counts auto-attacks. Forced false while KO'd.
     public bool IsMoving { get; private set; }
     public bool IsActing { get; private set; }
 
@@ -78,10 +76,11 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
 
     public void Knockback(Vector3 source, float distance, float speed) => Movement.Knockback(source, distance, speed);
 
-    // The player's input lock is a pure function of its own state, re-derived
-    // every tick: movement is frozen while KO'd or being force-slid by a
-    // knockback; actions are blocked only while KO'd. base.Tick advances Movement
-    // first, so a slide that arrives this frame has already cleared IsMoving.
+    public void PushInDirection(float heading, float distance, float speed) => Movement.PushInDirection(heading, distance, speed);
+
+    public void PushInDirectionEased(float heading, float distance, float durationSeconds) => Movement.PushInDirectionEased(heading, distance, durationSeconds);
+
+    // The input lock is re-derived every tick from Dead/Movement/statuses.
     public override void Tick(float deltaSeconds)
     {
         base.Tick(deltaSeconds);
@@ -92,7 +91,7 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
     private void SampleActivity()
     {
         var hooks = Plugin.PlayerInputHooks;
-        // Drain the action latch every frame — even while dead — so a stale press can't carry over.
+        // Drained every frame, even while dead, so a stale press can't carry over.
         var actedThisFrame = hooks.PollActionUsed();
         if (Dead)
         {
@@ -108,7 +107,7 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
     {
         Dead = true;
         StopMoving();
-        DropHpBar(); // real-death bar drop (bots do the same in their own OnKilled); godmode skips this path
+        DropHpBar(); // godmode preview skips this path
         AddStatus(StunStatusId);
         this.PlayKoActionTimeline();
         SyncInputLock(); // engage the lock now, not one frame later
@@ -118,28 +117,39 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
     {
         base.Despawn();
         StopMoving();
-        // Must run before RestoreHpBar -- see RestoreRealMaxHealth's own doc comment for why
-        // the order matters.
+        // Order matters; see RestoreRealMaxHealth.
         RestoreRealMaxHealth();
-        // Undo any KO bar drop (no-op if already full). Unconditional so it also covers a godmode
-        // preview drop, where Dead is never set and a pending heal on Game.Events may be cleared by reset.
+        // Unconditional: also covers a godmode preview drop, where Dead is never set.
         RestoreHpBar();
         if (Dead)
         {
-            ResetActionTimeline();
-            PlayActionTimeline(77); // revive
+            ResetActionTimelineNative();
+            PlayActionTimelineNative(77); // revive
             Dead = false;
         }
-        // No SimPlayer ticks between a reset and the next scenario, so the lock
-        // must be cleared here — otherwise a die-then-reset leaves the player
-        // input-locked in the inn.
+        // Nothing ticks between a reset and the next scenario, so the lock must clear here.
         SyncInputLock();
     }
+
+    // Real FFXIV ids: Confused and Sleep take control away in retail, so the local player is
+    // locked out the way a bot doppel has no input.
+    private const ushort StatusIdConfused = 0x503;
+    private const ushort StatusIdSleep = 0x131E;
 
     private void SyncInputLock()
     {
         var hooks = Plugin.PlayerInputHooks;
-        hooks.ZeroMovement = Dead || Movement.IsMoving;
-        hooks.DisableAllActions = Dead;
+        var asleep = !Dead && HasStatus(StatusIdSleep);
+        var confused = !Dead && HasStatus(StatusIdConfused);
+        var incapacitated = asleep || confused;
+        hooks.ZeroMovement = Dead || Movement.IsMoving || incapacitated;
+        hooks.DisableAllActions = Dead || incapacitated;
+        // A knockback slide still lets you turn, so this isn't folded into ZeroMovement.
+        hooks.ZeroRotation = Dead || incapacitated;
+        // Sleep pins the rotation it landed at; Confused re-pins every tick, since the
+        // scenario's Follow already turned the player toward the ally it walks them into.
+        if (asleep) hooks.LockedRotation ??= Rotation;
+        else if (confused) hooks.LockedRotation = Rotation;
+        else hooks.LockedRotation = null;
     }
 }

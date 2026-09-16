@@ -20,6 +20,7 @@ public sealed class TopP6WaveCannon2Scenario : IMultiplayerReplayable
     public bool SupportsMultiplayer => true;
 
     public void DrawSettings() => settingsWindow.Draw();
+    public object SettingsOverrides => settingsWindow.Overrides;
     private readonly TopP6WaveCannon2SettingsWindow settingsWindow = new();
 
     public IReadOnlyList<IScenarioAi> AiStrats => [new TopP6WaveCannon2Ai()];

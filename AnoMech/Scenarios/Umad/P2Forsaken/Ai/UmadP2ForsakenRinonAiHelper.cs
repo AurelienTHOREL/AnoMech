@@ -61,50 +61,19 @@ public sealed class UmadP2ForsakenRinonAiHelper
         ai.Move(75f, AllThingsEndsBait(2, 6), sprint: true);
         ai.Move(81.31f, TowerPositions(6), jitter: .0f, sprint: true);
         ai.Move(90.32f, TowerPositions(7), jitter: .0f, sprint: true);
-        // Occurrence 3 (t~88.36 castbar) has no "upcoming" tower to bisect against --
-        // Tower(7) is the last one, already resolved by 95.82. Unlike 0/1/2, there's no
-        // subsequent tower move to collide with (nothing else moves the party again),
-        // so this is the one occurrence with room for the real two-step mechanic:
-        // gather "between the last towers" (tower 7's own NewNorthAt(7) bisector) the
-        // moment Tower(7) resolves, then -- only once the AllThingsEnding castbar
-        // itself starts (the clones' simultaneous cast at 101.16, the earliest of the
-        // 4 casts) -- relocate across for Future's End. This isn't a race against the
-        // cast: the boss's facing locks in at its own Face(party.Player) call and
-        // Resolve() never re-reads party.Player, only the boss's now-fixed rotation,
-        // so moving away during the 5s cast-to-resolve window (101.16 to 106.16) is
-        // exactly what makes Future's End safe -- the cone stays aimed at the
-        // now-vacated between-towers spot. Past's End's second move lands on the same
-        // spot as the first (AllThingsEndsBait's existing Past branch), a same-spot
-        // no-op MoveTo, matching "stay there." First leg gets a relaxed window since
-        // there's no rush before the castbar; second leg's worst case (~26.7y,
-        // PastMeleeFromCenter+FutureMeleeFromCenter apart on opposite sides of center)
-        // still fits comfortably inside the 5s cast window even with sprint.
+        // Occurrence 3 has no upcoming tower to bisect against and nothing moves the party after
+        // it, so it gets the real two-step: gather between the last towers, then relocate once the
+        // castbar starts. The boss's facing locks at its Face() call, so moving during the cast is
+        // what makes Future's End safe; Past's End's second move is a same-spot no-op.
         ai.Move(95.83f, BetweenLastTowers(), sprint: true);
         ai.Move(101.16f, AllThingsEndsBait(3, 7), sprint: true);
     }
 
-    // Base point is "opposite the upcoming towers" for Future's End, "between the
-    // towers" for Past's End -- both via the same NewNorthAt(2*i+2) bisector the
-    // upcoming tower pair straddles (GetTowers places them at north.Rotate(-1)/
-    // north.Rotate(1)), reusing the exact reference frame the towers themselves are
-    // placed in.
-    //
-    // Future and Past use different distances now, not a shared magnitude flipped by
-    // sign: confirmed (see the timing analysis for occurrence-by-occurrence gaps
-    // between an AllThingsEnding resolve and the next tower's own resolve) that
-    // Future's End's own subsequent tower-transition is geometrically infeasible in
-    // this scenario's fixed timeline regardless of distance -- even the closest
-    // possible tower assignment needs more than max sprint speed to reach in time.
-    // Since there's no walkability tradeoff left to protect by staying close for
-    // Future, FutureMeleeFromCenter is pushed further out than Past's own margin, to
-    // improve the odds of clearing the All Things Ending cone via range as well as
-    // angle (the cone tracks party.Player, who is part of this same shared stack,
-    // so angle alone isn't a guarantee -- see prior investigation). Both casters
-    // (boss and clones alike) sit fixed at world origin for every resolve, so this
-    // is also the exact distance from whichever one is casting. PastMeleeFromCenter
-    // keeps the tighter hitbox+6 margin since Past's cone points away from the
-    // stack regardless of exact distance, and staying closer gives its own
-    // (already tight) tower transition a better chance.
+    // Future's End sits opposite the upcoming towers, Past's End between them, both on the
+    // NewNorthAt(2*i+2) bisector the tower pair straddles. Future's following tower transition
+    // is infeasible at any distance, so its spot is pushed out for range as well as angle (the
+    // cone tracks party.Player, who is in this stack); Past keeps the tighter margin to help its
+    // own tight transition. Both casters sit at the origin.
     private const float PastMeleeFromCenter = 9.7f;
     private const float FutureMeleeFromCenter = 11f;
 
@@ -115,10 +84,7 @@ public sealed class UmadP2ForsakenRinonAiHelper
                            .ApplyPositions(state.NewNorthAt(northIndex).Apply);
     }
 
-    // Unconditional "between the towers" landing spot for occurrence 3's first leg --
-    // same formula AllThingsEndsBait uses for Past's End, but not conditioned on the
-    // variant since both variants start here (see AllThingsEndsBait(3, 7) for the
-    // variant-dependent second leg).
+    // Occurrence 3's first leg: both variants start between the towers.
     private Func<IAiMove> BetweenLastTowers()
     {
         return () => AiMove.All(new(0, -PastMeleeFromCenter))

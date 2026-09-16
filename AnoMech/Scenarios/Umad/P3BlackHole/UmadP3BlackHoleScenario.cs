@@ -27,9 +27,10 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
     public uint? TankMaxHealth => Tunables.RealTankMaxHealth;
 
     public void DrawSettings() => settingsWindow.Draw();
-    // See IScenario.DrawMultiplayerSettings' own doc comment -- the Thunder III plan only
-    // matters for a bot-driven tank, so it needs to stay editable exactly when DrawSettings
-    // (solo-only overrides) gets disabled, not the other way around.
+    public bool HasPerPlayerSettings => true;
+    public void DrawPerPlayerSettings() => settingsWindow.DrawPerPlayer();
+    public object SettingsOverrides => settingsWindow.Overrides;
+    public IReadOnlyList<string> SettingsConflicts => settingsWindow.Overrides.Validate().Problems;
     public void DrawMultiplayerSettings() => settingsWindow.DrawThunderIIIPlan();
     private readonly UmadP3BlackHoleSettingsWindow settingsWindow = new();
 
@@ -43,49 +44,29 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
     private SimParty party = null!;
     private DamageSolver damage = null!;
     private List<Vector3>[] BlackHolePositions = null!;
-    // damage radius is 1.25; small clearance. internal: also read by
-    // MultiplayerManager to rebuild a peer's own obstacle avoidance (see
-    // OnWorldSnapshotReceived) from the already-synced black hole enemies,
-    // since a peer never runs Run_BlackHoleObstacles itself.
+    // Damage radius is 1.25; small clearance. Also read by MultiplayerManager to rebuild a
+    // peer's obstacle avoidance.
     internal const float BlackHoleAvoidRadius = 1.5f;
-    // Diagnostic-only: how close counts as "worth logging" in Tick's DamageDown
-    // check below, well wider than the actual 1.25y hit radius so a dump catches
-    // the approach (and near misses that never actually triggered DamageDown),
-    // not just the single moment of impact. internal: also read by
-    // MultiplayerManager to log a peer's own local view of the same near-miss,
-    // for comparison against what the host believed (see OnWorldSnapshotReceived).
+    // Diagnostic: wider than the hit radius so a dump catches the approach.
     internal const float NearBlackHoleLogRadius = 3f;
-    // Applied by the queued Primordial Crust cleanse below (Tick) -- shared so the
-    // cleanse's own recast cooldown can be kept safely longer than it, see Tick.
+    // The cleanse's recast cooldown (Tick) must stay longer than this.
     private const float EarthResistanceDownDuration = 1.960f;
 
-    // Raw (fully unmitigated) size of a single Thunder III hit, in actual HP -- a FIXED number,
-    // same as a real tankbuster. Directly observed in-game: 929,000, ±5% variance rolled per
-    // hit (see TankMitigation.ApplyTankBusterDamage's RawDamageVarianceFraction).
+    // Observed in-game: 929,000 unmitigated, rolled +/-5% per hit.
     private const float ThunderIIIRawDamage = 929_000f;
 
-    // A tank still carrying LightningResistanceDownII when the second hit lands took both
-    // hits without a swap -- meant to die no matter the mitigation, short of a real invuln
-    // (which already forces TankMitigation.SurvivalFraction to 0f). Just an absurdly large
-    // fixed number fed through the same ApplyTankBusterDamage call, rather than a bespoke
-    // lethality check. Kept at the old 40x margin.
+    // A tank still carrying LightningResistanceDownII on the second hit took both without a
+    // swap: dies regardless of mitigation, short of a real invuln.
     private const float ThunderIIIDoubleHitDamage = ThunderIIIRawDamage * 40f;
     private int PrimodialCrustsToResolve;
     private float CleanseCooldown;
     SimEnemy? CleanseHelper;
 
-    // The current run's randomized per-run assignments, exposed so
-    // MultiplayerManager can read the AI-relevant subset (Roles/StackTargets/
-    // SlapAttacks/KefkaPosition/ImplosionAttack) after a host Start and
-    // broadcast it -- lets a peer's local "debug: bot controls my character"
-    // mode replay the exact same choreography a host-side bot would produce
-    // for that role, without the host needing to know or care who's using it.
+    // For the multiplayer replay-state broadcast.
     public UmadP3BlackHoleState? LastState { get; private set; }
 
     public void Run(SimWorld worldParam, int? selectedAi)
     {
-        // Fresh per run so a damage-debug dump (see DamageDebugWindow.DumpToFile)
-        // never mixes tether diagnostic lines in from an earlier attempt.
         AnoMech.Core.DiagnosticLog.Clear();
         world = worldParam;
         party = worldParam.Party;
@@ -127,14 +108,8 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
         world.Events.Add(0f, () => CleanseHelper = world.SpawnEnemy(new EnemySpawnConfig(BNpcBaseId: BNpcBaseId.KefkaHelper, NameId: BNpcNameId.Chaos, Level: 1, Targetable: false, EnemyList: EnemyListMode.Never, IsVisible: false, Placement: new Placement(new Vector3(0.000f, 0.000f, 4.000f), 0.000f))));
     }
 
-    // Called for both host and peer (see IScenario.RunInstanceEvents / Game.
-    // RunScenarioInternal) -- these are fixed-time native replays of what the
-    // real duty's InstanceContentDirector sends, with no dependency on this
-    // run's randomized state, so a peer schedules the exact same calls on its
-    // own world.Events instead of only ever seeing them via the host.
-    //
-    // broadcast: false on every call below -- host and peer already run this independently, so
-    // the default broadcast:true doubled it (confirmed: Kefka's dialogue played twice on a peer).
+    // Fixed-time replays of the real director's messages with no dependency on this run's
+    // rolls, so a peer schedules them too; broadcast: false, or the peer gets them twice.
     public void RunInstanceEvents(SimWorld world)
     {
         // [5.88s] 33|800375D2|80000027|1B|02|1BDB|40004141|5fbef31e42584d90
@@ -216,28 +191,15 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
                foreach(var player in party.ActiveMembers())
                {
                   var distSq = player.Placement().DistanceSq(bh);
-                  // Diagnostic-only trace, wider than the actual 1.25y hit radius: a fresh
-                  // AnoMech-DamageDebug dump previously had nothing to show for a DamageDown
-                  // except the bare AddStatus line -- no position, no which hole, no distance,
-                  // and no trace of a close call that *didn't* trigger one. For a peer this
-                  // matters specifically because the position DamageSolver reads for them
-                  // (SimNetworkPuppet.Position) is whatever their last self-reported pose was,
-                  // not their true live position -- logging it here captures exactly what the
-                  // host believed at the moment that mattered, which a future dump can be
-                  // cross-referenced against the peer's own local trace to tell a genuinely
-                  // stale pose apart from the peer's own pathing actually cutting it close.
-                  // Not edge-triggered (unlike the DamageDown apply below) since a lingering
-                  // approach is short-lived by nature -- a few seconds of a hazard at 9-17y
-                  // out, not a standing condition -- so it won't flood the log.
+                  // Diagnostic: a peer's position here is its last self-reported pose, so this
+                  // records what the host believed at the moment that mattered.
                   if (distSq < NearBlackHoleLogRadius * NearBlackHoleLogRadius)
                   {
                       var role = (player as ISimPartyMember)?.Role.ToString() ?? "?";
                       AnoMech.Core.DiagnosticLog.Info(
                           $"[UmadP3BlackHoleScenario] Near black hole (wave {wave}): {role} at ({player.Position.X:F2},{player.Position.Z:F2}) is {MathF.Sqrt(distSq):F2}y from hole at ({bh.X:F2},{bh.Z:F2}).");
                   }
-                  // Edge-triggered: 180s already outlasts the fight, so this only ever needs
-                  // to fire once per approach -- re-checking HasStatus first avoids re-adding
-                  // (and re-logging) every single tick for as long as a player lingers in range.
+                  // Edge-triggered: 180s outlasts the fight.
                   if (!player.HasStatus(StatusId.DamageDown) && distSq < 1.25f * 1.25f)
                   {
                      var role = (player as ISimPartyMember)?.Role.ToString() ?? "?";
@@ -323,12 +285,8 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
             // before the resolve below checks survival. No-op for a real player or unplanned bot.
             ApplyPlannedThunderMitigation(target, setNumber, hitNumber: 1);
             helper?.Cast(ActionId.ThunderIII_Resolve, targetId: target?.GameObjectId);
-            // TankBuster-only, not DamageType.Lightning -- LightningResistanceDownII is a
-            // lethal vuln-up status here, and CheckLethal's vuln-up branch runs first, so
-            // including Lightning would kill any role carrying the debuff outright. The
-            // double-hit-is-lethal rule below implements the intended "died to two hits" case
-            // directly instead. Status still applied for the visual cue and as this hit's
-            // "already hit once" marker for the second cast.
+            // TankBuster only, not Lightning: LightningResistanceDownII is a lethal vuln-up here
+            // and would kill any carrier outright; the double-hit rule below covers that case.
             damage.Resolve(target, ActionId.ThunderIII_Resolve, [DamageType.TankBuster], [(StatusId.LightningResistanceDownII, 3.96f)],
                 tankBusterRawDamage: ThunderIIIRawDamage, tankBusterSource: exdeath);
         });
@@ -364,18 +322,9 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
     // non-zero marker. The actual kit is resolved fresh at apply time (job-dependent).
     private const ushort ThunderSharePlanned = 1;
 
-    // The REAL mitigation a Share plan relies on -- genuinely what SurvivalFraction computes
-    // against, same as a real player pressing all of it. Each job's full realistic self-mit kit:
-    //   Paladin:     Rampart + Sentinel + Bulwark + Holy Sheltron        ~= 73% alone
-    //   Gunbreaker:  Rampart + Nebula + Camouflage + Heart of Corundum   ~= 63% alone
-    //   Warrior:     Rampart + Vengeance + Bloodwhetting + Nascent Flash ~= 61% alone
-    //   Dark Knight: Rampart + Shadow Wall + Dark Mind + Oblation        ~= 61% alone
-    // ApplyThunderShareKit also adds PartyCompensationPlaceholderStatusId (20%) on top -- a
-    // TEMPORARY stand-in for real party-wide mitigation this engine doesn't simulate yet;
-    // delete once that exists. Warrior/Dark Knight are deliberately calibrated to need it.
-    //
-    // Job read live off the target's BattleChara, not assumed from role -- stays correct under
-    // debug-bot control or a mid-run job swap. Falls back to Paladin's kit if unrecognized.
+    // Each job's real self-mit kit (~61-73% alone), plus PartyCompensationPlaceholderStatusId
+    // (20%) standing in for party mitigation bots don't cast yet; Warrior/Dark Knight need it.
+    // Job read live off the BattleChara; Paladin's kit if unrecognized.
     private static readonly IReadOnlyDictionary<uint, ushort[]> ThunderShareKit = new Dictionary<uint, ushort[]>
     {
         [19] = [1191, 3829, 77, 2674],   // Paladin: Rampart, Sentinel ("Guardian"), Bulwark, Holy Sheltron
@@ -385,8 +334,6 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
     };
     private const uint ThunderShareFallbackJobId = 19; // Paladin
 
-    // Internal -- MultiplayerManager.SchedulePeerThunderMitigation also calls this directly,
-    // since RunThunder (host-only) never runs on a peer at all.
     internal static unsafe void ApplyThunderShareKit(SimCharacter target)
     {
         var bc = target.BattleCharaPtr;
@@ -394,22 +341,16 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
         var kit = ThunderShareKit.TryGetValue(jobId, out var jobKit) ? jobKit : ThunderShareKit[ThunderShareFallbackJobId];
         foreach (var statusId in kit)
         {
-            // Real duration straight from the chart (single source of truth) rather than a
-            // second hardcoded copy here -- 15f fallback only matters if a listed id is ever
-            // missing from the chart entirely, which would be a bug elsewhere, not a real case.
+            // Duration from the chart; 15f only if an id is missing there.
             var duration = TankMitigationChart.All.FirstOrDefault(a => a.StatusId == statusId).Duration ?? 15f;
             target.AddStatus(statusId, duration);
         }
-        // PLACEHOLDER -- see this method's own doc comment. Delete this line (not just the
-        // chart entry) once real party-buff simulation for bots exists.
+        // Placeholder; delete together with the chart entry.
         target.AddStatus(TankMitigationChart.PartyCompensationPlaceholderStatusId, duration: 5f);
     }
 
-    // Translates the Thunder III planner's choices into MultiplayerSession.TankBusterPlan
-    // entries ApplyPlannedThunderMitigation looks up per hit. Called once at Run() start.
-    // Only covers the Share case -- MtInvulnsBoth/OtInvulnsBoth are handled entirely by
-    // UmadP3BlackHoleAi.Run's own GiveInvuln instead. Skipped for a non-host peer, whose
-    // TankBusterPlan gets overwritten wholesale by the host's next LobbyStateMessage anyway.
+    // Only the Share case; InvulnsBoth is the Ai's GiveInvuln. Skipped for a peer, whose plan
+    // the host's LobbyState overwrites.
     private void PopulateThunderIIIPlan()
     {
         var mp = Plugin.MultiplayerInstance;
@@ -435,9 +376,8 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
     private static void SetThunderSetPlan(Dictionary<string, ushort> plan, int setNumber, ThunderIIIAssignment effective)
     {
         if (effective is not (ThunderIIIAssignment.ShareMtFirst or ThunderIIIAssignment.ShareOtFirst)) return;
-        // Either variant needs the SAME entries -- whichever tank actually ends up closest for
-        // a given hit should get ThunderShareKit's real mitigation, and MtFirst/OtFirst only
-        // affects ordering (see ThunderIIIAssignment's own doc comment), not who's entitled.
+        // Both tanks get entries: whichever is closest for a hit gets the kit; MtFirst/OtFirst
+        // only affects ordering.
         void Set(int hit, PartyRole role) => plan[$"p3-thunder3-set{setNumber}-hit{hit}-{role}"] = ThunderSharePlanned;
         Set(1, PartyRole.MainTank);
         Set(1, PartyRole.OffTank);
@@ -620,22 +560,9 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
         }
     }
 
-    // ConeTargets is rolled once at scenario start, long before this wave actually
-    // resolves -- if that specific pick has since died to an unrelated mechanic (most
-    // commonly Implosion's own Shockwave, which lands moments before this wave), their
-    // SimCharacter isn't removed, just frozen at the death spot (see IsAlive()). Facing
-    // a corpse there aims the cone by coincidence, not intent: everyone funnels through
-    // roughly the same Implosion-safe arc right before this wave, so a dead player's
-    // last position can sit angularly close to an entirely different, still-alive role
-    // group and sweep it into a second, overlapping hit -- confirmed via AnoMech-
-    // DamageDebug dumps, where a wave that killed a tank and a healer to Implosion then
-    // killed the entire DPS stack to this cone with the vuln-stack death message, even
-    // though the DPS were never near either dead player's intended target and had
-    // already arrived at their own spot in time. The real fight never has this failure
-    // mode: a boss doesn't re-target a corpse. Retarget within the same role category
-    // (everyone in it already shares this cone's intended landing spot by design, see
-    // DodgeSlap) to whoever's still up; if the whole category is gone there's nothing
-    // left to aim at faithfully, so keep the original target rather than guess.
+    // ConeTargets is rolled at start; if that pick has since died (usually to Implosion),
+    // facing the corpse can sweep an unrelated live group. A boss never re-targets a corpse,
+    // so retarget within the same role category, which shares the landing spot by design.
     private SimCharacter? LiveConeTarget(SimCharacter? target)
     {
         if (target is null || target.IsAlive() || target is not ISimPartyMember deadMember)
@@ -760,12 +687,6 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
 
     private void Run_Black_Hole_40004166()
     {
-        // TetherSortFrom scheduling lives in UmadP3BlackHoleAi.Run now -- it's
-        // AI bookkeeping (the AI is the only reader of ScenarioObjects.Tethers),
-        // and keeping it there means a peer's local AI replay (see
-        // MultiplayerManager's debug-bot-controlled mode) gets it for free by
-        // calling the same Run(state, world) the host calls here, instead of
-        // needing this scenario file's own timeline duplicated peer-side.
         RunActiveBlackHole(BlackHolePositions[0][2], 25.17f, 25.17f, 32.27f, 1);
         RunActiveBlackHole(BlackHolePositions[0][1], 25.17f, 32.27f, 39.33f, 1);
         RunActiveBlackHole(BlackHolePositions[0][0], 25.17f, 32.27f, 39.33f, 1);
@@ -915,9 +836,6 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
         world.Events.Add(159.63f, () => party.Get(PartyRole.CasterDps)?.RemoveStatus(StatusId.MagicVulnerabilityUp));
     }
 
-    // Host -> everyone, once per run. Carries the subset UmadP3BlackHoleAi reads
-    // (FromNetworkReplay). ThunderSet1/2 are the exception: a bot-controlled peer needs the
-    // host's real plan, not FromNetworkReplay's default fallback, to self-apply the right kit.
     public MpMessage? BuildReplayStateMessage()
         => LastState is { } s ? new AiReplayStateMessage(
             s.Roles.List, s.StackTargets.List, s.SlapAttacks.ToArray(),
@@ -936,11 +854,8 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
         return shadowState;
     }
 
-    // Applies the host's Thunder III Share kit to this peer's own character at RunThunder's
-    // resolve times -- that logic never runs on a peer (Ai.Run above only positions), so
-    // without this a Share-planned hit applied nothing. AddStatus writes through
-    // StatusManager, so the existing self-report poller picks it up. Skips InvulnsBoth -- a
-    // real invuln covers it.
+    // RunThunder never runs on a peer, so a Share plan would apply nothing there. AddStatus
+    // writes through StatusManager, so the self-report poller picks it up.
     private static void SchedulePeerThunderMitigation(UmadP3BlackHoleState state, SimWorld world, PartyRole myRole)
     {
         void ApplyIfMine(float time, ThunderIIIAssignment plan)
@@ -960,9 +875,7 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
         ApplyIfMine(84.9f, state.ThunderSet2);
     }
 
-    // Chaos/Exdeath might not be replicated yet when StartReplay first ran -- keep retrying.
-    // (Black-hole obstacle-avoidance rebuild stays unconditional in PeerSnapshot.cs -- see its
-    // own comment.)
+    // Chaos/Exdeath may not be replicated yet when StartReplay runs.
     public void RefreshLiveHandles(object shadowStateObj, IReadOnlyDictionary<int, SimEnemy> peerEnemies)
     {
         if (shadowStateObj is not UmadP3BlackHoleState shadowState) return;

@@ -6,29 +6,21 @@ using AnoMech.Core.SimObjects;
 
 namespace AnoMech.Scenarios;
 
-// Sim-only "how much absorbable damage is currently banked" bookkeeping for a barrier/shield
-// mitigation -- a depletable pool, unlike TankMitigation.Percent's flat-%-while-active math.
-// Tracked as a fraction of the shielded role's own max HP.
-//
-// Reset alongside the rest of a run's bookkeeping (Game.ResetInternal). ClearAllVisuals is a
-// SEPARATE step -- Reset only clears this class's own data, not the native ShieldValue byte it
-// wrote onto a real BattleChara, which otherwise keeps showing a fake shield bar in real
-// content forever for the local player (who persists past the sim, unlike a doppel).
+// Banked absorbable damage for shield mitigations, as a fraction of the shielded role's max
+// HP. ClearAllVisuals is separate from Reset: the native ShieldValue byte written onto the
+// real local player would otherwise show a fake shield bar in real content forever.
 public static class TankShieldTracker
 {
     private readonly record struct ShieldChunk(float FractionOfMaxHp, long ExpiresAtMs);
 
-    // Marks a chunk that only SetFromPeerReport replaces, never a timer -- used for the host's
-    // mirror of a peer's own self-shield (see SetFromPeerReport's own doc comment).
+    // A chunk only SetFromPeerReport replaces, never a timer.
     private const long NoExpiry = long.MaxValue;
 
     private static readonly Dictionary<PartyRole, List<ShieldChunk>> chunksByRole = new();
 
     public static void Reset() => chunksByRole.Clear();
 
-    // Adds on top of whatever's already banked -- real shields from different sources stack
-    // additively, so this never replaces. Local grants go through Grant + RefreshVisual
-    // directly (see LocalPlayerInputHooks).
+    // Additive: real shields from different sources stack.
     public static void Grant(PartyRole role, float fractionOfMaxHp, float durationSeconds)
     {
         if (fractionOfMaxHp <= 0f) return;
@@ -36,9 +28,8 @@ public static class TankShieldTracker
         list.Add(new ShieldChunk(fractionOfMaxHp, Environment.TickCount64 + (long)(durationSeconds * 1000f)));
     }
 
-    // Host-only: overwrites this role's ENTIRE banked shield with a peer's self-reported
-    // total -- a current-state snapshot, not an incremental grant. NoExpiry because the
-    // peer's NEXT report (including 0f) is what clears this, not an independent host timer.
+    // Host-only: replaces the role's whole banked shield with a peer's self-reported total;
+    // the peer's next report (including 0f) is what clears it.
     public static void SetFromPeerReport(PartyRole role, float fractionOfMaxHp)
     {
         chunksByRole[role] = fractionOfMaxHp > 0f ? [new ShieldChunk(fractionOfMaxHp, NoExpiry)] : [];
@@ -57,8 +48,7 @@ public static class TankShieldTracker
         return list.Sum(c => c.FractionOfMaxHp);
     }
 
-    // Drains oldest-first; returns how much was actually absorbed (capped by what's banked).
-    // Called once per hit from ApplyTankBusterDamage, after the flat-% mitigation math.
+    // Drains oldest-first; returns how much was absorbed.
     public static float Consume(PartyRole role, float fractionOfDamage)
     {
         if (fractionOfDamage <= 0f) return 0f;
@@ -77,9 +67,8 @@ public static class TankShieldTracker
         return absorbed;
     }
 
-    // Writes the native visual for one role -- BattleChara.ShieldValue drives the gold overlay
-    // on both the HP bar and party list. Clamped to 0-100 even though the tracked fraction can
-    // exceed 1.0 (stacked shields) -- purely cosmetic, absorption math always reads above.
+    // BattleChara.ShieldValue drives the gold overlay on the HP bar and party list. Cosmetic
+    // only, so the clamp to 0-100 never affects absorption.
     public static unsafe void RefreshVisual(SimCharacter member, PartyRole role)
     {
         var bc = member.BattleCharaPtr;
@@ -88,8 +77,7 @@ public static class TankShieldTracker
         bc->ShieldValue = (byte)Math.Clamp(pct, 0f, 100f);
     }
 
-    // Explicit rather than implied by Reset -- call on every sim exit, same call sites as
-    // RestoreGaugeIllusion.
+    // On every sim exit, same call sites as RestoreGaugeIllusion.
     public static unsafe void ClearAllVisuals(SimParty party)
     {
         foreach (var role in Enum.GetValues<PartyRole>())

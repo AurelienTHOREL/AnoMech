@@ -19,6 +19,7 @@ public sealed class TopP2PartySynergyScenario : IMultiplayerReplayable
     public bool SupportsMultiplayer => true;
 
     public void DrawSettings() => settingsWindow.Draw();
+    public object SettingsOverrides => settingsWindow.Overrides;
     private readonly TopP2PartySynergySettingsWindow settingsWindow = new();
 
     public IReadOnlyList<IScenarioAi> AiStrats => [new TopP2PartySynergyAi()];

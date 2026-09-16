@@ -14,6 +14,14 @@ internal static unsafe class InstanceContentDirectorHelper
     // flight) so MapController can retry instead of silently losing the call.
     public static bool ProcessDirectorUpdate(uint category, uint arg1 = 0, uint arg2 = 0, uint arg3 = 0, uint arg4 = 0, uint arg5 = 0, uint arg6 = 0)
     {
+        // Outside a sim this resolves the director of whatever instance the player is really
+        // in -- a live duty -- and drives its state machine. Nothing here may run there.
+        if (Plugin.GameInstance?.World.Map.IsInInstance != true)
+        {
+            Plugin.Log.Debug("[EventFrameworkHelper.ProcessDirectorUpdate] no sim in progress -- ignoring.");
+            return false;
+        }
+
         var eventFramework = EventFramework.Instance();
 
         if (eventFramework == null)

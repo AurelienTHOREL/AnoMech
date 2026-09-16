@@ -46,12 +46,10 @@ internal static unsafe class PartyCreator
 
     private static readonly Random Rng = new();
 
-    // networkRoles: slots claimed by other real multiplayer participants (never
-    // includes the local player's own role). Spawned as SimNetworkPuppet instead
-    // of an AI-driven SimPartyNpc — same visuals, but position comes from the
-    // network (see SimNetworkPuppet) rather than AiManager. Takes priority over
-    // `solo` so a solo-selected AI strat still shows other real participants.
-    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, uint? tankMaxHealth = null, PartyRole? roleOverride = null, bool solo = false, IReadOnlySet<PartyRole>? networkRoles = null)
+    // networkRoles: slots held by other real participants, spawned as SimNetworkPuppet (position
+    // from the network, not AiManager); takes priority over `solo`. networkNames: the player's
+    // lobby name for the nameplate/party list; a network role with no name keeps the job name.
+    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, uint? tankMaxHealth = null, PartyRole? roleOverride = null, bool solo = false, IReadOnlySet<PartyRole>? networkRoles = null, IReadOnlyDictionary<PartyRole, string>? networkNames = null)
     {
         var presets = roleOverride is { } skip
             ? PartyPresets.ForRole(skip)
@@ -75,7 +73,10 @@ internal static unsafe class PartyCreator
             {
                 var angle0 = (i / (float)presets.Count) * MathF.Tau;
                 var localPos0 = new Vector3(MathF.Sin(angle0) * RingRadius, 0f, MathF.Cos(angle0) * RingRadius);
-                var puppet = SpawnPuppet(preset, world, role, new Placement(localPos0, MathF.Atan2(-localPos0.X, -localPos0.Z)), itemSheet, tankMaxHealth);
+                var puppetPreset = networkNames?.GetValueOrDefault(role) is { Length: > 0 } playerName
+                    ? preset with { Name = playerName }
+                    : preset;
+                var puppet = SpawnPuppet(puppetPreset, world, role, new Placement(localPos0, MathF.Atan2(-localPos0.X, -localPos0.Z)), itemSheet, tankMaxHealth);
                 if (puppet != null) party.SetSlot(role, puppet);
                 continue;
             }
@@ -112,9 +113,7 @@ internal static unsafe class PartyCreator
         return member;
     }
 
-    // A puppet needs the same doppel visuals as a bot (Spawn) but never moves on
-    // its own — its Movement is a no-op (SimNetworkPuppet), so it's excluded from
-    // the Obstacles field that only steering doppels need.
+    // Same visuals as a bot, but excluded from the Obstacles field only steering doppels need.
     private static SimNetworkPuppet? SpawnPuppet(PartyMemberPreset preset, SimWorld world, PartyRole role, Placement placement, ExcelSheet<Item> itemSheet, uint? tankMaxHealth)
     {
         if (!SpawnNative(preset, world, role, placement, itemSheet, tankMaxHealth, out var idx)) return null;

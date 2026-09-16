@@ -1,3 +1,4 @@
+using System;
 using Dalamud.Game.Command;
 using Dalamud.Game.DutyState;
 using Dalamud.IoC;
@@ -40,6 +41,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private const string CommandName = "/anomech";
     private const string CommandAlias = "/ano";
+    private bool commandsRegistered;
 
     public Configuration Configuration { get; init; }
     internal static Configuration Config { get; private set; } = null!;
@@ -47,22 +49,15 @@ public sealed class Plugin : IDalamudPlugin
     public readonly WindowSystem WindowSystem = new("AnoMech");
     public Game Game { get; }
     public MultiplayerManager Multiplayer { get; } = new();
-    // Mirrors GameInstance below -- lets scenario-side code (TankMitigation) reach the
-    // active session without its own Plugin reference.
     internal static MultiplayerManager MultiplayerInstance { get; private set; } = null!;
     // SimObjects reach engine singletons through these statics (mirrors the
     // Plugin.* PluginService pattern).
     internal static Game GameInstance { get; private set; } = null!;
-    // Session-lifetime input hooks, owned here (not Game) so they're hooked once
-    // per load rather than per scenario. SimPlayer is the sole writer of their
-    // flags — it reconciles them from its own state each tick.
+    // Session-lifetime, hooked once per load; SimPlayer is the sole writer of their flags.
     internal static LocalPlayerInputHooks PlayerInputHooks { get; private set; } = null!;
     internal static LogManager LogManager { get; private set; } = null!;
     private ConfigWindow ConfigWindow { get; init; }
-    // internal static (not init) so MultiplayerManager can read the host's current
-    // scenario/strat/waymark selection (SelectedScenario/SelectedStrat/SelectedWaymark)
-    // without needing its own Plugin/MainWindow reference -- mirrors the GameInstance
-    // static-accessor pattern just above.
+    // Static so MultiplayerManager can read the host's current selection.
     internal static MainWindow MainWindow { get; private set; } = null!;
     internal MultiplayerWindow MultiplayerWindow { get; init; }
     internal RunningSimWindow RunningSimWindow { get; init; }
@@ -74,69 +69,93 @@ public sealed class Plugin : IDalamudPlugin
     {
         // First, so every subsequent construction step's own logging is captured from the start.
         Core.DiagnosticLog.Initialize();
-        Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        Config = Configuration;
+        try
+        {
+            Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+            Config = Configuration;
 
-        LogManager = new LogManager();
-        if (Config.EnableEventLogging) LogManager.Open();
+            LogManager = new LogManager();
+            if (Config.EnableEventLogging) LogManager.Open();
 
-        PlayerInputHooks = new LocalPlayerInputHooks(GameInterop);
-        Game = new Game();
-        GameInstance = Game;
-        MultiplayerInstance = Multiplayer;
-        ConfigWindow = new ConfigWindow(this);
-        MainWindow = new MainWindow(this);
-        MultiplayerWindow = new MultiplayerWindow(this);
-        RunningSimWindow = new RunningSimWindow(this);
+            PlayerInputHooks = new LocalPlayerInputHooks(GameInterop);
+            Game = new Game();
+            GameInstance = Game;
+            MultiplayerInstance = Multiplayer;
+            ConfigWindow = new ConfigWindow(this);
+            MainWindow = new MainWindow(this);
+            MultiplayerWindow = new MultiplayerWindow(this);
+            RunningSimWindow = new RunningSimWindow(this);
 
-        WindowSystem.AddWindow(ConfigWindow);
-        WindowSystem.AddWindow(MainWindow);
-        WindowSystem.AddWindow(MultiplayerWindow);
-        WindowSystem.AddWindow(RunningSimWindow);
+            WindowSystem.AddWindow(ConfigWindow);
+            WindowSystem.AddWindow(MainWindow);
+            WindowSystem.AddWindow(MultiplayerWindow);
+            WindowSystem.AddWindow(RunningSimWindow);
 #if DEBUG
-        DamageDebugWindow = new DamageDebugWindow(this);
-        WindowSystem.AddWindow(DamageDebugWindow);
+            DamageDebugWindow = new DamageDebugWindow(this);
+            WindowSystem.AddWindow(DamageDebugWindow);
 #endif
 
-        if (Config.OpenSimMenuOnInn && ZoneSession.IsInInn())
-            MainWindow.IsOpen = true;
+            if (Config.OpenSimMenuOnInn && ZoneSession.IsInInn())
+                MainWindow.IsOpen = true;
 
-        CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
+            CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
+            {
+                HelpMessage = "Open AnoMech. Subcommands: config, mp, start, reset, leave"
+            });
+            CommandManager.AddHandler(CommandAlias, new CommandInfo(OnCommand)
+            {
+                HelpMessage = "Alias for /anomech"
+            });
+            commandsRegistered = true;
+
+            PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
+            Framework.Update += OnFrameworkUpdate;
+
+            PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
+            PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
+            ClientState.TerritoryChanged += OnTerritoryChanged;
+            DutyState.DutyStarted += OnDutyStarted;
+            DutyState.DutyWiped += OnDutyWiped;
+            DutyState.DutyCompleted += OnDutyCompleted;
+
+            // Initialize Pointers
+            CharacterManagerPointers.Initialize();
+            EventFrameworkPointers.Initialize();
+            EventObjectManagerPointers.Initialize();
+            EventObjectPointers.Initialize();
+            GameMainPointers.Initialize();
+            ModelContainerPointers.Initialize();
+            PacketDispatcherPointers.Initialize();
+            RsfPointers.Initialize();
+            StatusManagerPointers.Initialize();
+            TimelineContainerPointers.Initialize();
+            VfxContainerPointers.Initialize();
+            VfxDataPointers.Initialize();
+
+            Log.Information($"===A cool log message from {PluginInterface.Manifest.Name}===");
+            // The diagnostic log's own header is written before any hook exists, so it alone
+            // doesn't prove a load succeeded.
+            Core.DiagnosticLog.Info("[Plugin] constructed OK -- all hooks and pointers initialized.");
+        }
+        catch (Exception)
         {
-            HelpMessage = "Open AnoMech. Subcommands: config, mp, start, reset, leave"
-        });
-        CommandManager.AddHandler(CommandAlias, new CommandInfo(OnCommand)
-        {
-            HelpMessage = "Alias for /anomech"
-        });
-
-        PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
-        Framework.Update += OnFrameworkUpdate;
-
-        PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
-        PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
-        ClientState.TerritoryChanged += OnTerritoryChanged;
-        DutyState.DutyStarted += OnDutyStarted;
-        DutyState.DutyWiped += OnDutyWiped;
-        DutyState.DutyCompleted += OnDutyCompleted;
-
-        // Initialize Pointers
-        CharacterManagerPointers.Initialize();
-        EventFrameworkPointers.Initialize();
-        EventObjectManagerPointers.Initialize();
-        EventObjectPointers.Initialize();
-        GameMainPointers.Initialize();
-        ModelContainerPointers.Initialize();
-        PacketDispatcherPointers.Initialize();
-        RsfPointers.Initialize();
-        StatusManagerPointers.Initialize();
-        TimelineContainerPointers.Initialize();
-        VfxContainerPointers.Initialize();
-        VfxDataPointers.Initialize();
-
-        Log.Information($"===A cool log message from {PluginInterface.Manifest.Name}===");
+            // Dalamud never disposes an instance whose constructor threw; the log writer's open
+            // handle would then block every later load from rotating the active log.
+            Log.Warning("[Plugin] Load failed during construction -- tearing down partial state.");
+            try
+            {
+                Dispose();
+            }
+            catch (Exception teardown)
+            {
+                Log.Warning($"[Plugin] Partial teardown after failed load threw: {teardown.Message}");
+            }
+            throw;
+        }
     }
 
+    // Null-tolerant throughout: the constructor's failure path calls this on a half-built
+    // instance, where anything past the throwing step was never assigned.
     public void Dispose()
     {
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
@@ -150,24 +169,28 @@ public sealed class Plugin : IDalamudPlugin
 
         WindowSystem.RemoveAllWindows();
 
+        Core.Native.TimelineDebug.Shutdown();
+        Core.Native.VfxSpawnLog.Dispose();
         Multiplayer.Dispose();
-        Game.Dispose();
+        Game?.Dispose();
         // After Game.Dispose so World.Dispose → SimPlayer.Despawn can still clear
         // the lock flags through the hooks before they're torn down.
-        PlayerInputHooks.Dispose();
-        LogManager.Dispose();
-        ConfigWindow.Dispose();
-        MainWindow.Dispose();
-        MultiplayerWindow.Dispose();
+        PlayerInputHooks?.Dispose();
+        LogManager?.Dispose();
+        ConfigWindow?.Dispose();
+        MainWindow?.Dispose();
+        MultiplayerWindow?.Dispose();
 #if DEBUG
-        DamageDebugWindow.Dispose();
+        DamageDebugWindow?.Dispose();
 #endif
 
-        CommandManager.RemoveHandler(CommandName);
-        CommandManager.RemoveHandler(CommandAlias);
+        if (commandsRegistered)
+        {
+            CommandManager.RemoveHandler(CommandName);
+            CommandManager.RemoveHandler(CommandAlias);
+        }
 
-        // Last, so it captures every other subsystem's own teardown logging, then flushes and
-        // closes the active log file before the DLL unloads (an update reload included).
+        // Last, so it captures every other subsystem's teardown logging before the DLL unloads.
         Core.DiagnosticLog.Shutdown();
     }
 
@@ -178,8 +201,12 @@ public sealed class Plugin : IDalamudPlugin
         // full-precision delta the game ticks its own animations with.
         var fw = CSFramework.Instance();
         if (fw == null) return;
-        Game.Tick(fw->FrameDeltaTime);
-        Multiplayer.Tick(fw->FrameDeltaTime);
+        // Both ticks reach code driven by whatever a relay sent; neither may take the frame
+        // pump down.
+        try { Game.Tick(fw->FrameDeltaTime); }
+        catch (Exception e) { Core.DiagnosticLog.Warn($"[Plugin] Game.Tick threw: {e}"); }
+        try { Multiplayer.Tick(fw->FrameDeltaTime); }
+        catch (Exception e) { Core.DiagnosticLog.Warn($"[Plugin] Multiplayer.Tick threw: {e}"); }
     }
 
     private void OnTerritoryChanged(uint territory)

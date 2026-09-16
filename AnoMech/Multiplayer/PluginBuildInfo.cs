@@ -6,9 +6,8 @@ using AnoMech.Core;
 
 namespace AnoMech.Multiplayer;
 
-// Identifies exactly which build of the plugin is running, so a host/peer mismatch (stale
-// update, local dev build sharing a version number) can be caught before it desyncs. Version
-// alone can't catch that -- Checksum hashes the DLL's own bytes so it can.
+// Checksum hashes the DLL itself: a local dev build shares its version number with the
+// release it was built from, and a build mismatch means differing scenario/protocol logic.
 internal static class PluginBuildInfo
 {
     public static string Version { get; } = ComputeVersion();
@@ -25,13 +24,12 @@ internal static class PluginBuildInfo
     {
         try
         {
-            // Assembly.GetExecutingAssembly().Location is always "" -- Dalamud loads plugin
-            // DLLs via Assembly.Load(byte[]), not from a file path. PluginInterface
-            // .AssemblyLocation is Dalamud's own answer to where the DLL actually lives.
+            // Assembly.Location is empty under Dalamud (plugins load from bytes);
+            // AssemblyLocation is the real path.
             var path = Plugin.PluginInterface.AssemblyLocation.FullName;
             if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "unknown";
             using var stream = File.OpenRead(path);
-            return Convert.ToHexString(SHA256.HashData(stream))[..16]; // first 16 hex chars of the SHA-256
+            return Convert.ToHexString(SHA256.HashData(stream))[..16];
         }
         catch (Exception e)
         {

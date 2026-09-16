@@ -42,9 +42,7 @@ public unsafe class MainWindow : Window, IDisposable
     // first group); stays null for ungrouped scenarios. Filters AiStrats under the buttons.
     private string? _selectedStratGroup;
 
-    // Remembers the last region the user picked per grouped scenario. On a scenario switch
-    // _selectedStratGroup is restored from here instead of being reset, so coming back to a
-    // scenario keeps its previously selected region rather than snapping to the first.
+    // The last region picked per grouped scenario, restored on a switch back to it.
     private readonly Dictionary<IScenario, string> _stratGroupMemory = new();
 
     // Index 0 = Auto (null override); indices 1..8 map to (PartyRole)(idx - 1).
@@ -57,11 +55,8 @@ public unsafe class MainWindow : Window, IDisposable
     private readonly DebugMenu debugMenu;
 #endif
 
-    // <Version> from AnoMech.csproj flows into the assembly version; surface it,
-    // plus the plugin build checksum (PluginBuildInfo -- the same value the
-    // multiplayer handshake compares to catch a host/peer on different
-    // builds), in the title bar. Use a ### id so the window identity stays
-    // "MainWindow" across versions.
+    // Version plus the build checksum the multiplayer handshake compares; the ### id keeps the
+    // window identity stable across versions.
     private static string TitleWithVersion()
         => $"AnoMech v{PluginBuildInfo.Version} ({PluginBuildInfo.ShortChecksum})###MainWindow";
 
@@ -91,15 +86,15 @@ public unsafe class MainWindow : Window, IDisposable
 #endif
     }
 
-    public void Dispose() { }
+    public void Dispose()
+    {
+#if DEBUG
+        debugMenu.Dispose();
+#endif
+    }
 
-    // Hidden while the fake-zone instance is loaded -- this is a full scenario
-    // picker with no reason to stay on screen mid-fight, and RunningSimWindow's
-    // compact Start/Reset/Leave/Leave-session substitute (see its own doc
-    // comment) covers everything this window's controls would otherwise be
-    // needed for. Reopened automatically once back out of the instance, but
-    // only if we're the one who closed it (hiddenByUs) -- a user who closed
-    // it themselves mid-fight shouldn't have it pop back open on them.
+    // Hidden while the instance is loaded (RunningSimWindow covers Start/Reset/Leave) and
+    // reopened afterwards only if we were the one who closed it.
     private bool hiddenByUs;
 
     public override void PreOpenCheck()
@@ -200,9 +195,7 @@ public unsafe class MainWindow : Window, IDisposable
         _selectedStratGroup = _stratGroupMemory.GetValueOrDefault(scenario);
     }
 
-    // Explains a control disabled for multiplayer reasons -- shared by every BeginDisabled
-    // site keyed on the Multiplayer window being open and/or an active connection, so the
-    // wording (and which of the two actually applies) stays consistent everywhere it appears.
+    // Shared wording for every control disabled by the Multiplayer window or a live session.
     private static string MpDisabledReason(bool windowOpen, bool connected) => (windowOpen, connected) switch
     {
         (true, true) => "Disabled: the Multiplayer window is open and you're connected to a multiplayer session.",
@@ -239,11 +232,8 @@ public unsafe class MainWindow : Window, IDisposable
         ImGui.Separator();
         DrawLocationHint();
 
-        // Role is claimed via the Multiplayer window's own buttons once connected, not this
-        // selector (which picks which slot the real player occupies in solo play) -- disabled
-        // for host and guest alike so it can't drift out of sync with the actual claim. Forced
-        // back to Auto (not just disabled) so a role picked before connecting can't silently
-        // keep applying underneath the real multiplayer role claim.
+        // Once connected the role comes from the Multiplayer claim; forced back to Auto, not
+        // just disabled, so an earlier pick can't apply underneath it.
         var mpConnectedForRole = plugin.Multiplayer.IsConnected;
         if (mpConnectedForRole) _roleOverride = null;
         ImGui.BeginDisabled(mpConnectedForRole);
@@ -254,12 +244,8 @@ public unsafe class MainWindow : Window, IDisposable
         if (mpConnectedForRole && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip("Role is claimed via the Multiplayer window instead. " + MpDisabledReason(false, true));
 
-        // Region/strat only matter as the HOST's choice -- that's what gets broadcast and
-        // actually run (see MultiplayerManager.StartScenario). A guest's own local selection
-        // here does nothing but could confuse them into thinking they're choosing something.
-        // Forced back to the first region/strat (same defaults SelectScenario sets) rather than
-        // just disabled, so a guest's dropdown doesn't sit frozen on whatever they'd picked
-        // right before someone else started the run.
+        // Only the host's region/strat is broadcast and run; a guest's is reset, not just
+        // disabled, so it doesn't sit frozen on a stale pick.
         var mpGuest = plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost;
         if (mpGuest)
         {
@@ -297,15 +283,11 @@ public unsafe class MainWindow : Window, IDisposable
             }
         }
 
-        // God mode, the speed toggle, and Scenario config all tune solo-play behavior that a
-        // multiplayer session doesn't use (see MultiplayerManager.StartScenario/RunScenarioAsHost)
-        // -- disabled both while setting up a session (Multiplayer window open) and once one's
-        // actually live (IsConnected), not just one or the other.
+        // God mode, speed and the solo scenario config are disabled while a session is being set
+        // up or is live; forced to defaults, not just disabled, so a stale value can't apply.
         var mpWindowOpen = plugin.MultiplayerWindow.IsOpen;
         var mpConnected = plugin.Multiplayer.IsConnected;
         var mpActive = mpWindowOpen || mpConnected;
-        // Forced to its default (not just disabled) so a value left on from before the
-        // Multiplayer window opened / a session connected can't keep silently applying.
         if (mpActive) game.GodMode = false;
         ImGui.BeginDisabled(mpActive);
         var god = game.GodMode;
@@ -331,17 +313,29 @@ public unsafe class MainWindow : Window, IDisposable
         if (ImGui.CollapsingHeader("Scenario config", ImGuiTreeNodeFlags.DefaultOpen))
         {
             ImGui.Indent();
-            // DrawSettings (solo-only randomization) stays disabled in multiplayer;
-            // DrawMultiplayerSettings is the opposite (only matters in multiplayer), so it's
-            // deliberately outside this BeginDisabled/EndDisabled pair.
-            ImGui.BeginGroup();
-            ImGui.BeginDisabled(mpActive);
-            _selectedScenario.DrawSettings();
-            ImGui.EndDisabled();
-            ImGui.EndGroup();
-            if (mpActive && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                ImGui.SetTooltip(MpDisabledReason(mpWindowOpen, mpConnected));
-            _selectedScenario.DrawMultiplayerSettings();
+            if (mpConnected)
+            {
+                ImGui.TextDisabled(plugin.Multiplayer.IsHost
+                    ? "Configured in the Multiplayer window while hosting."
+                    : "The host configures the scenario -- see the Multiplayer window.");
+            }
+            else
+            {
+                // DrawMultiplayerSettings only matters in multiplayer, so it stays outside the
+                // disabled block.
+                ImGui.BeginGroup();
+                ImGui.BeginDisabled(mpActive);
+                _selectedScenario.DrawSettings();
+                ImGui.EndDisabled();
+                ImGui.EndGroup();
+                if (mpActive && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip(MpDisabledReason(mpWindowOpen, mpConnected));
+                // Solo keeps its own copy: these are the player's own mechanics, not only a
+                // host's assignment.
+                MultiplayerWindow.DrawAssignMechanicsButton(_selectedScenario, mpActive,
+                                                            MpDisabledReason(mpWindowOpen, mpConnected));
+                _selectedScenario.DrawMultiplayerSettings();
+            }
             ImGui.Unindent();
         }
 
@@ -354,9 +348,7 @@ public unsafe class MainWindow : Window, IDisposable
 #endif
     }
 
-    // Solo/AI Start button. Self-contained (recomputes its own env/strat checks
-    // rather than taking them as parameters) so RunningSimWindow can call this
-    // directly while a sim is running, not just DrawMainContent above.
+    // Self-contained so RunningSimWindow can draw it too.
     internal void DrawSoloStartButton()
     {
         if (_selectedScenario == null) return;
@@ -364,14 +356,8 @@ public unsafe class MainWindow : Window, IDisposable
         var busy = ZoneSession.IsPlayerBusy();
         var envReady = inInn && !busy;
         var hasStrat = HasStartableStrat();
-        // This calls game.RunScenario directly -- the plain solo/AI path, entirely
-        // bypassing MultiplayerManager. While connected to a multiplayer session for
-        // this scenario, that path must be blocked: the host clicking this instead
-        // of the Multiplayer window's own Start button would run a real fight
-        // locally without ever sending a StartMessage, leaving every guest stuck on
-        // "waiting for the host to start" forever; a peer clicking it would start a
-        // second, fully independent local simulation instead of waiting for the
-        // host's broadcast.
+        // The solo path bypasses MultiplayerManager: a host would run the fight without a
+        // StartMessage, a peer would start a second independent simulation.
         var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
         var canStart = envReady && hasStrat && !mpBlocked;
         ImGui.BeginDisabled(!canStart);
@@ -389,16 +375,11 @@ public unsafe class MainWindow : Window, IDisposable
         }
     }
 
-    // Reset, plus (while in-instance) Leave -- redirecting through the host for a
-    // connected peer exactly like MultiplayerWindow's own Leave-session button
-    // does. Self-contained like DrawSoloStartButton above, for the same reason.
+    // Reset, plus Leave while in-instance; a connected peer's clicks route through the host.
     internal void DrawResetLeaveButtons()
     {
         var game = plugin.Game;
-        // A peer's own Game.Reset() would only clear their own local view --
-        // route through the host instead so a reset reaches the whole group.
-        // The host's own click needs no such redirect: it's already
-        // authoritative and already propagates via Tick()/EndMessage.
+        // A peer's own Game.Reset() would only clear their local view.
         if (ImGui.Button("Reset"))
         {
             if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
@@ -409,12 +390,7 @@ public unsafe class MainWindow : Window, IDisposable
         if (game.World.Map.IsInInstance)
         {
             ImGui.SameLine();
-            // Same redirect reasoning as Reset above: a peer's own Game.Leave()
-            // would only unload their own local zone, leaving the host still
-            // simulating/broadcasting to a puppet-driven world they've since
-            // torn down. Routing through the host ends the run for the whole
-            // group (see MultiplayerManager.RequestLeaveInstance) while
-            // leaving the session itself intact.
+            // A peer's own Game.Leave() would leave the host simulating for a torn-down world.
             if (ImGui.Button("Leave"))
             {
                 if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
@@ -422,19 +398,14 @@ public unsafe class MainWindow : Window, IDisposable
                 else
                 {
                     game.Leave();
-                    // A prior Reset already consumed the one-shot Tick() edge trigger
-                    // that would normally broadcast this -- without an explicit call
-                    // here, peers never learn the host left and get stuck in-instance.
-                    // See MultiplayerManager.NotifyLeftInstance's doc comment.
+                    // A prior Reset consumed Tick()'s one-shot end trigger (see NotifyLeftInstance).
                     plugin.Multiplayer.NotifyLeftInstance();
                 }
             }
         }
     }
 
-    // Drawn below the strat picker for scenarios that declare WaymarkPresets. _selectedWaymark
-    // is the index passed to RunScenario on Start; changing it while a scenario is loaded
-    // re-places the markers immediately (same live-feedback loop as the position readout).
+    // Changing the preset while a scenario is loaded re-places the markers immediately.
     private void DrawWaymarkSelector()
     {
         if (_selectedScenario is null) return;
@@ -534,11 +505,8 @@ public unsafe class MainWindow : Window, IDisposable
             _selectedStrat = filtered[localIdx];
     }
 
-    // True when Start may run a strat: ungrouped scenarios are always fine; grouped
-    // scenarios require the current selection to be a real strat in the active region.
-    // internal (not private): MultiplayerManager.StartScenario reuses this exact check
-    // before broadcasting SelectedAi -- an out-of-range/-1 index would throw when a
-    // debug-bot peer later indexes AiStrats[SelectedAi] (see TryStartDebugBotReplay).
+    // Grouped scenarios need a real strat in the active region. Also the host's pre-broadcast
+    // check in MultiplayerManager.StartScenario.
     internal bool HasStartableStrat()
     {
         if (_selectedScenario is not { } scenario) return false;

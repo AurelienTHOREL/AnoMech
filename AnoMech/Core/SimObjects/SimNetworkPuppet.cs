@@ -7,46 +7,26 @@ using FFXIVClientStructs.FFXIV.Client.Game.Character;
 
 namespace AnoMech.Core.SimObjects;
 
-// A party slot occupied by a real remote player (a multiplayer peer, or the
-// host's own view of one) rather than a local AI bot. Visually identical to
-// SimPartyNpc -- same Lalafell-doppel spawn path in PartyCreator -- but its
-// Movement is a no-op (NetworkPuppetMovement) so scenario/AI code that
-// addresses party slots uniformly (AiManager.Move calls .MoveTo on every
-// slot, including the real local player's) harmlessly skips it exactly the
-// way it already skips SimPlayer. The only writer of this slot's position is
-// ApplyNetworkPose, driven by poses received from the peer who owns it.
+// A party slot occupied by a real remote player. Same doppel spawn path as SimPartyNpc, but
+// Movement is a no-op (NetworkPuppetMovement), so code that addresses every slot uniformly
+// skips it the way it skips SimPlayer; only ApplyNetworkPose moves it.
 //
-// Deliberately not a SimPartyNpc subclass: SimPartyNpc is sealed, and the two
-// only share ~a dozen lines (Dead/OnKilled/Knockback), so a sibling class is
-// simpler than lifting the seal on tested engine code for one extra caller.
+// Not a SimPartyNpc subclass: that class is sealed and the two share only a dozen lines.
 public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
 {
-    // Sanity cap on how fast we step toward a newly received pose. Distances beyond
-    // SnapThreshold (spawn placement, a lag spike, a genuine teleport) skip
-    // interpolation entirely rather than visibly gliding across the arena.
-    // See SimEnemy.NetworkCatchUpSpeed's doc comment for why this was raised from
-    // 12f -- same reasoning: it's meant to be a jitter filter over
-    // MultiplayerManager's snapshot interval, not a second lag source stacked on
-    // top of it.
+    // Same smoothing model as SimEnemy's Network* fields: the catch-up speed is a floor once
+    // the real pose interval is known, anything beyond SnapThreshold (spawn, lag spike,
+    // teleport) snaps instead of gliding, and extrapolation only feeds the visual glide.
     private const float CatchUpSpeed = 20f;
     private const float SnapThreshold = 15f;
-    // Angular counterpart to CatchUpSpeed -- see SimEnemy.NetworkAngularCatchUpSpeed's
-    // doc comment (same reasoning, same value) for why rotation needs stepping too,
-    // and why this was raised from a half-turn-in-1/8s.
     private const float AngularCatchUpSpeed = MathF.PI * 20f;
-    // See SimEnemy.NetworkIntervalSmoothingFactor -- same reasoning: CatchUpSpeed is
-    // a floor once the real pose interval is known, not the pacing itself.
     private const float IntervalSmoothingFactor = 0.3f;
     private const float MinPacingWindowSeconds = 0.05f;
     private float timeSinceLastPose;
     private float estimatedPoseInterval = 0.05f;
-    // See SimEnemy.MaxNetworkExtrapolationSeconds -- same reasoning. Only feeds the
-    // Tick() glide target below; targetPosition/Position (mechanic resolution) is
-    // never touched by it.
     private const float MaxPoseExtrapolationSeconds = 1f;
     private Vector3 poseVelocity;
-    // Mirrors Game.Movement.RunTimelineId -- can't reference it by type name here
-    // since the Movement property below shadows the Movement type in this scope.
+    // Game.Movement.RunTimelineId; the Movement property below shadows that type name here.
     private const ushort RunTimelineId = 22;
 
     private Vector3? targetPosition;
@@ -54,19 +34,11 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
     private bool interpAnimActive;
     private bool poseMoving;
 
-    // Tolerance below which two consecutive poses read as "the same spot" rather
-    // than motion -- filters quantization/floating-point noise between updates
-    // that are otherwise identical. See SimEnemy.NetworkMovementEpsilon (same
-    // reasoning, same value).
+    // Below this, two consecutive poses read as "same spot" rather than motion.
     private const float PoseMovementEpsilon = 0.01f;
 
-    // Mechanic resolution (AoeQuery, stack/distance checks, gaze facing, ...) must
-    // see where the peer's real character actually is right now, not wherever the
-    // model has smoothly interpolated to -- ticking mechanics off the render-lagged
-    // position would judge a correctly-positioned player as being in the wrong spot
-    // (or vice versa) for as long as the catch-up step hasn't landed. base.Position
-    // (native transform) is still what Tick's interpolation drives and what the
-    // player visually sees; this only redirects what game logic reads.
+    // Mechanic resolution must see where the peer's real character is, not where the model
+    // has interpolated to; base.Position stays what Tick drives and what is rendered.
     public override Vector3 Position => targetPosition ?? base.Position;
 
     public PartyRole Role { get; set; }
@@ -83,16 +55,9 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
 
     private protected override Movement Movement => field ??= new NetworkPuppetMovement(this);
 
-    // Records the latest pose reported by the owning peer's real client. The
-    // actual position write happens in Tick (see below) so the model steps
-    // toward it smoothly with the run animation playing, instead of teleporting
-    // once per network update. poseMoving is read off whether the reported
-    // position is actually advancing between updates, not off local
-    // interpolation state -- see SimEnemy.TickNetworkPosition's doc comment for
-    // why that's the more robust signal (this class doesn't hit the specific
-    // AnimationLock desync that motivated it there -- AnimationLock is always
-    // false for a puppet -- but the same "gap between targets can shrink to
-    // nothing once updates arrive fast enough" risk applies here too).
+    // The position write happens in Tick so the model steps toward the pose with the run
+    // animation playing. poseMoving comes from whether the reported position is advancing,
+    // not from interpolation state (see SimEnemy.TickNetworkPosition).
     public void ApplyNetworkPose(Vector3 position, float rotation)
     {
         if (targetPosition is { } previous)
@@ -112,9 +77,8 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
         if (Dead || targetPosition is not { } rawTarget) return;
         timeSinceLastPose += deltaSeconds;
 
-        // Interpolate the visual/native transform, not the overridden Position
-        // (which reports targetPosition directly, untouched by the extrapolation
-        // below) -- basePos is where the rendered model currently sits.
+        // Interpolates the native transform; the overridden Position reports targetPosition
+        // untouched by the extrapolation.
         var target = rawTarget + poseVelocity * MathF.Min(timeSinceLastPose, MaxPoseExtrapolationSeconds);
         var basePos = base.Position;
         var delta = target - basePos;
@@ -127,23 +91,28 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
         else
             SetPosition(new Placement(basePos + delta / dist * step, nextRotation));
 
+        // Native entry points: interpolation is not a scenario cue to broadcast.
         if (poseMoving && !interpAnimActive)
         {
-            PlayActionTimeline(RunTimelineId, baseOverride: RunTimelineId);
+            PlayActionTimelineNative(RunTimelineId, baseOverride: RunTimelineId);
             interpAnimActive = true;
         }
         else if (!poseMoving && interpAnimActive)
         {
-            ResetActionTimeline();
+            ResetActionTimelineNative();
             interpAnimActive = false;
         }
     }
 
-    // Knockback on this puppet only moves the host's local cosmetic copy -- it never reaches
-    // the peer's own real character (whose position this puppet mirrors FROM, not the other
-    // way around). MultiplayerManager polls this to broadcast a KnockbackMessage telling the
-    // owning peer to apply it to their real character.
+    // A forced move here only moves the host's cosmetic copy; MultiplayerManager polls these
+    // to tell the owning peer to apply it to their real character.
     public (Vector3 Source, float Distance, float Speed)? PendingNetworkKnockback { get; private set; }
+    public (float Heading, float Distance, float Speed, float DurationSeconds)? PendingNetworkPush { get; private set; }
+    public Placement? PendingNetworkTeleport { get; private set; }
+    // Edge-triggered on the (target, speed) pair: Umad P1's confused chase re-issues Follow
+    // every tick with the same target.
+    public (SimCharacter? Target, float Speed)? PendingNetworkFollow { get; private set; }
+    private (SimCharacter? Target, float Speed) lastNetworkFollow;
 
     public void Knockback(Vector3 source, float distance, float speed)
     {
@@ -152,6 +121,45 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
     }
 
     public void ClearPendingNetworkKnockback() => PendingNetworkKnockback = null;
+
+    public void PushInDirection(float heading, float distance, float speed)
+    {
+        Movement.PushInDirection(heading, distance, speed);
+        PendingNetworkPush = (heading, distance, speed, 0f);
+    }
+
+    public void PushInDirectionEased(float heading, float distance, float durationSeconds)
+    {
+        Movement.PushInDirectionEased(heading, distance, durationSeconds);
+        PendingNetworkPush = (heading, distance, 0f, durationSeconds);
+    }
+
+    public void ClearPendingNetworkPush() => PendingNetworkPush = null;
+
+    // The cosmetic copy snaps too, so mechanics read the new spot until the peer's next pose.
+    public void TeleportTo(Placement placement)
+    {
+        SetPosition(placement);
+        if (targetPosition != null) targetPosition = placement.Position;
+        PendingNetworkTeleport = placement;
+    }
+
+    public void ClearPendingNetworkTeleport() => PendingNetworkTeleport = null;
+
+    // Only a forced follow reaches the owner: an unforced one is a strat walking its bots, and
+    // the person in this seat is playing, not being driven. A release always propagates -- it
+    // only ever hands control back. Never applied locally either: this copy's position is the
+    // owner's reported pose, which TickFollow would fight every frame.
+    public override void Follow(SimCharacter? target = null, float speed = 6f, bool forced = false)
+    {
+        var liveTarget = target.IsAlive() ? target : null;
+        if (!forced && liveTarget != null) return;
+        if (ReferenceEquals(liveTarget, lastNetworkFollow.Target) && (liveTarget == null || speed == lastNetworkFollow.Speed)) return;
+        lastNetworkFollow = (liveTarget, speed);
+        PendingNetworkFollow = lastNetworkFollow;
+    }
+
+    public void ClearPendingNetworkFollow() => PendingNetworkFollow = null;
 
     public void OnKilled()
     {

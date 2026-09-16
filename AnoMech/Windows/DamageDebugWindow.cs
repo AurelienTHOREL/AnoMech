@@ -55,10 +55,8 @@ internal sealed class DamageDebugWindow : Window, IDisposable
     private float sourceRemaining;
     private IDalamudTextureWrap? tex;
 
-    // Captured on every Resolve regardless of IsOpen/frozen (unlike the grid/texture
-    // heatmap below, which is only built while the window is actually open) -- so
-    // Freeze()'s file dump has something to write even if the user never opened this
-    // window at all. See DumpToFile.
+    // Captured regardless of IsOpen/frozen, so Freeze()'s dump works without the window ever
+    // having been opened.
     private AoeQuery? lastRecordedQuery;
 
     public DamageDebugWindow(Plugin plugin)
@@ -166,10 +164,8 @@ internal sealed class DamageDebugWindow : Window, IDisposable
     }
 
     // Auto-freeze hook for the wipe sequence (Game.Kill). Snapshots the heatmap as-is
-    // so the killing AOE — recorded moments earlier in the same Resolve — stays visible.
-    // Also dumps that same killing query to a file (see DumpToFile) -- this runs
-    // regardless of whether the window was ever opened, so a fresh Debug build hands
-    // you a shareable text file on the very first death with no setup.
+    // so the killing AOE — recorded moments earlier in the same Resolve — stays visible,
+    // and dumps that query whether or not the window was ever opened.
     internal void Freeze()
     {
         frozen = true;
@@ -177,11 +173,9 @@ internal sealed class DamageDebugWindow : Window, IDisposable
         DumpToFile();
     }
 
-    // Records a party/AOE state snapshot into DiagnosticLog's persistent log. Re-derives the
-    // Action sheet's own shape fields the same way CharacterFind.InsideActionAoe does, and
-    // re-runs the same query against every party member (dead ones included, via AllMembers)
-    // so the snapshot shows who was inside the shape. Also called periodically by Game.Tick so
-    // near-live state is captured even on a run where nobody dies.
+    // A party/AOE state snapshot into DiagnosticLog; the last query is re-run against every
+    // party member (dead ones included) to show who was inside the shape. Also called
+    // periodically by Game.Tick.
     internal void DumpToFile()
     {
         try
@@ -229,10 +223,7 @@ internal sealed class DamageDebugWindow : Window, IDisposable
                 var statusLabel = statuses.Count == 0
                     ? ""
                     : "  statuses=[" + string.Join(", ", statuses.Select(s => s.Stacks > 1 ? $"{s.StatusId}x{s.Stacks}" : $"{s.StatusId}")) + "]";
-                // Who's actually driving this slot on THIS client -- essential for comparing
-                // a host dump against a guest dump, since both list the same 8 party roles but
-                // only one slot on each side is "YOU"; everyone else is a network-mirrored PEER
-                // or a locally-simulated BOT doppel filling an empty seat.
+                // Who drives this slot on this client, for comparing a host dump with a guest's.
                 var driver = member switch
                 {
                     SimPlayer => DebugBotControl.Enabled ? "YOU(bot)" : "YOU",
@@ -244,9 +235,6 @@ internal sealed class DamageDebugWindow : Window, IDisposable
             sb.AppendLine();
 
             sb.AppendLine("Enemies currently in world:");
-            // world.Children accumulates every SimEnemy ever spawned this run and never drops
-            // despawned ones from the list -- IsActive (BattleCharaPtr != null) is what actually
-            // tells a live one from a torn-down leftover still holding its last position.
             var enemies = plugin.Game.World.Children.OfType<SimEnemy>().Where(e => e.IsActive).ToList();
             if (enemies.Count == 0)
                 sb.AppendLine("  (none)");
@@ -268,10 +256,7 @@ internal sealed class DamageDebugWindow : Window, IDisposable
                 }
             sb.AppendLine();
 
-            // Routed into DiagnosticLog's own persistent log (see LogSnapshot) instead of a
-            // second file -- per-tick log lines are already written there continuously, so a
-            // bug report is one file either way, and every snapshot this produces is now kept,
-            // not just the latest.
+            // Into the diagnostic log rather than a second file, so a bug report is one file.
             AnoMech.Core.DiagnosticLog.LogSnapshot("Damage Debug Snapshot", sb.ToString());
         }
         catch (Exception ex)

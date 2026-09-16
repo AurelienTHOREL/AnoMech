@@ -29,13 +29,28 @@ public sealed class MapController : IDisposable
         public int FramesLeft;
     }
 
-    // AddEffect/DirectorUpdate calls that couldn't apply immediately (zone still
-    // async-loading -- same race as the collider drops above) get retried here
-    // each Tick until they land or time out. Needed because a peer's zone load
-    // consistently lags the host's by a few seconds, and a scenario's early
-    // world.Events.Add(0..3f, ...) calls land well inside that window.
+    // AddEffect/DirectorUpdate calls the zone can't accept yet (still async-loading) are retried
+    // each Tick: a peer's zone load lags the host's by seconds, and a scenario's early events
+    // land in that window.
     private readonly List<PendingMapEffect> pendingEffects = new();
     private readonly List<PendingDirectorUpdate> pendingDirectorUpdates = new();
+
+    // IsInInstance goes true in TryLoad and false in Unload, so this also refuses to queue a
+    // call that would otherwise fire on the next run.
+    private bool InSim(string what)
+    {
+        if (IsInInstance) return true;
+        DiagnosticLog.Warn($"[MapEffect] {what} ignored -- no sim in progress.");
+        return false;
+    }
+
+    // The queues are fed by replayed network messages too.
+    private static bool TryReserveRetrySlot(int currentCount, string what)
+    {
+        if (currentCount < AnoMech.Multiplayer.NetGuard.MaxPendingMapCalls) return true;
+        DiagnosticLog.Warn($"[MapEffect] Dropping a {what} retry -- over {AnoMech.Multiplayer.NetGuard.MaxPendingMapCalls} already queued.");
+        return false;
+    }
 
     private struct PendingMapEffect
     {
@@ -65,15 +80,31 @@ public sealed class MapController : IDisposable
     // Apply weather after a zone load (1-second delayed to let the engine settle).
     public void ApplyWeather(byte weatherId) => zone.ApplyWeather(weatherId);
 
-    // Fired whenever SetWeather actually applies, purely so MultiplayerManager can mirror
-    // it to peers without this class needing to know or care whether multiplayer is even
-    // active -- same reasoning as EffectApplied/DirectorUpdated above. Scenarios call
-    // world.SetWeather directly mid-fight (e.g. P2 Forsaken's arena-transform weather cue
-    // at its "gold->black" moment) as a host/solo-only Run() event; with no relay, a peer's
-    // client never received it at all -- every SharedGroup/BgPart involved could report
-    // full success (state, readiness, activity all correct) while the environment's own
-    // weather-driven lighting/effects stayed on the untransformed default.
+    // Mirrored to peers by MultiplayerManager; scenarios call SetWeather mid-fight for
+    // arena-transform lighting cues that no SimObject carries.
     public event Action<byte, float>? WeatherChanged;
+
+    // Live toggle of the per-frame fog hold (see ZoneSession.FogHold) -- a scenario's debug knob.
+    // Mirrored to peers, whose own load-time value came from the phase and never moves again.
+    public event Action<float?>? FogHoldChanged;
+
+    public void SetFogHold(float? value)
+    {
+        zone.FogHold = value;
+        FogHoldChanged?.Invoke(value);
+    }
+
+    // A captured server packet, replayed through the client's own dispatcher (see
+    // ZoneSession.InjectIncomingPacket). Returns false when it could not be delivered.
+    public bool InjectIncomingPacket(uint sourceEntityId, ushort opcode, ReadOnlySpan<byte> body, string what)
+        => zone.InjectIncomingPacket(sourceEntityId, opcode, body, what);
+
+    // Outside a session, block every outbound packet but the heartbeat (see
+    // ZoneSession.HoldSendFirewall).
+    public void HoldSendFirewall(bool hold) => zone.HoldSendFirewall(hold);
+
+    // See ZoneSession.MaxActionEffectCounter.
+    public uint MaxSeenActionEffectCounter => zone.MaxActionEffectCounter;
 
     // Immediately change the active weather (mid-scenario). transition = fade seconds.
     public void SetWeather(byte weatherId, float transition = 0.5f)
@@ -87,12 +118,21 @@ public sealed class MapController : IDisposable
     {
         zone.Revert(false);
         IsInInstance = false;
+        // Otherwise the native ProcessMapEffect path stays reachable from a replayed message
+        // outside any sim.
+        effects.Loaded = false;
         pendingColliderDrops.Clear();
+        pendingEffects.Clear();
+        pendingDirectorUpdates.Clear();
+        suppressedArenaSlots.Clear();
     }
 
     // Per-frame poll. Called from SimWorld.Tick.
     internal void Tick()
     {
+        zone.TickWeather();
+        foreach (var slot in suppressedArenaSlots) effects.SilenceSlotSounds(slot);
+
         for (int i = pendingColliderDrops.Count - 1; i >= 0; i--)
         {
             var drop = pendingColliderDrops[i];
@@ -110,18 +150,15 @@ public sealed class MapController : IDisposable
             }
         }
 
-        // Forward/insertion order, unlike pendingColliderDrops above -- collider
-        // drops are position-independent so retry order doesn't matter, but
-        // MapEffects are not: per MapEffects.cs, an SGB slot's State is locked in
-        // by whichever call reaches it FIRST, so if two calls to the same index
-        // (different State) are both stuck pending at once, retrying newest-first
-        // would let the later call win the lock instead of the earlier one --
-        // silently producing the wrong arena visual state on whichever client hit
-        // the retry path (typically a peer whose zone-load lagged the host's).
+        // Insertion order: an SGB slot's State is locked in by whichever call reaches it first
+        // (see MapEffects), so a later call to the same index must not win the retry.
         for (int i = 0; i < pendingEffects.Count; i++)
         {
             var pending = pendingEffects[i];
-            if (effects.Apply(pending.PacketFlags, pending.Index)) { pendingEffects.RemoveAt(i); i--; continue; }
+            var applied = pending.PacketFlags == SuppressSentinel
+                ? effects.SuppressSlot(pending.Index)
+                : effects.Apply(pending.PacketFlags, pending.Index);
+            if (applied) { pendingEffects.RemoveAt(i); i--; continue; }
             pending.FramesLeft--;
             if (pending.FramesLeft <= 0)
             {
@@ -164,6 +201,8 @@ public sealed class MapController : IDisposable
     public void TryLoad(TargetInstance? target, byte levelSync, ushort itemLevelSync)
     {
         if (target == null) return;
+        // A restart re-runs the phase's own InitArena, which re-registers what it suppresses.
+        suppressedArenaSlots.Clear();
         // Fresh load only when no zone is active yet (must be in the Inn). When a
         // zone is already loaded we're switching scenarios within the same
         // territory — skip the reload but still fall through to re-apply weather.
@@ -174,6 +213,8 @@ public sealed class MapController : IDisposable
             Load(target.TerritoryId, target.PlayerPosition, levelSync, itemLevelSync);
             freshLoad = true;
         }
+        // Per phase, before the weather write; a phase without a hold clears a previous one's.
+        zone.FogHold = target.FogHold;
         if (target.WeatherId is { } wid)
         {
             if (freshLoad) ApplyWeather(wid);   // fresh load: delay so the engine settles
@@ -183,14 +224,8 @@ public sealed class MapController : IDisposable
         effects.Loaded = true;
         InstanceContentDirectorHelper.Commence();
         ArmBarrierDrop(target.PlayerPosition, 10f);
-        // freshLoad=false (reusing an already-loaded zone from an earlier run this
-        // session) is the one case AddEffect's own async-load retry can't see or
-        // account for -- effects.Loaded flips true here either way, so a stale SGB
-        // left over from the PREVIOUS run's map state wouldn't show up as a retry/
-        // failure at all, just a native call that "succeeds" without visibly
-        // changing anything. Worth knowing which case a run was in when diagnosing
-        // an arena that still looks wrong despite MapEffectMessage replication and
-        // the native hook both checking out.
+        // freshLoad=false reuses a zone from an earlier run, where a stale SGB never shows up as
+        // a retry or failure.
         DiagnosticLog.Info($"[MapController] TryLoad: freshLoad={freshLoad}, territoryId={target.TerritoryId}.");
     }
 
@@ -214,28 +249,25 @@ public sealed class MapController : IDisposable
 
     // ── Map effects ───────────────────────────────────────────────────────────
 
-    // Fired after each native call below actually applies, purely so
-    // MultiplayerManager (Core.Map has no business knowing Multiplayer exists)
-    // can mirror it to peers without this class needing to know or care whether
-    // multiplayer is even active -- see the events' own doc comments for why a
-    // peer needs this at all: these are native, this-client-only calls with no
-    // other replication path (unlike SimEnemy/SimEventObject/party-role state,
-    // none of this flows through a SimObject the existing snapshot sync walks).
+    // Mirrored to peers by MultiplayerManager: these are native, this-client-only calls with no
+    // other replication path.
     public event Action<uint, byte>? EffectApplied;
     public event Action<uint, uint, uint, uint, uint, uint, uint>? DirectorUpdated;
 
-    // Replay a single MapEffect state change. packetFlags: high16=State, low8=Flags.
-    // Queued for retry (see pendingEffects) if the zone isn't ready to accept it
-    // yet -- otherwise a peer whose async zone-load lags the host's by even a
-    // couple seconds silently loses any effect called in that window, since
-    // there's no other way to know it was missed and no packet to re-request it.
-    //
-    // broadcast: false for RunInstanceEvents calls, which host and peer already both run
-    // locally by design -- broadcasting there double-applies it on the peer. True (default)
-    // for every other, host-only call site.
+    // ProcessDirectorUpdate is where the server's own instance-state packets land, so only the
+    // two categories scenarios actually emit are accepted from the network.
+    private static readonly uint[] ReplayableDirectorCategories = [0x80000004U, 0x80000027U];
+
+    public static bool IsReplayableDirectorCategory(uint category) => ReplayableDirectorCategories.Contains(category);
+
+    // Replay a single MapEffect state change. packetFlags: high16=State, low8=Flags. Queued for
+    // retry if the zone isn't ready yet; a peer whose zone load lags the host's would otherwise
+    // silently lose it. broadcast: false for RunInstanceEvents calls, which host and peer both
+    // run locally.
     public void AddEffect(uint packetFlags, byte index, bool broadcast = true)
     {
-        if (!effects.Apply(packetFlags, index))
+        if (!InSim(nameof(AddEffect))) return;
+        if (!effects.Apply(packetFlags, index) && TryReserveRetrySlot(pendingEffects.Count, "MapEffect"))
         {
             DiagnosticLog.Warn($"[MapEffect] packetFlags=0x{packetFlags:X8} index=0x{index:X} not ready yet -- queued for retry.");
             pendingEffects.Add(new PendingMapEffect { PacketFlags = packetFlags, Index = index, FramesLeft = BarrierDropMaxFrames });
@@ -243,14 +275,28 @@ public sealed class MapController : IDisposable
         if (broadcast) EffectApplied?.Invoke(packetFlags, index);
     }
 
-    // Replay a native DirectorUpdate event (instance progress / state sync) — the
-    // server-side InstanceContentDirector message a scenario timeline replays. Thin
-    // forwarder so scenarios address it through world.Map alongside AddEffect.
-    // Same retry-if-not-ready treatment as AddEffect, and for the same reason.
-    // broadcast: see AddEffect's own doc comment -- identical reasoning, same bug, same fix.
+    // Hard-deactivate one arena scenery slot (SharedGroup, geometry, VFX and sound): AddEffect's
+    // hide flag leaves the SGB's Sound children playing. Retried until the slot's SGB has
+    // streamed in. Local-only: a phase's InitArena runs per client, and leaving the sim reloads
+    // the territory.
+    private const uint SuppressSentinel = 0xFFFFFFFFu;
+    private readonly HashSet<byte> suppressedArenaSlots = new();
+
+    public void SuppressArenaSlot(byte index)
+    {
+        if (!InSim(nameof(SuppressArenaSlot))) return;
+        suppressedArenaSlots.Add(index); // Tick re-silences its Sound children every frame
+        if (!effects.SuppressSlot(index) && TryReserveRetrySlot(pendingEffects.Count, "SuppressSlot"))
+            pendingEffects.Add(new PendingMapEffect { PacketFlags = SuppressSentinel, Index = index, FramesLeft = BarrierDropMaxFrames });
+    }
+
+    // Replay a native DirectorUpdate event (instance progress / state sync); same retry and
+    // broadcast rules as AddEffect.
     public void DirectorUpdate(uint category, uint arg1 = 0, uint arg2 = 0, uint arg3 = 0, uint arg4 = 0, uint arg5 = 0, uint arg6 = 0, bool broadcast = true)
     {
-        if (!InstanceContentDirectorHelper.ProcessDirectorUpdate(category, arg1, arg2, arg3, arg4, arg5, arg6))
+        if (!InSim(nameof(DirectorUpdate))) return;
+        if (!InstanceContentDirectorHelper.ProcessDirectorUpdate(category, arg1, arg2, arg3, arg4, arg5, arg6)
+            && TryReserveRetrySlot(pendingDirectorUpdates.Count, "DirectorUpdate"))
         {
             DiagnosticLog.Warn($"[MapEffect] DirectorUpdate category=0x{category:X8} not ready yet -- queued for retry.");
             pendingDirectorUpdates.Add(new PendingDirectorUpdate { Category = category, Arg1 = arg1, Arg2 = arg2, Arg3 = arg3, Arg4 = arg4, Arg5 = arg5, Arg6 = arg6, FramesLeft = BarrierDropMaxFrames });

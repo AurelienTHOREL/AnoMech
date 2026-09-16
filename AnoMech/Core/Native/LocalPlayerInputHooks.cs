@@ -18,45 +18,38 @@ using FFXIVClientStructs.FFXIV.Client.System.Input;
 
 namespace AnoMech.Core.Native;
 
-// Hooks the native action and movement input paths so the simulator can stun
-// the local player when a mechanic kills them. Status-row writes don't enforce
-// anything (the server overwrites StatusManager._status[] on every packet); the
-// real lockout is two booleans this class exposes — the detours read them every
-// frame and short-circuit the original calls. Owned by Plugin (session-lifetime);
-// SimPlayer is the sole writer of the two flags, reconciling them each tick from
-// its own Dead / Movement.IsMoving state.
+// Hooks the native action and movement input paths so a mechanic can stun the local player.
+// Status-row writes don't enforce anything (the server overwrites them every packet); the real
+// lockout is the flags below, which SimPlayer reconciles each tick.
 //
-// Signatures and detour shapes lifted from FFXIV-RaidsRewritten's
-// PlayerMovementOverride.cs / ActionManagerEx.cs (which themselves credit
-// awgil's vnavmesh + bossmod). If a future patch breaks a sig, both projects
-// will need to rev them together.
+// Signatures and detour shapes lifted from FFXIV-RaidsRewritten's PlayerMovementOverride.cs /
+// ActionManagerEx.cs (which credit awgil's vnavmesh + bossmod).
 public sealed unsafe class LocalPlayerInputHooks : IDisposable
 {
     internal const uint SprintActionId = 3;
     private const ushort SprintStatusId = 50;
-    private const float SprintDuration = 10f; 
+    private const float SprintDuration = 10f;
     internal const ushort SprintStatusParam = 30;
 
     public bool DisableAllActions { get; set; }
     public bool ZeroMovement { get; set; }
+    // A knockback slide freezes translation but not turning; Sleep, Confuse and KO freeze
+    // rotation too. LockedRotation is re-stamped every frame from the ActionManager::Update
+    // hook, after camera-follow rotation.
+    public bool ZeroRotation { get; set; }
+    public float? LockedRotation { get; set; }
 
     // --- Player activity signals (read by SimPlayer to drive Party.Player.IsMoving/IsActing) ---
-    // Movement is the engine's own per-frame movement sample taken in RMIWalkDetour — the same
-    // signal bossmod's MovementOverride.IsMoving() reads — captured as the player's true input
-    // intent *before* the stun-zeroing. This is intent/input based (matches cast-cancel semantics),
-    // not a position delta. Holds its last value on frames where RMIWalk doesn't fire.
+    // The engine's own per-frame movement sample (the signal bossmod reads), captured before
+    // stun-zeroing: input intent, not a position delta.
     public bool MovementInputActive { get; private set; }
 
-    // True while the player's weapon auto-attack is swinging.
     public bool IsAutoAttacking => UIState.Instance()->WeaponState.AutoAttackState.IsAutoAttacking;
 
-    // True while the player is in a jump arc (CONDITION_JUMP). State poll like
-    // IsAutoAttacking — a jump is always self-initiated, so the state flag is
-    // equivalent to input intent here (nothing can force the player airborne).
+    // State poll: a jump is always self-initiated.
     public bool IsJumping => Plugin.Condition[ConditionFlag.Jumping];
 
-    // Latched whenever the player actually fires a real action; drained once per frame by SimPlayer
-    // (PollActionUsed) so a same-frame action press is still observable to a snapshot mechanic.
+    // Latched on a real action press; drained once per frame by SimPlayer.
     private bool actionUsedSincePoll;
     public bool PollActionUsed()
     {
@@ -65,8 +58,7 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         return used;
     }
 
-    // Debug aid for pinning down a real action id -- every UseAction attempt lands here,
-    // newest last; DebugMenu reads this so a press in-game shows its real id.
+    // Debug aid for pinning down a real action id; DebugMenu shows these.
     private const int RecentActionsCapacity = 50;
     private readonly Queue<(uint ActionId, ActionType Type)> recentActions = new();
     public IReadOnlyCollection<(uint ActionId, ActionType Type)> RecentActions => recentActions;
@@ -81,8 +73,8 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Action pressed: {actionId} ({type}) -- {Core.ActionLookup.Name(actionId)} (job={jobId}).");
     }
 
-    // Edge-triggered gain/loss logging, not one line per frame. Reads the local player
-    // directly (not Game.Player) so it works with no scenario running.
+    // Edge-triggered gain/loss logging; reads the local player directly so it works with no
+    // scenario running.
     private readonly HashSet<ushort> lastLoggedStatusIds = new();
 
     private void ScanAndLogActiveStatuses()
@@ -147,8 +139,7 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
 
     public void Dispose()
     {
-        // Game.Dispose() doesn't route through ResetInternal -- restore here too, or a
-        // mid-sim unload leaves the real gauge/shield stuck faked forever.
+        // Game.Dispose doesn't route through ResetInternal.
         RestoreGaugeIllusion();
         if (Plugin.GameInstance is { } game) TankShieldTracker.ClearAllVisuals(game.World.Party);
         rmiWalkHook?.Dispose();
@@ -162,9 +153,9 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
     private void RMIWalkDetour(void* self, float* sumLeft, float* sumForward, float* sumTurnLeft, byte* haveBackwardOrStrafe, byte* a6, byte bAdditiveUnk)
     {
         rmiWalkHook.Original(self, sumLeft, sumForward, sumTurnLeft, haveBackwardOrStrafe, a6, bAdditiveUnk);
-        // Capture the engine's movement sample as the player's true movement intent, before any
-        // stun-zeroing below. (self is a MoveControllerSubMemberForMine*; the sums are its move vector.)
+        // self is a MoveControllerSubMemberForMine*; the sums are its move vector.
         MovementInputActive = *sumLeft != 0 || *sumForward != 0;
+        if (ZeroRotation) *sumTurnLeft = 0;
         if (!ZeroMovement) return;
         *sumLeft = 0;
         *sumForward = 0;
@@ -193,14 +184,21 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         ScanAndLogActiveStatuses();
         UpdateGaugeIllusion();
         RefreshShieldVisuals();
+        // A missed clear must not pin rotation outside an instance.
+        if (LockedRotation is { } lockedRot)
+        {
+            if (Plugin.GameInstance is { } g && g.World.Map.IsInInstance && Plugin.ObjectTable.LocalPlayer is { } lp)
+                ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)lp.Address)->SetRotation(lockedRot);
+            else
+                LockedRotation = null;
+        }
         if (!DisableAllActions) return;
         var autosOn = UIState.Instance()->WeaponState.AutoAttackState.IsAutoAttacking;
         if (autosOn) self->UseAction(ActionType.GeneralAction, 1);
     }
 
-    // Runs every frame so a shield's visual stays honest as it depletes or expires --
-    // TankShieldTracker only answers "how much is left" when asked, it never pushes updates.
-    // Also clears every visual the instant IsInInstance goes false (leave/reset).
+    // Every frame: TankShieldTracker never pushes updates. Also clears every visual once
+    // IsInInstance goes false.
     private static void RefreshShieldVisuals()
     {
         if (Plugin.GameInstance is not { } game) return;
@@ -216,10 +214,9 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
     }
 
     // ---- Gauge illusion (client-side only) -----------------------------------
-    // Interception never checks gauge itself (see TryInterceptTankMitigation), but the real
-    // hotbar icon reads the real job gauge to decide whether to render as available -- so a
-    // gauge-gated mitigation (Holy Sheltron needs 50 Oath) would look disabled. Tops the gauge
-    // up purely for display; saves the real value once and restores it the moment the sim ends.
+    // The hotbar icon reads the real job gauge to render as available, so a gauge-gated
+    // mitigation (Holy Sheltron needs 50 Oath) would look disabled. Topped up for display only;
+    // the real value is saved once and restored when the sim ends.
     private byte? savedOathGauge;
     private const byte PaladinClassJobId = 19;
 
@@ -230,8 +227,8 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
             RestoreGaugeIllusion();
             return;
         }
-        // Only Holy Sheltron (Paladin/Oath) needs this today -- extend per-job as more
-        // gauge-gated mitigations get wired into TankMitigationChart.
+        UpdateLimitBreakIllusion();
+        // Only Holy Sheltron (Paladin/Oath) needs this today.
         if (Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId != PaladinClassJobId) return;
         var gauge = (PaladinGauge*)Plugin.JobGauges.Address;
         if (gauge == null) return;
@@ -239,10 +236,41 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         gauge->OathGauge = 100;
     }
 
-    // Also called explicitly from Game.ResetInternal (not just the IsInInstance-flip branch
-    // above) so the restore is immediate on Reset/Leave rather than waiting for next frame.
+    // Same for the limit break gauge: a scenario that expects a tank LB3 needs the button
+    // pressable, and solo in the inn the real gauge is empty. Client-side only; a press is
+    // intercepted or swallowed, so no LB packet ever leaves.
+    private (byte BarCount, ushort CurrentUnits, ushort BarUnits)? savedLimitBreak;
+    private const ushort LimitBreakUnitsPerBar = 10000;
+    private const byte LimitBreakBars = 3;
+    // An intercepted tank LB3 empties the faked gauge for the rest of the run, as a real one would.
+    private bool limitBreakConsumed;
+    private static readonly HashSet<uint> TankLimitBreakActionIds = [199, 4240, 4241, 17105];
+
+    private void UpdateLimitBreakIllusion()
+    {
+        var lb = LimitBreakController.Instance();
+        if (lb == null) return;
+        savedLimitBreak ??= (lb->BarCount, lb->CurrentUnits, lb->BarUnits);
+        lb->BarCount = LimitBreakBars;
+        lb->BarUnits = LimitBreakUnitsPerBar;
+        lb->CurrentUnits = limitBreakConsumed ? (ushort)0 : (ushort)(LimitBreakUnitsPerBar * LimitBreakBars);
+    }
+
+    // Also called from Game.ResetInternal so the restore is immediate on Reset/Leave.
     public void RestoreGaugeIllusion()
     {
+        if (savedLimitBreak is { } lbSaved)
+        {
+            var lb = LimitBreakController.Instance();
+            if (lb != null)
+            {
+                lb->BarCount = lbSaved.BarCount;
+                lb->CurrentUnits = lbSaved.CurrentUnits;
+                lb->BarUnits = lbSaved.BarUnits;
+            }
+            savedLimitBreak = null;
+        }
+        limitBreakConsumed = false;
         if (savedOathGauge is not { } saved) return;
         if (Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId == PaladinClassJobId)
         {
@@ -250,6 +278,25 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
             if (gauge != null) gauge->OathGauge = saved;
         }
         savedOathGauge = null;
+    }
+
+    // Limit breaks the chart doesn't simulate are dropped while a sim runs: with the gauge
+    // faked full, the real UseAction would fire an LB the server never granted.
+    private static bool SwallowLimitBreak(ActionType actionType, uint actionId)
+    {
+        if (actionType != ActionType.Action) return false;
+        if (Plugin.GameInstance is not { } game || !game.World.Map.IsInInstance) return false;
+        if (Plugin.ObjectTable.LocalPlayer is not { } local) return false;
+        var lb = LimitBreakController.Instance();
+        if (lb == null) return false;
+        var character = (Character*)local.Address;
+        for (byte level = 0; level < 3; level++)
+            if (lb->GetActionId(character, level) == actionId)
+            {
+                Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Limit break press (actionId={actionId}, level {level + 1}) swallowed -- only tank LB3s are simulated (TankMitigationChart).");
+                return true;
+            }
+        return false;
     }
 
     private bool UseActionDetour(ActionManager* self, ActionType actionType, uint actionId, ulong targetId, uint extraParam, ActionManager.UseActionMode mode, uint comboRouteId, bool* outOptAreaTargeted)
@@ -261,9 +308,9 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
             actionUsedSincePoll = true;
             return true;
         }
+        if (SwallowLimitBreak(actionType, actionId)) return false;
         var result = useActionHook.Original(self, actionType, actionId, targetId, extraParam, mode, comboRouteId, outOptAreaTargeted);
-        // Record a real action use for Party.Player.IsActing — but ignore the auto-attack-cancel
-        // general action that UpdateDetour issues while stunned.
+        // Ignore the auto-attack-cancel general action that UpdateDetour issues while stunned.
         if (result && !IsStopAutosAction(actionType, actionId))
             actionUsedSincePoll = true;
         if (result && actionType == ActionType.Action && actionId == SprintActionId)
@@ -271,12 +318,10 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         return result;
     }
 
-    // Blocks a tracked mitigation's real UseAction while a sim runs, so the real ability (and
-    // its real recast group) never actually gets touched. In its place: applies our own
-    // synthetic status, fakes the hotbar sweep (mirrors Game.ResetSprintCooldown, inverted),
-    // and records the use on TankMitigationTracker's own sim-only cooldown. Returns false for
-    // anything untracked or outside an instance; a press still on our sim-cooldown is
-    // swallowed silently (true, no effect).
+    // Blocks a tracked mitigation's real UseAction while a sim runs, so the real ability and
+    // its recast group are never touched; applies the synthetic status, fakes the hotbar sweep
+    // and records the sim-only cooldown instead. False for anything untracked or outside an
+    // instance; a press still on the sim cooldown is swallowed silently.
     private bool TryInterceptTankMitigation(uint actionId, ulong targetId)
     {
         if (Plugin.GameInstance is not { } game || !game.World.Map.IsInInstance) return false;
@@ -292,8 +337,7 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         if (ability.SourceSide)
         {
             var affected = ApplySourceSideMitigation(game.World, player, ability);
-            // A peer's own enemy doppel is cosmetic-only -- report so the host's authoritative
-            // copy gets the debuff too (no-op on host/solo).
+            // A peer's enemy doppel is cosmetic; the host's copy needs the debuff too.
             Plugin.MultiplayerInstance?.ReportAppliedEnemyStatus(affected, ability.StatusId, ability.Duration ?? 0f);
         }
         else if (ability.Scope == MitigationScope.Party)
@@ -320,30 +364,27 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         }
         else
         {
-            // Self-scope needs no report here -- SendSelfMitigationIfChanged already polls
-            // and reports the caster's own real statuses to the host separately.
+            // Self scope is reported by SendSelfMitigationIfChanged.
             player.AddStatus(ability.StatusId, ability.Duration ?? 0f);
             appliedRoles.Add(role);
         }
         // Banks + visualizes any shield component this ability carries; no-op if it has none.
         var shieldFraction = GrantShield(party, player, ability, appliedRoles);
 
-        // Party/Ally scope can touch roles other than the caster -- same cosmetic-puppet
-        // reasoning as the SourceSide report above, plus the granted shieldFraction.
+        // Party/Ally scope touches roles whose puppets are cosmetic on a peer.
         if (ability.Scope is MitigationScope.Party or MitigationScope.Ally)
             Plugin.MultiplayerInstance?.ReportAppliedRoleStatus(appliedRoles, ability.StatusId, ability.Duration ?? 0f, shieldFraction);
 
         TankMitigationTracker.RecordUse(role, ability.StatusId, ability.Cooldown ?? 0f);
-        ForceRecastSweep(actionId, ability.Cooldown ?? 0f);
+        // A tank LB3 has no recast group to sweep -- what it spends is the (faked) gauge.
+        if (TankLimitBreakActionIds.Contains(actionId)) limitBreakConsumed = true;
+        else ForceRecastSweep(actionId, ability.Cooldown ?? 0f);
         var jobId = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId;
         Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Intercepted {ability.Name} (actionId={actionId}) for {role} (job={jobId}), scope={ability.Scope} -- applied synthetic status {ability.StatusId} to [{string.Join(",", appliedRoles)}], real ability never touched.");
         return true;
     }
 
-    // Reprisal-style mitigations debuff nearby enemies rather than buffing the caster --
-    // applies the synthetic status to every active enemy within the ability's own radius
-    // (see TankMitigationChart), centered on the caster, matching its real self-centered AoE.
-    // Returns the affected enemies so the caller can report them across the network too.
+    // Reprisal-style: debuffs every active enemy within the ability's radius of the caster.
     private static List<SimEnemy> ApplySourceSideMitigation(SimWorld world, SimCharacter caster, TankMitigationAbility ability)
     {
         var affected = new List<SimEnemy>();
@@ -360,10 +401,8 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         return affected;
     }
 
-    // Banks the shield `ability` carries onto every role in appliedRoles and writes the
-    // visual immediately. Returns the granted fraction (0f if none) for the caller's
-    // multiplayer report. Shield % is always of the CASTER's max HP, so it's converted to an
-    // absolute HP amount once, then re-expressed as a fraction of each recipient's own max HP.
+    // Shield % is of the caster's max HP: converted to HP once, then re-expressed against each
+    // recipient's own max HP. Returns the granted fraction (0f if none).
     private static float GrantShield(SimParty party, SimCharacter caster, TankMitigationAbility ability, IReadOnlyList<PartyRole> appliedRoles)
     {
         var casterPercent = ability.ShieldPercentOfMaxHp
@@ -388,10 +427,7 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         return lastGrantedFraction;
     }
 
-    // Resolves a raw targetId (as received by UseAction) to whichever party role that
-    // GameObjectId belongs to, for an Ally-scope mitigation (Oblation, Heart of Corundum,
-    // Intervention, Nascent Flash) -- these are cast ON a specific party member, so the
-    // interception needs to know who was actually targeted, not just who pressed the button.
+    // Ally-scope mitigations (Oblation, Intervention, ...) are cast on a specific member.
     private static PartyRole? ResolveTargetRole(SimParty party, ulong targetId)
     {
         if (targetId == 0) return null;
@@ -401,9 +437,8 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         return null;
     }
 
-    // Forces the recast-group sweep active without ever calling the real UseAction. Total must
-    // be set explicitly (unlike Game.ResetSprintCooldown) -- a never-started group can have a
-    // stale/zero Total, so IsActive=true alone renders no visible sweep.
+    // Total must be set explicitly: a never-started group can have a zero Total, and
+    // IsActive alone renders no sweep.
     private static void ForceRecastSweep(uint actionId, float cooldownSeconds)
     {
         var am = ActionManager.Instance();

@@ -23,6 +23,7 @@ service](#running-it-as-a-public-service) and [Security notes](#security-notes).
 - [Running it as a public service](#running-it-as-a-public-service)
 - [Logging](#logging)
 - [Admin dashboard](#admin-dashboard)
+- [Admin actions](#admin-actions)
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
 - [Configuring the plugin](#configuring-the-plugin)
@@ -246,11 +247,33 @@ anomech-relay --port 7890 --token <shared-secret> --admin-token <a-different-sec
   | `--max-peers-per-session` | 8 | Peers in one room |
   | `--max-connections-per-ip` | 64 | Live sockets from one source address at once, across every room. Sized with slack for CGNAT/mobile carriers sharing one IP across many real users — a public relay sees much more of this than a friend-only one, so don't set it too tight (see [Security notes](#security-notes)) |
   | `--max-message-bytes` | 1048576 (1 MiB) | One logical message's size |
-  | `--max-messages-per-second` | 5000 | Messages from one connection before it gets cut off — well above any legitimate send rate |
+  | `--max-messages-per-second` | 5000 | Messages from one connection before it gets cut off. A host broadcasting a snapshot pair every frame peaks near 450/s, so this is ~10x the worst legitimate case |
+  | `--max-bytes-per-second` | 10485760 (10 MiB) | Bytes from one connection per second. A full 8-peer run peaks around 2 MB/s on the host's connection |
   | `--max-fragments-per-message` | 2000 | Fragments allowed while assembling one message, independent of its byte size — bounds someone deliberately sending many tiny frames to burn CPU rather than a large one |
-  | `--max-failed-joins` | 10 | Failed attempts per address before a 5-minute lockout — shared across session-code guesses, wrong `--token`, and wrong `--admin-token` alike |
+  | `--max-failed-joins` | 10 | Failed attempts per address before a 5-minute lockout — shared across session-code guesses and a wrong `--token`. Wrong `--admin-token` attempts use their own separate bucket, so an admin-endpoint scan can never lock players out |
+  | `--usage-warn-fraction` | 0.5 | Logs one `[NEAR-LIMIT]` line per connection once it passes this fraction of either rate cap — how you find out a real scenario is creeping toward a limit before anyone is cut off |
+  | `--bind` | `*` (all interfaces) | Address to listen on. Set `127.0.0.1` when a reverse proxy fronts the relay, so nothing can reach it directly |
   | `--log-dir` | `logs/` next to the executable | Where compressed logs are written — see [Logging](#logging) |
   | `--log-max-bytes` | 5368709120 (5 GiB) | Total on-disk size of all log segments combined |
+
+- **`--trusted-proxy <cidr>`** — **required when a token or `--require-tls` is set**,
+  and repeatable. Names the reverse proxy in front of the relay (e.g.
+  `--trusted-proxy 127.0.0.1/32` for a local Caddy). Two things depend on it:
+
+  - **Client addresses.** Behind a proxy, every connection's transport address is the
+    proxy's, so without this every per-IP control — the connection cap, the brute-force
+    lockout, the abuse log — would collapse into one shared bucket. One person guessing
+    session codes would lock out *everyone*. With it, the relay reads the real client
+    address from `X-Forwarded-For` (override the header name with `--client-ip-header`,
+    e.g. `CF-Connecting-IP`).
+  - **TLS enforcement.** `X-Forwarded-Proto: https` is only believed from one of these
+    addresses. Otherwise anyone who can reach the port directly could just claim it.
+
+  Never list an address that isn't actually your proxy — a host in this list is trusted
+  to say who its traffic is coming from. The relay **refuses to start** if TLS is
+  enforced and this isn't set, rather than silently doing the wrong thing. Requests
+  arriving over loopback with no forwarding headers at all are exempt from the TLS check
+  (they never left the machine) — this is what lets the admin CLI reach a local relay.
 
 **Put a real reverse proxy in front regardless of TLS.** `HttpListener` is a
 hand-rolled HTTP front door with far less adversarial-traffic hardening than nginx or
@@ -335,6 +358,29 @@ to notice something's wrong.
 
 ---
 
+## Admin actions
+
+The dashboard (`--admin`) is interactive. Single keypresses:
+
+| Key | Action |
+|---|---|
+| `s` | Toggle the live session list — every room, its peers, their addresses, and per-connection traffic/peak rates |
+| `k` | Kick one connection by id (ids are shown in the session list) |
+| `d` | Disband a whole session |
+| `b` / `u` | Ban / unban an address. A ban also drops that address's live connections immediately |
+| `c` | Clear every lockout and failure counter |
+| `p` / `r` | Pause / resume accepting new connections. Existing sessions keep running |
+| `l` | Change a limit live, without restarting (any of the `--max-*` flags, plus `usage-warn-fraction`) |
+| `q` | Quit the dashboard (the relay keeps running) |
+
+The same actions are available as `POST /admin/action` with a JSON body
+(`{"action":"kick-peer","connectionId":12}`), alongside `GET /admin/stats` and
+`GET /admin/sessions`. All three need the `X-AnoMech-Admin-Token` header.
+
+Bans and limit changes live in memory only — they reset when the relay restarts.
+
+---
+
 ## Security notes
 
 - **Access control**: no auth by default — anyone with the URL and a live session code
@@ -350,18 +396,27 @@ to notice something's wrong.
   can't predict a future one. Repeated failed joins from one address get locked out
   for 5 minutes (`--max-failed-joins`).
 - **Resource exhaustion (the relay itself)**: caps on total sessions, peers per
-  session, connections per address, and one message's size, plus timeouts on a
-  stalled handshake or a message that never finishes arriving. All tunable via CLI
-  flags; see [Running it as a public service](#running-it-as-a-public-service).
+  session, connections per address, one message's size, and both the message rate and
+  the byte rate of a single connection, plus timeouts on a stalled handshake, a message
+  that never finishes arriving, and every close handshake. Each rate cap is roughly 10x
+  what a full 8-peer run produces, and the relay logs a `[NEAR-LIMIT]` line plus a
+  peak-vs-cap figure in its minute summary so you can see headroom rather than guess at
+  it. All tunable via CLI flags (and live from the admin dashboard); see [Running it as
+  a public service](#running-it-as-a-public-service).
+- **IPv6 address rotation**: per-address controls bucket IPv6 by /64, not by single
+  address — a /64 is the standard allocation, so keying on the full address would make
+  every cap free to sidestep.
 - **CGNAT / shared-IP collateral**: at public scale, unrelated strangers legitimately
   share one address more often than in a friend-only deployment (mobile carriers,
   corporate NAT). `--max-connections-per-ip` defaults with slack for this, but if you
   see real users getting capped, raise it rather than assume it's abuse.
-- **Message impersonation**: every forwarded message is tagged with whether the
-  original sender was the room's host, so a peer who joins a session can't forge a
-  host-authoritative message (world state, run start/end, ...) — the plugin drops
-  those. Best-effort: needs both the relay and the plugin build to be reasonably
-  current (see `RelayVersion`/capabilities in `Program.cs`).
+- **Message impersonation**: every forwarded message is tagged with the relay-assigned
+  connection it came from, plus whether that connection is the room's host. A peer who
+  joins a session therefore can't forge a host-authoritative message (world state, run
+  start/end, ...), and can't send a peer message carrying somebody else's identity to
+  steal their role or force a reset — the plugin drops both. Best-effort: needs both the
+  relay and the plugin build to be reasonably current (see `RelayVersion`/capabilities
+  in `Program.cs`).
 - **It cannot be used to attack a third party.** It's TCP (WebSocket), not the
   connectionless UDP protocols IP-spoofing reflection/amplification attacks need — you
   can't fake a TCP source address without completing the handshake back to that faked

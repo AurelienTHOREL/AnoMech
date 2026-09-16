@@ -50,7 +50,7 @@ namespace AnoMech.Scenarios.Top.P5Sigma
             DynamisTargets = new RoleListBuilder
             {
                 Size = 6,
-                IncludePlayer = overrides.Dynamis,
+                Membership = overrides.ResolveDynamis(party.PlayerRole),
             }.Build(party);
             WaveCannonTargets = SelectWaveCannonTargets(Order);
 
@@ -61,14 +61,12 @@ namespace AnoMech.Scenarios.Top.P5Sigma
             SpinnerRotation = overrides.SpinnerRotation ?? rng.NextObj(Rotation.Clockwise, Rotation.CounterClockwise);
             OmegaFAttack = overrides.OmegaFForm ?? rng.NextObj(OmegaAttack.Legs, OmegaAttack.Staff);
 
-            HelloWorldTargets = new RoleListBuilder()
+            var (helloSlots, helloMembership) = overrides.ResolveHelloWorld(party.PlayerRole);
+            HelloWorldTargets = new RoleListBuilder
             {
                 Size = 2,
-                ForcePlayerIndex = overrides.HelloWorld switch
-                {
-                    HelloWorldOption.Near => [0], HelloWorldOption.Far => [1], _ => []
-                },
-                IncludePlayer = overrides.HelloWorld switch { HelloWorldOption.No => false, _ => null }
+                Slots = helloSlots,
+                Membership = helloMembership,
             }.Build(party);
 
             HandBait = DynamisTargets.Random(rng, 2, HelloWorldTargets.List);
@@ -112,8 +110,7 @@ namespace AnoMech.Scenarios.Top.P5Sigma
                    towerNorthFlipped, glitchIsFar, spinnerIsClockwise, omegaFIsStaff, firstMissing, secondMissing);
 
 
-        // MidGlitch: 6 towers on the 22.5°-offset inner ring at radius 17.
-        // Extracted from TOP_pull_05_clear.log (01:23:34.933), rotated so the two
+        // MidGlitch: 6 towers on the 22.5°-offset inner ring at radius 17, rotated so the two
         // adjacent SOLOs frame compass N (bossmod-canonical: relNorth → N).
         // N half holds only the two SOLOs; S half going E→W is PAIR, SOLO, SOLO, PAIR.
         // 15.706 = 17·cos 22.5°, 6.506 = 17·sin 22.5°.
@@ -127,11 +124,10 @@ namespace AnoMech.Scenarios.Top.P5Sigma
             new(new Vector3(-6.506f, 0f, +15.706f), MinPlayers: 1), // SOLO SSW (202.5°)
         };
 
-        // FarGlitch: 5 towers — derived from bossmod P5Sigma.cs (apex pair at rel N,
-        // base pairs at rel SE/SW, solos at rel W/E). Rotated so the alone (apex)
-        // pair-tower is at compass N. Radius 17 assumed to match MidGlitch; positions
-        // on true cardinals/intercardinals. NOT verified against a log — no
-        // FarGlitch Sigma pull in the available logs reached tower spawn.
+        // FarGlitch: 5 towers, following bossmod P5Sigma.cs (apex pair at rel N, base pairs at
+        // rel SE/SW, solos at rel W/E), rotated so the apex pair-tower is at compass N.
+        // UNVERIFIED: radius 17 is assumed to match MidGlitch and the positions are placed on
+        // true cardinals/intercardinals. Neither is observed; treat both as guesses.
         // 12.021 = 17/√2.
         private static readonly Tower?[] FarGlitchTowers =
         {

@@ -15,39 +15,46 @@ public interface IScenario
 
     bool SupportsSolo => false;
 
-    // True once a scenario has the matching multiplayer plumbing in
-    // MultiplayerManager/Protocol.cs (per-scenario *AiReplayStateMessage,
-    // shadow-state field, dispatch case) -- core replication works for any
-    // IScenario automatically, but debug-bot AI replay doesn't.
+    // Core replication works for any scenario; this also needs the debug-bot AI replay plumbing
+    // (IMultiplayerReplayable).
     bool SupportsMultiplayer => false;
 
     // Selectable strats. Run's selectedAi indexes this (null = solo); region buttons derive
     // from each strat's IScenarioAi.Group.
     IReadOnlyList<IScenarioAi> AiStrats { get; }
 
-    // Tankbusters this scenario wants the multiplayer host to be able to pre-plan
-    // mitigation for (see TankMitigation) -- empty for scenarios that don't use it yet.
+    // Tankbusters the multiplayer host can pre-plan mitigation for (see TankMitigation).
     IReadOnlyList<TankBusterCastInfo> TankBusters => [];
 
-    // Null (default): tank doppels/puppets and a real player in a tank role spawn at the
-    // generic doppel HP. A scenario wanting tanks to carry a specific reference HP instead
-    // (e.g. so TankMitigation's fixed-HP tankbuster numbers land against a real tank's real
-    // max HP) overrides this with that value.
+    // Tanks spawn at this HP so TankMitigation's fixed numbers land against a real tank's
+    // pool; null = the generic doppel HP.
     uint? TankMaxHealth => null;
 
     void Run(SimWorld world, int? selectedAi);
     void Tick(float delta, float elapsed) { }
+
+    // The fight-wide rolls only: one setting the whole sim shares.
     void DrawSettings() { }
 
-    // Settings that stay editable while the Multiplayer window is open, unlike DrawSettings
-    // (solo-only overrides get disabled there) -- e.g. pre-planning a bot tank's behavior
-    // (UmadP3BlackHoleSettingsWindow.DrawThunderIIIPlan), which only matters in multiplayer.
+    // Mechanic roles a single player carries -- a Limit Cut number, an Accretion, a tether. Not
+    // part of DrawSettings: these are per seat, and mixing them into the fight-wide panel is
+    // what made them hard to read. Drawn in their own dialog instead.
+    bool HasPerPlayerSettings => false;
+    void DrawPerPlayerSettings() { }
+
+    // Stays editable while the Multiplayer window is open, unlike DrawSettings (e.g. a bot
+    // tank's mitigation plan).
     void DrawMultiplayerSettings() { }
 
-    // Deterministic, RNG-independent instance-progress replay (native
-    // DirectorUpdate/AddEffect calls) a scenario may schedule alongside its
-    // boss timeline. Unlike Run, this has no dependency on host-only state
-    // (random assignments, AI, DamageSolver), so Game.RunScenarioInternal
-    // calls it for a peer too, not just the host.
+    // The overrides object DrawSettings edits, for the lobby's read-only summary
+    // (ScenarioSettingsSummary); null when there is nothing to configure.
+    object? SettingsOverrides => null;
+
+    // Per-player settings the fight can't produce together (see SettingsConflicts). A start is
+    // refused while this is non-empty, rather than running something the host didn't ask for.
+    IReadOnlyList<string> SettingsConflicts => [];
+
+    // Deterministic instance-progress replay (native DirectorUpdate/AddEffect calls) with no
+    // host-only dependency, so Game.RunScenarioInternal schedules it for a peer too.
     void RunInstanceEvents(SimWorld world) { }
 }

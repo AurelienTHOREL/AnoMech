@@ -25,6 +25,7 @@ public sealed class UmadP4KefkaSaysScenario : IMultiplayerReplayable
     public uint? TankMaxHealth => Tunables.RealTankMaxHealth;
 
     public void DrawSettings() => settingsWindow.Draw();
+    public object SettingsOverrides => settingsWindow.Overrides;
     private readonly UmadP4KefkaSaysSettingsWindow settingsWindow = new();
 
     public IReadOnlyList<IScenarioAi> AiStrats =>

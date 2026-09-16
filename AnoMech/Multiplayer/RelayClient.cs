@@ -14,69 +14,71 @@ using AnoMech.Core;
 
 namespace AnoMech.Multiplayer;
 
-// Thrown when the relay explicitly rejects a connection with a WS close frame right after the
-// upgrade (see ReadGreetingAsync) -- almost always "session not found" because the relay
-// restarted and forgot every room. Distinct from a transient/network failure: retrying the
-// exact same session code will never succeed, so a caller (see MultiplayerManager's reconnect
-// loop) should stop and tell the user, not keep backing off forever.
+// The relay rejected the connection with a close frame right after the upgrade (see
+// ReadGreetingAsync), almost always "session not found" after a relay restart. Retrying the
+// same code can never succeed, so the reconnect loop gives up instead of backing off forever.
 internal sealed class RelaySessionRejectedException(string reason) : Exception(reason);
 
-// Thin ClientWebSocket wrapper talking to AnoMech.Relay (see Relay/README.md). The relay
-// only forwards opaque frames; message meaning lives in MpMessage/Protocol.cs. The frame's
-// WebSocket message type doubles as the compression flag: Text = raw UTF-8 JSON, Binary =
-// Brotli-compressed JSON (used once a message hits CompressionThresholdBytes -- below that,
-// Brotli's own framing overhead costs more than it saves).
+// ClientWebSocket wrapper for AnoMech.Relay (Relay/README.md), which only forwards opaque
+// frames. The WebSocket message type doubles as the compression flag: Text = raw JSON,
+// Binary = Brotli (from CompressionThresholdBytes up; below that Brotli's framing costs more
+// than it saves).
 public sealed class RelayClient : IDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     private const int CompressionThresholdBytes = 256;
 
-    // Not readonly -- ConnectCoreAsync replaces this with a fresh instance per fallback
-    // attempt, since a ClientWebSocket can only ConnectAsync once.
+    // Replaced per fallback attempt: a ClientWebSocket can only ConnectAsync once.
     private ClientWebSocket socket = new();
     private readonly CancellationTokenSource cts = new();
-    // Two queues so a large WorldSnapshotMessage can't hog ClientWebSocket's one send slot
-    // ahead of small/urgent messages. sendQueue is drained first; bulkSendQueue only when
-    // it's empty. Each queue's own order is FIFO; order isn't preserved across the two.
+    // Two queues so a large WorldSnapshot can't hog the single send slot ahead of small urgent
+    // messages; bulk is drained only while the priority queue is empty.
     private readonly Channel<(byte[] Bytes, WebSocketMessageType Type, TaskCompletionSource Completion)> sendQueue =
         Channel.CreateUnbounded<(byte[], WebSocketMessageType, TaskCompletionSource)>();
     private readonly Channel<(byte[] Bytes, WebSocketMessageType Type, TaskCompletionSource Completion)> bulkSendQueue =
         Channel.CreateUnbounded<(byte[], WebSocketMessageType, TaskCompletionSource)>();
     private bool disposed;
 
-    // bool is IsFromHost -- see IHostOnlyMessage's own doc comment.
-    public event Action<MpMessage, bool>? MessageReceived;
+    // The relay is untrusted; 2 MB is ~100x the largest real message.
+    private const int MaxIncomingMessageBytes = 2 * 1024 * 1024;
+    private const int MaxIncomingFragments = 4096;
+
+    // (message, isFromHost, relay-assigned sender connection id or 0) -- see IHostOnlyMessage.
+    public event Action<MpMessage, bool, uint>? MessageReceived;
     public event Action<Exception?>? Disconnected;
 
     public bool IsConnected => socket.State == WebSocketState.Open;
 
-    // Which scheme this connection actually dialed -- the relay can't attest to this itself
-    // (wss:// terminates in a reverse proxy in front of it, see Program.cs).
+    // The scheme actually dialed; the relay can't say (wss:// terminates in a reverse proxy).
     public bool IsEncrypted { get; private set; }
 
-    // True only when a bare host's wss:// attempt failed and it landed on ws:// instead --
-    // distinct from IsEncrypted being false because someone typed ws:// on purpose.
+    // Distinct from a ws:// the user typed on purpose.
     public bool FellBackToUnencrypted { get; private set; }
 
-    // From the relay's greeting (ReadGreetingAsync). A named set rather than one version
-    // number, so a missing entry always just means "not supported."
+    // From the relay's greeting; a missing entry just means "not supported".
     public IReadOnlySet<string> RelayCapabilities { get; private set; } = new HashSet<string>();
     public bool HasRelayCapability(string name) => RelayCapabilities.Contains(name);
     public bool SupportsCompression => HasRelayCapability("binaryCompression");
     public bool SupportsSenderIdentity => HasRelayCapability("senderIdentity");
 
-    public Task ConnectAsync(string relayUrl, string sessionCode, string? accessToken = null) =>
-        ConnectCoreAsync(relayUrl, $"session/{Uri.EscapeDataString(sessionCode)}", accessToken);
+    // Each connection's usage is counted from zero: the caps it is measured against are
+    // per-connection too.
+    public Task ConnectAsync(string relayUrl, string sessionCode, string? accessToken = null)
+    {
+        RelayStats.Reset();
+        return ConnectCoreAsync(relayUrl, $"session/{Uri.EscapeDataString(sessionCode)}", accessToken);
+    }
 
-    // Requests a relay-assigned session code (Program.cs's /host endpoint) instead of
-    // picking one locally, since only the relay can guarantee no collision.
-    public Task<string?> ConnectAndHostAsync(string relayUrl, string? accessToken = null) =>
-        ConnectCoreAsync(relayUrl, "host", accessToken);
+    // Only the relay can guarantee a collision-free session code.
+    public Task<string?> ConnectAndHostAsync(string relayUrl, string? accessToken = null)
+    {
+        RelayStats.Reset();
+        return ConnectCoreAsync(relayUrl, "host", accessToken);
+    }
 
-    // A bare host is tried encrypted first, falling back to plain ws:// only on failure --
-    // there's no way to ask a server "do you speak TLS" other than trying. Default ports
-    // match Relay/README.md's two setups (443 for wss:// behind Caddy, 7890 direct ws://).
-    // An explicit ws://\wss://\http://\https:// is respected literally, tried once, no fallback.
+    // A bare host tries wss:// then falls back to ws://; the only way to learn whether a server
+    // speaks TLS is to try. Default ports match Relay/README.md (443 behind Caddy, 7890
+    // direct). An explicit scheme is tried once, literally.
     private static IReadOnlyList<Uri> ResolveCandidateUris(string relayUrl, string path)
     {
         var trimmed = relayUrl.Trim();
@@ -97,9 +99,7 @@ public sealed class RelayClient : IDisposable
         ];
     }
 
-    // Probes with a scheme Uri has no built-in default port for -- "ws://" itself resolves
-    // an unspecified port to 80 (mirroring http), which made a bare host silently get sent
-    // to port 80 on both candidates instead of 443/7890.
+    // A probe scheme with no default port: "ws://host" would resolve an unspecified port to 80.
     private static (string Host, int? Port) SplitHostPort(string hostAndOptionalPort)
     {
         if (!Uri.TryCreate($"anomech-probe://{hostAndOptionalPort}", UriKind.Absolute, out var probe))
@@ -109,9 +109,8 @@ public sealed class RelayClient : IDisposable
 
     private static Uri BuildUri(string baseUrl, string path) => new($"{baseUrl.TrimEnd('/')}/{path}");
 
-    // Same host/port resolution as ResolveCandidateUris, mapped to https/http instead of
-    // wss/ws -- the relay's plain-HTTP /info endpoint lives on the exact same host:port a WS
-    // connect would use (a TLS-terminating reverse proxy in front forwards both the same way).
+    // Same host/port resolution mapped to https/http; /info lives on the same host:port as the
+    // WS endpoint.
     private static IReadOnlyList<Uri> ResolveInfoCandidateUris(string relayUrl)
     {
         var trimmed = relayUrl.Trim();
@@ -133,13 +132,10 @@ public sealed class RelayClient : IDisposable
 
     private sealed record RelayInfo(int RelayVersion, string[]? Capabilities, bool RequiresToken);
 
-    private static readonly HttpClient InfoHttpClient = new() { Timeout = TimeSpan.FromSeconds(5) };
+    private static readonly HttpClient InfoHttpClient = new() { Timeout = TimeSpan.FromSeconds(5), MaxResponseContentBufferSize = 64 * 1024 };
 
-    // Plain HTTP GET, not a WS connection -- lets the UI learn whether a relay needs an
-    // access token BEFORE the user has one to offer, so the password box in
-    // MultiplayerWindow only shows up when it's actually needed. Best-effort: null means
-    // either candidate failed (unreachable, or an old relay with no /info at all) -- callers
-    // should fall back to "assume no token needed" rather than block on this.
+    // Plain HTTP, so the UI can learn whether a relay needs a token before the user has one.
+    // Null = unreachable or an old relay without /info; callers assume no token needed.
     public static async Task<(int RelayVersion, bool RequiresToken)?> FetchInfoAsync(string relayUrl, CancellationToken ct = default)
     {
         foreach (var uri in ResolveInfoCandidateUris(relayUrl))
@@ -161,10 +157,8 @@ public sealed class RelayClient : IDisposable
     private async Task<string?> ConnectCoreAsync(string relayUrl, string path, string? accessToken)
     {
         var candidates = ResolveCandidateUris(relayUrl, path);
-        // A password is worthless sent in the clear -- never attempt (let alone fall back to)
-        // a ws:// candidate once one is set, whether that's the auto-detect fallback or an
-        // explicit ws:// the user typed. Matches the relay's own enforcement (see
-        // Program.cs's IsRequestEncrypted), so this is defense-in-depth, not the only guard.
+        // A password must never go over ws://, whether from the fallback or typed explicitly
+        // (the relay enforces the same; see Program.cs IsRequestEncrypted).
         if (!string.IsNullOrEmpty(accessToken))
         {
             var encryptedOnly = candidates.Where(u => u.Scheme == "wss").ToList();
@@ -185,8 +179,7 @@ public sealed class RelayClient : IDisposable
                 socket.Dispose();
                 socket = new ClientWebSocket();
             }
-            // Options only take effect before ConnectAsync, so this has to be set again on
-            // every fresh ClientWebSocket instance, not once outside the loop.
+            // Options only apply before ConnectAsync, so they are set per instance.
             if (!string.IsNullOrEmpty(accessToken))
                 socket.Options.SetRequestHeader("X-AnoMech-Relay-Token", accessToken);
             var uri = candidates[i];
@@ -212,8 +205,8 @@ public sealed class RelayClient : IDisposable
                     + (i < candidates.Count - 1 ? " -- trying the next candidate." : ""));
             }
         }
-        // Callers fire this fire-and-forget; without routing through Disconnected a failed
-        // handshake only surfaced as an unobserved Task exception, with no UI feedback.
+        // Callers are fire-and-forget; without Disconnected a failed handshake would only be
+        // an unobserved Task exception.
         DiagnosticLog.Warn($"[RelayClient] Connect failed: {lastFailure?.Message}");
         Disconnected?.Invoke(lastFailure);
         return null;
@@ -223,9 +216,8 @@ public sealed class RelayClient : IDisposable
 
     private const int GreetingTimeoutMs = 5000;
 
-    // Reads the relay's one-shot greeting, sent right after join/host and not an MpMessage
-    // (the relay stays protocol-agnostic) -- consumed here, once, before ReceiveLoopAsync
-    // starts. An old relay that never sends one just times out to "no capabilities."
+    // The greeting is not an MpMessage (the relay stays protocol-agnostic) and is consumed once
+    // before ReceiveLoopAsync starts. An old relay that sends none times out to "no capabilities".
     private async Task<string?> ReadGreetingAsync()
     {
         var buffer = new byte[1024];
@@ -246,14 +238,9 @@ public sealed class RelayClient : IDisposable
             return null;
         }
 
-        // The relay accepts the WS upgrade BEFORE it validates the session code (see
-        // Program.cs's HandleConnectionAsync -- TryJoin/TryCreateSession run after
-        // AcceptWebSocketAsync, not before), so a rejected /session/<code> or /host arrives
-        // HERE as a close frame, not as malformed JSON. Most commonly this means the relay
-        // itself restarted and no longer has any memory of the session at all -- a real,
-        // permanent rejection, not "an old relay with no greeting." Surfacing it distinctly
-        // (rather than falling into the same catch-all as a genuine JSON parse failure) is
-        // what lets the reconnect loop tell "give up and say so" apart from "keep retrying."
+        // The relay accepts the WS upgrade before validating the session code, so a rejected
+        // /session/<code> or /host arrives here as a close frame. Surfaced distinctly so the
+        // reconnect loop can tell "give up" from "keep retrying".
         if (result.MessageType == WebSocketMessageType.Close)
             throw new RelaySessionRejectedException(socket.CloseStatusDescription ?? "the relay closed the connection");
 
@@ -293,11 +280,9 @@ public sealed class RelayClient : IDisposable
         return output.ToArray();
     }
 
-    // Bounded manually -- CopyTo has no output-size limit, so a small malicious/corrupted
-    // payload claiming a huge decompressed size (a compression bomb) could otherwise exhaust
-    // memory in the game's own process, not just this connection. 64 MB is far past anything
-    // a real WorldSnapshotMessage produces even compressed at CompressionThresholdBytes.
-    private const int MaxDecompressedBytes = 64 * 1024 * 1024;
+    // CopyTo has no output limit, so a compression bomb could exhaust the game's own memory.
+    // ~100x the largest real snapshot.
+    private const int MaxDecompressedBytes = 8 * 1024 * 1024;
 
     private static byte[] Decompress(byte[] data)
     {
@@ -315,8 +300,8 @@ public sealed class RelayClient : IDisposable
         return output.ToArray();
     }
 
-    // ClientWebSocket allows only one outstanding send with no built-in timeout. Aborting on
-    // timeout also faults ReceiveLoopAsync's pending read, which triggers Disconnected/reconnect.
+    // ClientWebSocket allows one outstanding send with no timeout; aborting also faults the
+    // receive loop's pending read, which triggers Disconnected/reconnect.
     private const int SendTimeoutMs = 10_000;
 
     private async Task SendLoopAsync()
@@ -338,7 +323,7 @@ public sealed class RelayClient : IDisposable
         }
         catch (OperationCanceledException)
         {
-            // Dispose() cancelled us -- not a failure.
+            // cancelled by Dispose()
         }
     }
 
@@ -350,11 +335,12 @@ public sealed class RelayClient : IDisposable
             if (await Task.WhenAny(sendTask, Task.Delay(SendTimeoutMs, cts.Token)).ConfigureAwait(false) != sendTask)
             {
                 DiagnosticLog.Warn($"[RelayClient] Send stuck for over {SendTimeoutMs / 1000}s -- treating the connection as dead.");
-                try { socket.Abort(); } catch { /* best-effort; ReceiveLoopAsync's fault is what actually matters */ }
+                try { socket.Abort(); } catch { /* best-effort */ }
                 completion.SetException(new TimeoutException($"Send timed out after {SendTimeoutMs}ms."));
                 return;
             }
             await sendTask.ConfigureAwait(false);
+            RelayStats.RecordSent(bytes.Length);
             completion.SetResult();
         }
         catch (Exception e)
@@ -374,6 +360,7 @@ public sealed class RelayClient : IDisposable
             {
                 using var ms = new MemoryStream();
                 WebSocketReceiveResult result;
+                var fragments = 0;
                 do
                 {
                     result = await socket.ReceiveAsync(buffer, cts.Token).ConfigureAwait(false);
@@ -383,36 +370,47 @@ public sealed class RelayClient : IDisposable
                         return;
                     }
                     ms.Write(buffer, 0, result.Count);
+                    if (ms.Length > MaxIncomingMessageBytes || ++fragments > MaxIncomingFragments)
+                    {
+                        failure = new InvalidDataException(
+                            $"Relay sent a message over {MaxIncomingMessageBytes / (1024 * 1024)} MB or {MaxIncomingFragments} fragments -- dropping the connection.");
+                        DiagnosticLog.Warn($"[RelayClient] {failure.Message}");
+                        try { socket.Abort(); } catch { /* best-effort */ }
+                        return;
+                    }
                 } while (!result.EndOfMessage);
+                RelayStats.RecordReceived(ms.Length);
 
                 MpMessage? message;
                 var isFromHost = true;
+                uint senderConnectionId = 0;
                 try
                 {
                     var raw = ms.ToArray();
-                    // Leading byte is the relay's host-tag (see Relay/Program.cs BroadcastAsync)
-                    // -- only present when the relay actually advertised support for it.
+                    // Relay-written prefix (Relay/Program.cs BroadcastAsync): host-tag byte,
+                    // then the sender's connection id.
                     if (SupportsSenderIdentity)
                     {
-                        if (raw.Length == 0) throw new InvalidDataException("empty frame with senderIdentity active.");
+                        if (raw.Length < 5) throw new InvalidDataException("frame shorter than the senderIdentity prefix.");
                         isFromHost = raw[0] == 1;
-                        raw = raw[1..];
+                        senderConnectionId = BitConverter.ToUInt32(raw, 1);
+                        raw = raw[5..];
                     }
                     if (result.MessageType == WebSocketMessageType.Binary) raw = Decompress(raw);
                     message = JsonSerializer.Deserialize<MpMessage>(raw, JsonOptions);
                 }
-                // One bad message shouldn't take the whole connection down.
+                // One bad message shouldn't take the connection down.
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
                     DiagnosticLog.Warn($"[RelayClient] Malformed message dropped: {e.Message}");
                     continue;
                 }
-                if (message != null) MessageReceived?.Invoke(message, isFromHost);
+                if (message != null) MessageReceived?.Invoke(message, isFromHost, senderConnectionId);
             }
         }
         catch (OperationCanceledException)
         {
-            // Dispose() cancelled us -- not a failure.
+            // cancelled by Dispose()
         }
         catch (Exception e)
         {
@@ -432,8 +430,8 @@ public sealed class RelayClient : IDisposable
         if (disposed) return;
         disposed = true;
         DiagnosticLog.Debug($"[RelayClient] Dispose() -- socket state was {socket.State}.");
-        // Complete before Cancel, so any already-enqueued SendAsync caller observes a normal
-        // failed send instead of hanging on a TaskCompletionSource that never gets set.
+        // Complete before Cancel, so an enqueued SendAsync caller sees a failed send instead
+        // of hanging.
         sendQueue.Writer.TryComplete();
         bulkSendQueue.Writer.TryComplete();
         while (sendQueue.Reader.TryRead(out var pending))
@@ -441,7 +439,7 @@ public sealed class RelayClient : IDisposable
         while (bulkSendQueue.Reader.TryRead(out var pending))
             pending.Completion.TrySetException(new ObjectDisposedException(nameof(RelayClient)));
         cts.Cancel();
-        try { socket.Abort(); } catch { /* best-effort teardown */ }
+        try { socket.Abort(); } catch { /* best-effort */ }
         socket.Dispose();
         cts.Dispose();
     }

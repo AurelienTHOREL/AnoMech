@@ -22,40 +22,53 @@ internal class Movement(SimCharacter parent)
     private bool timelineBaseOverride;
     private bool animActive;
 
+    // Only PushInDirectionEased sets this; every other move steps at a fixed speed.
+    private float? easeDuration;
+    private float easeElapsed;
+    private Vector3 easeStart;
+
     private SimCharacter? followTarget;
+    private bool followForced;
     private float followCooldown;
 
     private SimTether? interceptTether;
     private float interceptMargin = 3f;   // park this many yards short of either tether endpoint
 
-    // Set around RetargetIntercept's and TickFollow's own re-issued MoveTo calls so
-    // InternalMoveTo doesn't cancel the very tracking that's driving them. Left false
-    // for every other caller (ai.Move, PullTether, Knockback, ...) so an externally
-    // issued move -- e.g. the Implosion dodge choreography firing mid-Intercept --
-    // correctly cancels a stale Intercept/Follow instead of having TickIntercept
-    // silently steer the character back toward the tether next frame.
+    // Set around RetargetIntercept/TickFollow's own re-issued MoveTo so InternalMoveTo doesn't
+    // cancel the tracking driving them; any external move cancels a stale Intercept/Follow.
     private bool internalReissue;
 
     public bool IsMoving => destination != null;
     // Unused -- reserved for a possible future Move/Intercept race guard.
     public bool IsIntercepting => interceptTether != null;
+    // Narrower than IsMoving: true only while a PushInDirectionEased is mid-flight.
+    public bool IsEasedMoving => easeDuration != null;
 
     public virtual void MoveTo(Vector3 t, float sp = 6f, float? finalRot = null, ushort tl = RunTimelineId, bool baseOverride = true)
         => InternalMoveTo(t, sp, finalRot, tl, baseOverride);
 
-    public void Follow(SimCharacter? target, float speed = 6f)
+    // forced: the mechanic itself is taking control (UMAD P1's Confusion), as opposed to a
+    // strat walking a bot to its spot. Only a forced follow may drive a real player -- see
+    // PlayerMovement.CanFollow.
+    public void Follow(SimCharacter? target, float speed = 6f, bool forced = false)
     {
         if (!target.IsAlive())
         {
             followTarget = null;
+            followForced = false;
             Stop();
             return;
         }
         followTarget = target;
+        followForced = forced;
         followCooldown = 0f;
         interceptTether = null;
         this.speed = MathF.Max(0f, speed);
     }
+
+    // Whether this character may be walked by a follow at all. Movement drives anything;
+    // PlayerMovement refuses the unforced kind.
+    protected virtual bool CanFollow(bool forced) => true;
 
     // Walk to the nearest point on the tether line and keep tracking it: TickIntercept
     // re-projects every frame so a tether whose endpoints drift is still met. `margin`
@@ -68,10 +81,8 @@ internal class Movement(SimCharacter parent)
         RetargetIntercept(logDetail: true);
     }
 
-    // Re-project the parent onto the tether segment and re-issue the move. Self-cancels
-    // (clears tracking, issues no move) if the tether is gone or an endpoint died, so any
-    // in-flight move just finishes. logDetail is true only for the initial Intercept() call --
-    // TickIntercept's per-frame re-calls would spam a log line otherwise.
+    // Re-project the parent onto the tether segment and re-issue the move; self-cancels if the
+    // tether or an endpoint is gone. logDetail only on the initial Intercept() call.
     private void RetargetIntercept(bool logDetail = false)
     {
         var margin = interceptMargin;
@@ -132,6 +143,30 @@ internal class Movement(SimCharacter parent)
 
     }
 
+    // Forced movement along a fixed heading (Umad P1's arrows), with Knockback's forced-move
+    // semantics.
+    public void PushInDirection(float heading, float distance, float pushSpeed)
+    {
+        var dir = new Vector2(MathF.Sin(heading), MathF.Cos(heading));
+        var dest = parent.Position + new Vector3(dir.X * distance, 0f, dir.Y * distance);
+        InternalMoveTo(dest, pushSpeed, tl: KnockbackTimelineId, baseOverride: false, faceTravel: false, avoid: false);
+    }
+
+    // Same forced-move semantics, but smoothstep-eased over durationSeconds: a real arrow push
+    // eases in, holds and eases out over ~1s rather than sliding at one speed.
+    public void PushInDirectionEased(float heading, float distance, float durationSeconds)
+    {
+        var dir = new Vector2(MathF.Sin(heading), MathF.Cos(heading));
+        var start = parent.Position;
+        var dest = start + new Vector3(dir.X * distance, 0f, dir.Y * distance);
+        // Speed is meaningless for an eased move. The ease fields are set after the call, which
+        // clears easeDuration.
+        InternalMoveTo(dest, 0f, tl: KnockbackTimelineId, baseOverride: false, faceTravel: false, avoid: false);
+        easeStart = start;
+        easeDuration = MathF.Max(0.01f, durationSeconds);
+        easeElapsed = 0f;
+    }
+
     // Shared move entry for MoveTo (locomotion) and Knockback (one-shot action).
     // `baseOverride` selects the animation mechanism in StartAnim: true for a
     // looping locomotion clip (run/walk), false for a one-shot action timeline
@@ -141,11 +176,7 @@ internal class Movement(SimCharacter parent)
         bool faceTravel = true, bool avoid = true)
     {
         if (!parent.IsAlive()) return;   // dead characters don't move
-        // An externally issued move (ai.Move, PullTether, Knockback, ...) supersedes
-        // whatever this character was doing -- cancel any stale Intercept/Follow so
-        // TickIntercept/TickFollow don't steer back over it next frame. RetargetIntercept
-        // and TickFollow's own re-issue set internalReissue around this call so they
-        // don't cancel the very tracking driving them.
+        // An external move supersedes any Intercept/Follow.
         if (!internalReissue)
         {
             interceptTether = null;
@@ -156,6 +187,8 @@ internal class Movement(SimCharacter parent)
         finalRotation = finalRot;
         this.faceTravel = faceTravel;
         this.avoid = avoid;
+        // A stale ease must not carry onto a fixed-speed move.
+        easeDuration = null;
         var sameAnim = animActive && timelineId == tl;
         timelineId = tl;
         timelineBaseOverride = baseOverride;
@@ -181,6 +214,18 @@ internal class Movement(SimCharacter parent)
         // one-shot MoveTo/Knockback won't, so re-assert here or it would slide the
         // rest of the way unanimated.
         if (!animActive) StartAnim();
+
+        // Eased moves have their own path: the fixed-speed branch would treat speed 0 as "arrived".
+        if (easeDuration is { } duration)
+        {
+            easeElapsed += deltaSeconds;
+            var t = Math.Clamp(easeElapsed / duration, 0f, 1f);
+            var eased = t * t * (3f - 2f * t); // smoothstep
+            var next = Vector3.Lerp(easeStart, dest, eased);
+            parent.SetPosition(new Placement(next, parent.Rotation));
+            if (t >= 1f) Stop();
+            return;
+        }
 
         var cur = parent.Position;
 
@@ -220,10 +265,13 @@ internal class Movement(SimCharacter parent)
         if (!followTarget.IsAlive())
         {
             followTarget = null;
+            followForced = false;
             followCooldown = 0f;
             Stop();
             return;
         }
+        // Before the arrival branch below, which also turns the character to face the target.
+        if (!CanFollow(followForced)) return;
 
         // Arrived last frame: sit out the cooldown facing the target, don't chase yet.
         if (followCooldown > 0f)
@@ -253,6 +301,7 @@ internal class Movement(SimCharacter parent)
     {
         destination = null;
         interceptTether = null;
+        easeDuration = null;
         StopAnim();
     }
 
@@ -269,8 +318,8 @@ internal class Movement(SimCharacter parent)
     //     loop the pose forever (the original "knockback stuck" bug).
     protected void StartAnim()
     {
-        // Native entry point, not the virtual PlayActionTimeline -- SimEnemy overrides that to
-        // track/broadcast scenario cues, and movement-driven start/stop must never go through it.
+        // Native entry point: SimEnemy's PlayActionTimeline override broadcasts scenario cues,
+        // which movement must not trigger.
         parent.PlayActionTimelineNative(timelineId, baseOverride: timelineBaseOverride ? timelineId : (ushort)0);
         animActive = true;
     }
@@ -278,7 +327,7 @@ internal class Movement(SimCharacter parent)
     protected void StopAnim()
     {
         if (!animActive) return;
-        parent.ResetActionTimeline();
+        parent.ResetActionTimelineNative();
         animActive = false;
     }
 
@@ -294,16 +343,8 @@ internal class Movement(SimCharacter parent)
 
 internal sealed class PlayerMovement(SimCharacter parent) : Movement(parent)
 {
-    // Normally a no-op ("player cannot be moved like this") since AiManager.Move
-    // and friends address every party slot uniformly, including whichever one
-    // holds the real player. DebugBotControl flips this for the one case that
-    // legitimately wants the real character driven by AI: MultiplayerManager's
-    // debug "bot controls my character" peer mode, which schedules the exact
-    // same AiManager/scenario-Ai MoveTo/Intercept calls a host-side bot would
-    // get. Falling through to base.MoveTo also sets SimPlayer's own
-    // destination/IsMoving, which SyncInputLock already reads to zero the real
-    // player's WASD input while a knockback is sliding them -- so it
-    // transparently suppresses manual input here too, no extra plumbing needed.
+    // Normally a no-op, since AiManager addresses every slot uniformly; DebugBotControl lets
+    // the AI drive the real character (SyncInputLock then zeroes manual input via IsMoving).
     public override void MoveTo(Vector3 t, float sp = 6f, float? finalRot = null, ushort tl = RunTimelineId, bool baseOverride = true)
     {
         if (DebugBotControl.Enabled)
@@ -313,15 +354,15 @@ internal sealed class PlayerMovement(SimCharacter parent) : Movement(parent)
         }
         // NO-OP - player cannot be moved like this
     }
+
+    // The same rule for follows, which reach the mover through TickFollow rather than MoveTo:
+    // a strat walking its bots must never take the wheel from someone practising. Knockbacks,
+    // arrow pushes and a forced follow (Confusion) still apply -- the real fight moves you too.
+    protected override bool CanFollow(bool forced) => forced || DebugBotControl.Enabled;
 }
 
-// A network puppet's position is set directly from received poses
-// (SimNetworkPuppet.ApplyNetworkPose -> SimCharacter.SetPosition), not by local
-// pathing. AI/scenario code addresses party slots uniformly regardless of what
-// occupies them (see AiManager.Move calling .MoveTo on every slot including the
-// real player's), so this no-ops the same calls PlayerMovement already no-ops --
-// otherwise a scheduled bot MoveTo would fight the network-driven position every
-// frame via Movement.Tick's own SetPosition calls.
+// Position comes from received poses (SimNetworkPuppet.ApplyNetworkPose); a scheduled bot
+// MoveTo would fight it every frame.
 internal sealed class NetworkPuppetMovement(SimCharacter parent) : Movement(parent)
 {
     public override void MoveTo(Vector3 t, float sp = 6f, float? finalRot = null, ushort tl = RunTimelineId, bool baseOverride = true)

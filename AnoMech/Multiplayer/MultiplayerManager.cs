@@ -17,16 +17,12 @@ using AnoMech.Scenarios;
 
 namespace AnoMech.Multiplayer;
 
-// Owns the multiplayer session lifecycle and the host<->peer replication loop. The host
-// runs the real scenario unmodified, with joined peers' claimed roles spawned as
-// SimNetworkPuppet instead of AI bots. Peers run no scenario logic themselves -- they load
-// the same cosmetic zone/party and apply whatever the host broadcasts (WorldSnapshot each
-// host Tick; RoleKilled through the normal Game.Kill path), reporting their own real
-// position back every frame (SelfPose) so the host's puppet tracks it.
+// Session lifecycle and the host<->peer replication loop. The host runs the real scenario
+// with joined peers' roles spawned as SimNetworkPuppet; peers run no scenario logic, apply
+// what the host broadcasts, and report their own position back (SelfPose).
 //
-// All engine calls here assume the framework thread -- Tick() runs there via
-// OnFrameworkUpdate, and every handler reached from RelayClient.MessageReceived (a
-// background thread) is marshalled onto it via Plugin.Framework.Run first.
+// Everything here runs on the framework thread: Tick() via OnFrameworkUpdate, and relay
+// messages are queued and drained there (see DrainPendingMessages).
 public sealed partial class MultiplayerManager : IDisposable
 {
     private RelayClient? relay;
@@ -36,15 +32,13 @@ public sealed partial class MultiplayerManager : IDisposable
     private int nextEnemyNetId;
     private readonly Dictionary<SimTether, int> hostTetherNetIds = new();
     private int nextTetherNetId;
-    // Host-only: edge-triggered logging so a mid-fight change gets one log line instead of
-    // one per sample. ModelState/statuses/animation are still sent in full every snapshot.
+    // Host-only, for edge-triggered logging; every snapshot still carries the full state.
     private readonly Dictionary<SimEnemy, byte> hostEnemyLastLoggedModelState = new();
-    // Per-status-id (not just "did the set change") so LogStatusChanges can log an
-    // individual gain/loss/stack-change line instead of one "the whole set changed" summary.
     private readonly Dictionary<SimEnemy, Dictionary<ushort, ushort>> hostEnemyLastLoggedStatuses = new();
     private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedAnimationTimeline = new();
     private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedAnimationState = new();
     private readonly Dictionary<PartyRole, Dictionary<ushort, ushort>> hostRoleLastLoggedStatuses = new();
+    private readonly Dictionary<PartyRole, int> hostRoleLastLoggedAnimationTimeline = new();
 
     private readonly Dictionary<SimEventObject, int> hostEventObjectNetIds = new();
     private int nextEventObjectNetId;
@@ -52,59 +46,55 @@ public sealed partial class MultiplayerManager : IDisposable
     private readonly Dictionary<int, SimEnemy> peerEnemies = new();
     private readonly Dictionary<int, SimTether> peerTethers = new();
     private readonly Dictionary<int, SimEventObject> peerEventObjects = new();
-    // Peer-only: last-applied value per NetId, so a no-op resend isn't reissued every
-    // snapshot -- SetModelState's native rebuild flickers the model, animation replay would
-    // restart the loop, etc.
+    // Peer-only: last applied value per NetId. Re-issuing an unchanged ModelState rebuilds the
+    // model (visible flicker) and re-playing an animation restarts it.
     private readonly Dictionary<int, byte> peerEnemyModelState = new();
     private readonly Dictionary<int, Dictionary<ushort, ushort>> peerEnemyLastLoggedStatuses = new();
     private readonly Dictionary<int, int> peerEnemyAnimationTimeline = new();
     private readonly Dictionary<int, int> peerEnemyAnimationState = new();
-    // Peer-only: see EnemyState.LastInstantCastSeq/CastSeq for why instant and telegraphed
-    // casts each need their own dedup counter instead of the IsCasting rising edge.
     private readonly Dictionary<int, int> peerEnemyLastInstantCastSeq = new();
     private readonly Dictionary<int, int> peerEnemyLastCastSeq = new();
+    // NetIds whose real-packet spawn the engine dropped locally; recreated as plain doppels.
+    private readonly HashSet<int> peerEnemyTemplateFailed = new();
     private readonly Dictionary<int, ushort> peerEventObjectState = new();
-    // Peer-only role equivalent of peerEnemyLastLoggedStatuses -- reconciled/applied for
-    // every role including the peer's own, since a peer never runs scenario logic itself.
+    private readonly Dictionary<int, int> peerEventObjectAnimationSeq = new();
+    private readonly Dictionary<int, int> peerEventObjectFadeSeq = new();
+    // Engine-state seqs applied per NetId (see ActorEngineState): re-issuing an unchanged mode
+    // or hold restarts it.
+    private readonly Dictionary<int, (int Mode, int Hold, int Direct, int ForceLoad)> peerEnemyEngineSeqs = new();
+    private readonly Dictionary<int, bool> peerEnemyModelHidden = new();
+    private readonly Dictionary<PartyRole, int> peerRoleAnimationTimelineSeq = new();
+    private readonly Dictionary<PartyRole, int> peerRolePlayedActionSeq = new();
     private readonly Dictionary<PartyRole, Dictionary<ushort, ushort>> peerRoleLastLoggedStatuses = new();
-    // Peer-only: statusIds THIS reconciliation applied to a role, as opposed to one the
-    // local client manages itself (e.g. Sprint via LocalPlayerInputHooks on the peer's own
-    // claimed role) -- removal here must only ever undo what this code added.
+    // Statuses this client put on a role by reconciliation; removal must only undo those, never
+    // a status the local client manages itself (Sprint via LocalPlayerInputHooks).
     private readonly Dictionary<PartyRole, HashSet<ushort>> peerRoleReconciledStatusIds = new();
-    // RunScenarioAsPeer's zone load is deferred a frame past OnStartReceived setting
-    // running=true -- only treat IsInInstance==false as "left" once it's flipped true once.
+    // The peer's zone load is deferred a frame past running=true, so IsInInstance==false only
+    // means "left" once it has been true.
     private bool peerEnteredInstance;
 
-    // ---- Connection-quality tracking ---------------------------------------
-    // Host-only ground truth: last-heard wall-clock time and last measured RTT per claimed
-    // peer. Runs continuously (lobby and mid-fight), independent of `running`/IsHost.
+    // ---- Connection-quality tracking (runs in the lobby too) ---------------
     private const float PingIntervalSeconds = 2f;
     private const long PeerStaleTimeoutMs = 8000;
-    // Shorter timeout for "never heard from a host at all" -- catches a mistyped/nonexistent
-    // code, since the relay has no "session not found" at the transport level.
+    // Catches a mistyped/nonexistent code; the relay has no "session not found" at the
+    // transport level.
     private const long NoHostFoundTimeoutMs = 4000;
     private float pingTimer;
     private readonly Dictionary<Guid, long> peerLastSeenMs = new();
     private readonly Dictionary<Guid, float> peerLatencyMs = new();
     private readonly HashSet<Guid> warnedStalePeers = new();
-    // Host-only: a peer's own real tank-mitigation statuses, self-reported (see
-    // SelfMitigationMessage) since a peer's real button press never reaches the host's
-    // SimNetworkPuppet copy of them. Read by TankMitigation.ComputeMitigation.
+    // Host-only: each peer's self-reported mitigation statuses (SelfMitigationMessage); read by
+    // TankMitigation.ComputeMitigation.
     private readonly Dictionary<Guid, HashSet<ushort>> peerMitigationStatusIds = new();
-    // Display-ready status per claimed peer, rebuilt by the host each ping cycle and
-    // broadcast (PeerStatusMessage) so peers can render the roster without their own
-    // liveness bookkeeping.
+    // Rebuilt by the host each ping cycle and broadcast (PeerStatusMessage).
     private readonly Dictionary<Guid, PeerStatusEntry> peerStatuses = new();
-    // Peer-only: the host's own roster row, since it's excluded from peerStatuses (it never
-    // pings itself). Updated by watching every host-originated broadcast -- see DispatchCore.
+    // Peer-only: the host never pings itself, so its liveness is the time since any host broadcast.
     private long lastHostMessageMs;
-    // Distinguishes "never heard from a host" from "was hearing, then stopped" --
-    // lastHostMessageMs alone can't, since it's seeded to "now" on every join/reconnect.
+    // lastHostMessageMs is seeded to "now" on join, so it alone can't tell "never heard" from
+    // "went silent".
     private bool everHeardFromHost;
 
-    // ---- Pre-Start readiness check -----------------------------------------
-    // Host-only: mid-flight state for a StartScenario call awaiting every claimed peer's
-    // StartCheckResponseMessage -- see StartScenario/FinishStartCheck/Tick().
+    // ---- Pre-start readiness check (see StartScenario/FinishStartCheck) -----
     private const float StartCheckTimeoutSeconds = 5f;
     private HashSet<Guid>? pendingStartResponses;
     private readonly Dictionary<Guid, string> startCheckFailures = new();
@@ -113,61 +103,50 @@ public sealed partial class MultiplayerManager : IDisposable
     public string? StartCheckFailureReason { get; private set; }
 
     // ---- Debug: bot-controlled host or peer ---------------------------------
-    // Testing aid: drives the user's own claimed role via the same AiManager choreography a
-    // bot would produce, so one developer can fill a multi-person session alone. For the
-    // host, scenario.Run already scheduled that choreography live -- this flag just stops
-    // PlayerMovement.MoveTo from no-op'ing it. For a peer it's reconstructed from a
-    // broadcast AiReplayStateMessage (see TrySendAiReplayState/TryStartDebugBotReplay).
-    // Sticky across Start/Reset within a session; lobby-only to toggle.
+    // Testing aid: the user's own role is driven by the bot AI, so one developer can fill a
+    // session alone. The host's scenario.Run already schedules that choreography (the flag just
+    // lets PlayerMovement.MoveTo act on the player); a peer rebuilds it from the host's
+    // replay-state message. Sticky across Start/Reset; lobby-only to toggle.
     private bool debugBotControlled;
     public bool DebugBotControlled => debugBotControlled;
 
-    // Host-only: whether this run's replay-state message already went out.
     private bool aiReplayStateSent;
 
-    // Host-only: BroadcastRunEnded's EndMessage is fire-and-forget -- these track resends
-    // still owed if it's lost, since a peer otherwise only notices via PeerStaleTimeoutMs.
+    // EndMessage is resent a few times: a lost one would leave peers waiting out PeerStaleTimeoutMs.
     private const int EndMessageResendCount = 4;
     private const float EndMessageResendIntervalSeconds = 1f;
     private bool? pendingEndResendReturnedToInn;
+    private string? pendingEndResendReason;
     private int endResendsRemaining;
     private float endResendTimer;
 
-    // Host-only: RunScenarioAsHost's real work (setting Game.ActiveScenario) is deferred a
-    // frame past `running` being set true -- without this, Tick() can see ActiveScenario
-    // still null and wrongly broadcast an end-of-run right after a real start.
+    // RunScenarioAsHost sets ActiveScenario a frame late; without this Tick() would read the
+    // null as "run ended".
     private bool hostScenarioStarted;
 
-    // Peer-only: host's broadcast replay-state message, buffered until peerEnteredInstance
-    // (order vs. the host broadcast isn't guaranteed). debugShadowStateGeneric stays around
-    // after replay starts so OnWorldSnapshotReceived can keep refreshing it (see
-    // IMultiplayerReplayable.RefreshLiveHandles). Shared by every multiplayer scenario instead
-    // of a field pair each -- the concrete type is opaque here, only the owning scenario's own
-    // interface methods ever cast it back.
+    // Peer-only: the host's replay-state message, buffered until the zone is entered (arrival
+    // order isn't guaranteed), and the opaque shadow state the owning scenario built from it.
     private MpMessage? pendingGenericReplayState;
     private object? debugShadowStateGeneric;
     private bool debugBotReplayStarted;
 
     public bool SetDebugBotControlled(bool value)
     {
-        if (running) return false; // toggling mid-fight would be a silent no-op anyway
+        if (running) return false;
         debugBotControlled = value;
         return true;
     }
 
     // ---- Reconnection --------------------------------------------------------
-    // The relay has no session persistence beyond currently-open sockets -- reconnecting
-    // with the same code re-adds a fresh socket. Identity survives via
-    // Configuration.LocalPeerId (stable per-install), and the host never releases a claimed
-    // role on staleness, so rejoining resumes where it left off.
+    // Identity survives a reconnect via Configuration.LocalPeerId, and the host keeps a stale
+    // peer's role, so rejoining resumes where it left off.
     private static readonly TimeSpan[] ReconnectBackoff =
         { TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(15) };
     private CancellationTokenSource? reconnectCts;
     private bool reconnecting;
     public bool IsReconnecting => reconnecting;
-    // Host-only: when the host's own relay connection went down; null while connected.
-    // Without this the host retries forever while the fight runs on locally, oblivious that
-    // every peer already gave up via IsHostStale.
+    // Host-only; lets Tick() end a run whose peers have all given up (IsHostStale) while the
+    // host would otherwise keep retrying.
     private long? disconnectedSinceMs;
     public int ReconnectAttempt { get; private set; }
 
@@ -178,31 +157,42 @@ public sealed partial class MultiplayerManager : IDisposable
     public bool IsEncrypted => relay?.IsEncrypted ?? false;
     public bool FellBackToUnencrypted => relay?.FellBackToUnencrypted ?? false;
     public bool SupportsCompression => relay?.SupportsCompression ?? false;
+    // Without it every frame is assumed to be from the host (see IHostOnlyMessage).
+    public bool RelayAttestsSender => relay?.SupportsSenderIdentity ?? false;
     public bool IsRunning => running;
     public string? SessionCode { get; private set; }
     public string? RelayUrl { get; private set; }
-    // Read fresh from config at Host/Join time (Plugin.Config.RelayAccessToken), then reused
-    // for the reconnect loop the same way RelayUrl is -- so a mid-session config edit can't
-    // change what an already-open reconnect attempt sends.
+    // Captured at Host/Join time so a mid-session config edit doesn't change what the
+    // reconnect loop sends.
     private string? relayAccessToken;
     public string DisplayName { get; set; } = "Player";
-    // Set when RelayClient.Disconnected fires from a failed connect (bad scheme, relay
-    // unreachable, TLS misconfig) rather than a later drop, so it's surfaced in the UI
-    // instead of only an unobserved Task exception. Cleared on the next Host/Join attempt.
+    // Failed-connect reason for the UI; cleared on the next Host/Join.
     public string? ConnectionError { get; private set; }
-    // Set when a session ends out from under a peer (host left, or contact lost) rather than
-    // via this client's own Leave click, so the connect screen can explain why.
+    // Why the session ended, when it wasn't this client's own Leave.
     public string? SessionEndReason { get; private set; }
 
     public PartyRole? MyClaimedRole => Session.RoleOf(MyPeerId);
+
+    // ScenarioIndex comes off the wire; every read goes through here rather than indexing
+    // Scenarios directly.
+    internal IScenario? TryResolveScenario()
+    {
+        var scenarios = Plugin.GameInstance.Scenarios;
+        if (Session.ScenarioIndex < 0) return null; // nothing chosen yet
+        if (NetGuard.InRange(Session.ScenarioIndex, scenarios.Count)) return scenarios[Session.ScenarioIndex];
+        if (warnedBadScenarioIndex == Session.ScenarioIndex) return null;
+        warnedBadScenarioIndex = Session.ScenarioIndex;
+        DiagnosticLog.Warn($"[Multiplayer] Host sent scenario index {Session.ScenarioIndex}, but only {scenarios.Count} exist -- ignoring.");
+        return null;
+    }
+
+    private int? warnedBadScenarioIndex;
 
     public event Action? LobbyChanged;
 
     public PeerStatusEntry? GetPeerStatus(Guid peerId) => peerStatuses.GetValueOrDefault(peerId);
 
-    // Host-only: whatever `role`'s claimed peer last self-reported as active (see
-    // SelfMitigationMessage) -- empty if unclaimed, unreported yet, or called on a peer
-    // client (a peer has no visibility into another peer's statuses).
+    // Host-only (a peer has no view of other peers' statuses); empty if unclaimed or unreported.
     public IReadOnlyCollection<ushort> PeerMitigationStatusIds(PartyRole role)
     {
         if (!IsHost || !Session.ClaimedBy.TryGetValue(role, out var peerId)) return [];
@@ -210,8 +200,7 @@ public sealed partial class MultiplayerManager : IDisposable
     }
 
     public float SecondsSinceHostMessage => (Environment.TickCount64 - lastHostMessageMs) / 1000f;
-    // Lets MultiplayerWindow hold a peer on "connecting" instead of the full lobby until a
-    // host is actually confirmed present -- SessionCode alone is set synchronously on Join.
+    // SessionCode is set synchronously on Join; this is what confirms a host is actually there.
     public bool EverHeardFromHost => everHeardFromHost;
     public bool IsHostStale => !IsHost && everHeardFromHost && SecondsSinceHostMessage * 1000f > PeerStaleTimeoutMs;
     public bool IsSessionNotFound => !IsHost && !everHeardFromHost && SecondsSinceHostMessage * 1000f > NoHostFoundTimeoutMs;
@@ -238,14 +227,13 @@ public sealed partial class MultiplayerManager : IDisposable
         LobbyChanged?.Invoke();
     }
 
-    // `client` is captured rather than reading `relay` after the await, so a
-    // LeaveSession/fresh Host/Join that replaces `relay` mid-flight can't resurrect an
-    // abandoned session with a late-arriving code (same guard as OnDisconnectedOffThread).
+    // The ReferenceEquals check keeps a late-arriving code from resurrecting a session that was
+    // left mid-connect.
     private async Task FinishHostConnectAsync(RelayClient client)
     {
         var code = await client.ConnectAndHostAsync(RelayUrl!, relayAccessToken);
         if (!ReferenceEquals(relay, client)) return;
-        if (code is null) return; // Disconnected already fired from inside ConnectAndHostAsync
+        if (code is null) return; // Disconnected already fired
         SessionCode = code;
         DiagnosticLog.Info($"[Multiplayer] Relay assigned session code {code}.");
         LobbyChanged?.Invoke();
@@ -261,8 +249,7 @@ public sealed partial class MultiplayerManager : IDisposable
         relayAccessToken = Plugin.Config.RelayAccessToken;
         SessionCode = code.Trim().ToUpperInvariant();
         Session = new MultiplayerSession();
-        // Seed to "now", not the long default (0), or the host's row reads as silent for
-        // decades until the first broadcast arrives.
+        // Seeded to now, or the host reads as silent since 1970 until its first broadcast.
         lastHostMessageMs = Environment.TickCount64;
         everHeardFromHost = false;
 
@@ -279,9 +266,7 @@ public sealed partial class MultiplayerManager : IDisposable
         await relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum));
     }
 
-    // Shared by HostSession, JoinSession, and the reconnect loop. Disconnected captures the
-    // specific instance so a stale event from an already-replaced client can be told apart
-    // from one about the currently active connection.
+    // Disconnected captures the instance so an event from a replaced client can be told apart.
     private void WireRelay(RelayClient client)
     {
         client.MessageReceived += OnMessageReceivedOffThread;
@@ -303,10 +288,9 @@ public sealed partial class MultiplayerManager : IDisposable
         if (IsHost) Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
         if (IsHost) Plugin.GameInstance.World.OmenSpawned -= OnOmenSpawnedHost;
 
-        // Notify so peers don't sit stuck waiting on a session that's already over (see
-        // SessionEndedMessage). Defer Dispose() until the send completes, or it usually
-        // aborts before reaching the wire. notifyOthers is false when reacting to someone
-        // else's SessionEndedMessage, to avoid a broadcast cascade.
+        // Dispose only after the SessionEnded send completes, or it usually aborts before
+        // reaching the wire. notifyOthers is false when reacting to someone else's
+        // SessionEnded, to avoid a cascade.
         if (notifyOthers && relay is { IsConnected: true } activeRelay)
             _ = activeRelay.SendAsync(new SessionEndedMessage(MyPeerId)).ContinueWith(_ => activeRelay.Dispose());
         else
@@ -318,6 +302,11 @@ public sealed partial class MultiplayerManager : IDisposable
         RelayUrl = null;
         ConnectionError = null;
         SessionEndReason = null;
+        RunEndReason = null;
+        warnedBadScenarioIndex = null;
+        peerConnectionIds.Clear();
+        connectionLastSeenMs.Clear();
+        bannedPeers.Clear();
         Session = new MultiplayerSession();
         hostEnemyNetIds.Clear();
         hostEnemyLastLoggedModelState.Clear();
@@ -325,6 +314,7 @@ public sealed partial class MultiplayerManager : IDisposable
         hostEnemyLastLoggedAnimationTimeline.Clear();
         hostEnemyLastLoggedAnimationState.Clear();
         hostRoleLastLoggedStatuses.Clear();
+        hostRoleLastLoggedAnimationTimeline.Clear();
         hostTetherNetIds.Clear();
         hostEventObjectNetIds.Clear();
         peerEnemies.Clear();
@@ -334,11 +324,18 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEnemyAnimationState.Clear();
         peerEnemyLastInstantCastSeq.Clear();
         peerEnemyLastCastSeq.Clear();
+        peerEnemyTemplateFailed.Clear();
         peerRoleLastLoggedStatuses.Clear();
+        peerRoleAnimationTimelineSeq.Clear();
+        peerRolePlayedActionSeq.Clear();
         peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
         peerEventObjects.Clear();
         peerEventObjectState.Clear();
+        peerEventObjectAnimationSeq.Clear();
+        peerEventObjectFadeSeq.Clear();
+        peerEnemyEngineSeqs.Clear();
+        peerEnemyModelHidden.Clear();
         peerLastSeenMs.Clear();
         peerLatencyMs.Clear();
         peerStatuses.Clear();
@@ -355,6 +352,7 @@ public sealed partial class MultiplayerManager : IDisposable
         debugBotControlled = false;
         aiReplayStateSent = false;
         pendingEndResendReturnedToInn = null;
+        RestoreOwnScenarioSettings();
         StopDebugBotReplay();
     }
 
@@ -362,9 +360,7 @@ public sealed partial class MultiplayerManager : IDisposable
 
     // ---- Reconnection ---------------------------------------------------
 
-    // Fired when the active relay connection dies unexpectedly (not via LeaveSession).
-    // Retries with capped backoff until it succeeds or LeaveSession cancels it -- no attempt
-    // limit, since "Leave session" is always the user's escape hatch.
+    // No attempt limit: "Leave session" is always the user's way out.
     private void BeginReconnect()
     {
         if (SessionCode == null || RelayUrl == null || reconnecting) return;
@@ -387,9 +383,8 @@ public sealed partial class MultiplayerManager : IDisposable
 
             var client = new RelayClient();
             WireRelay(client);
-            // Captured directly, not via OnDisconnectedOffThread -- that handler ignores this
-            // client until it's actually installed as `relay` (see its own ReferenceEquals
-            // guard), so it's the wrong place to learn WHY this particular attempt failed.
+            // OnDisconnectedOffThread ignores a client not yet installed as `relay`, so the
+            // failure is captured here.
             Exception? failure = null;
             client.Disconnected += e => failure = e;
             await client.ConnectAsync(relayUrl, sessionCode, relayAccessToken).ConfigureAwait(false);
@@ -398,11 +393,8 @@ public sealed partial class MultiplayerManager : IDisposable
 
             if (!connected && failure is RelaySessionRejectedException rejected)
             {
-                // The relay is reachable and has explicitly said this session doesn't exist --
-                // most likely it restarted and forgot every room. Retrying the same code can
-                // never succeed, so stop looping (this used to retry every 15s forever with
-                // nothing to show for it -- see AnoMech-DamageDebug transcripts) and tell the
-                // user plainly instead of leaving them staring at "Reconnect attempt N" forever.
+                // The relay says the session doesn't exist (it most likely restarted); retrying
+                // the same code can never succeed.
                 client.Dispose();
                 DiagnosticLog.Warn($"[Multiplayer] Giving up on session {sessionCode} -- relay says: {rejected.Message}.");
                 var wasHost = IsHost;
@@ -423,8 +415,6 @@ public sealed partial class MultiplayerManager : IDisposable
         }
     }
 
-    // Runs on the framework thread. `connected` was already read synchronously, so only
-    // installing the result into game-visible state needs marshalling.
     private void FinishReconnectAttempt(RelayClient client, bool connected, CancellationToken token)
     {
         if (token.IsCancellationRequested || !connected)
@@ -439,8 +429,7 @@ public sealed partial class MultiplayerManager : IDisposable
         DiagnosticLog.Info($"[Multiplayer] Reconnected to session {SessionCode}.");
         lastHostMessageMs = Environment.TickCount64;
         ConnectionError = null;
-        // Re-registers with the host (refreshes Names, triggers BroadcastLobbyState); the
-        // existing LobbyStateMessage handler resumes a running scenario like a late join.
+        // Re-registering with the host resumes a running scenario the same way a late join does.
         if (!IsHost) _ = relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum));
         LobbyChanged?.Invoke();
     }
@@ -461,18 +450,14 @@ public sealed partial class MultiplayerManager : IDisposable
         else _ = relay.SendAsync(new ReleaseRoleMessage(MyPeerId));
     }
 
-    // Peer-only: routes a Reset through the host (ResetRequestMessage) instead of resetting
-    // only the requester's local view. The host's own Reset needs no equivalent.
     public void RequestReset()
     {
         if (IsHost || relay is not { IsConnected: true }) return;
         _ = relay.SendAsync(new ResetRequestMessage(MyPeerId));
     }
 
-    // Peer-only: routes a Leave through the host (LeaveRequestMessage) so the whole group
-    // ends the run together, rather than unloading this peer's zone while the host keeps
-    // simulating for a puppet nobody has loaded. Distinct from LeaveSession, which
-    // disconnects just the clicker.
+    // Peer-only: the host ends the run for the whole group (LeaveRequestMessage); LeaveSession
+    // disconnects just this client.
     public void RequestLeaveInstance()
     {
         if (IsHost || relay is not { IsConnected: true }) return;
@@ -486,8 +471,7 @@ public sealed partial class MultiplayerManager : IDisposable
             DiagnosticLog.Info($"[Multiplayer] Rejected role claim: {Session.NameOf(peerId)} wanted {role}, already held by {Session.NameOf(holder)}.");
             return;
         }
-        // A build mismatch means differing scenario/protocol logic -- reject silently
-        // (not a kick) so it self-resolves the moment the peer updates, no reconnect needed.
+        // Rejected rather than kicked, so it self-resolves once the peer updates.
         if (IsVersionMismatched(peerId))
         {
             DiagnosticLog.Warn($"[Multiplayer] Rejected role claim from {Session.NameOf(peerId)} -- plugin build mismatch.");
@@ -500,8 +484,7 @@ public sealed partial class MultiplayerManager : IDisposable
         BroadcastLobbyState();
     }
 
-    // "unknown" checksum (local checksumming failed) never counts as a mismatch either way --
-    // fail open rather than block a session over a checksum that couldn't be computed.
+    // An "unknown" checksum (local checksumming failed) fails open.
     public bool IsVersionMismatched(Guid peerId)
     {
         if (!Session.Builds.TryGetValue(peerId, out var build)) return false;
@@ -517,8 +500,115 @@ public sealed partial class MultiplayerManager : IDisposable
         BroadcastLobbyState();
     }
 
-    // Host-only: a non-host peer left. Unlike ApplyRelease this drops them from the roster
-    // entirely (Names/Builds too), plus all host-only liveness/start-check bookkeeping.
+    // ---- Host-side roster management ----------------------------------------
+
+    // Lobby only. The previous holder is unseated, not swapped.
+    public void AssignRole(Guid peerId, PartyRole role)
+    {
+        if (!IsHost || Session.Started || !Session.Names.ContainsKey(peerId)) return;
+        if (IsVersionMismatched(peerId))
+        {
+            DiagnosticLog.Warn($"[Multiplayer] Not assigning {role} to {Session.NameOf(peerId)} -- plugin build mismatch.");
+            return;
+        }
+        if (Session.ClaimedBy.TryGetValue(role, out var holder) && holder != peerId)
+        {
+            Session.ClaimedBy.Remove(role);
+            DiagnosticLog.Info($"[Multiplayer] Host unseated {Session.NameOf(holder)} from {role} to assign it to {Session.NameOf(peerId)}.");
+        }
+        foreach (var r in Session.ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => kv.Key).ToList())
+            Session.ClaimedBy.Remove(r);
+        Session.ClaimedBy[role] = peerId;
+        DiagnosticLog.Info($"[Multiplayer] Host assigned {role} to {Session.NameOf(peerId)}.");
+        BroadcastLobbyState();
+    }
+
+    public void UnassignRole(Guid peerId)
+    {
+        if (!IsHost || Session.Started) return;
+        ApplyRelease(peerId);
+    }
+
+    // By stable per-install PeerId, with the name for the ban list. A banned client's messages
+    // are dropped and the kick repeated (see DispatchCore); a plain kick leaves the way back open.
+    private readonly Dictionary<Guid, string> bannedPeers = new();
+    public IReadOnlyDictionary<Guid, string> BannedPeers => bannedPeers;
+
+    public void KickPeer(Guid peerId) => RemoveByHost(peerId, ban: false);
+    public void BanPeer(Guid peerId) => RemoveByHost(peerId, ban: true);
+
+    private void RemoveByHost(Guid peerId, bool ban)
+    {
+        if (!IsHost || peerId == MyPeerId || relay == null) return;
+        var who = Session.NameOf(peerId);
+        DiagnosticLog.Info($"[Multiplayer] Host {(ban ? "banned" : "kicked")} {who} ({peerId}).");
+        if (ban) bannedPeers[peerId] = who;
+        _ = relay.SendAsync(new KickMessage(peerId, ban));
+        RemovePeer(peerId);
+    }
+
+    public void UnbanPeer(Guid peerId)
+    {
+        if (!IsHost || !bannedPeers.Remove(peerId, out var who)) return;
+        DiagnosticLog.Info($"[Multiplayer] Host unbanned {who} ({peerId}).");
+        LobbyChanged?.Invoke();
+    }
+
+    // Both the display summary and the overrides themselves: a peer's own code reads them too
+    // (IScenario.RunInstanceEvents), so the host's choices have to reach it.
+    public void PublishScenarioSettings(IScenario? scenario)
+    {
+        if (!IsHost) return;
+        var overrides = scenario is { SupportsMultiplayer: true } ? scenario.SettingsOverrides : null;
+        var lines = ScenarioSettingsSummary.Describe(overrides);
+        var json = ScenarioSettingsSync.Serialize(overrides);
+        if (lines.SequenceEqual(Session.ScenarioSettings) && json == Session.ScenarioSettingsJson) return;
+        Session.ScenarioSettings = lines;
+        Session.ScenarioSettingsJson = json;
+        BroadcastLobbyState();
+    }
+
+    // Peer-only: the host's overrides for the selected scenario, applied to our own instance of
+    // them. Ours are put back when the session ends, so a lobby can't leave its debug knobs
+    // behind on someone's solo settings.
+    private string? appliedScenarioSettingsJson;
+    private (object Target, string Json)? scenarioSettingsBackup;
+
+    private void ApplyHostScenarioSettings()
+    {
+        if (IsHost) return;
+        var json = Session.ScenarioSettingsJson;
+        if (json == appliedScenarioSettingsJson) return;
+        if (string.IsNullOrEmpty(json) || TryResolveScenario()?.SettingsOverrides is not { } overrides) return;
+        if (scenarioSettingsBackup is not { } backup || !ReferenceEquals(backup.Target, overrides))
+        {
+            RestoreOwnScenarioSettings();
+            if (ScenarioSettingsSync.Serialize(overrides) is { } ownJson) scenarioSettingsBackup = (overrides, ownJson);
+        }
+        appliedScenarioSettingsJson = json;
+        ScenarioSettingsSync.Apply(overrides, json);
+    }
+
+    private void RestoreOwnScenarioSettings()
+    {
+        appliedScenarioSettingsJson = null;
+        if (scenarioSettingsBackup is not { } backup) return;
+        scenarioSettingsBackup = null;
+        DiagnosticLog.Info($"[Multiplayer] Restoring our own {backup.Target.GetType().Name} settings.");
+        ScenarioSettingsSync.Apply(backup.Target, backup.Json);
+    }
+
+    // Mirrors the main-window selection pre-start so the lobby can name it.
+    public void PublishSelectedScenario(IScenario? scenario)
+    {
+        if (!IsHost || Session.Started || scenario == null) return;
+        var index = Plugin.GameInstance.Scenarios.ToList().IndexOf(scenario);
+        if (index < 0 || index == Session.ScenarioIndex) return;
+        Session.ScenarioIndex = index;
+        BroadcastLobbyState();
+    }
+
+    // Drops the peer from the roster entirely, unlike ApplyRelease.
     private void RemovePeer(Guid peerId)
     {
         var who = Session.NameOf(peerId);
@@ -526,12 +616,13 @@ public sealed partial class MultiplayerManager : IDisposable
         foreach (var r in Session.ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => kv.Key).ToList())
         {
             Session.ClaimedBy.Remove(r);
-            // A departed peer sends no more reports -- clear their banked shield so it
-            // doesn't linger onto whoever claims this role next.
+            // Their banked shield must not linger onto the role's next claimant.
             TankShieldTracker.SetFromPeerReport(r, 0f);
         }
         Session.Names.Remove(peerId);
         Session.Builds.Remove(peerId);
+        // Otherwise a prompt rejoin reads as impersonation until the old connection has gone quiet.
+        if (peerConnectionIds.Remove(peerId, out var connection)) connectionLastSeenMs.Remove(connection);
         peerLastSeenMs.Remove(peerId);
         peerLatencyMs.Remove(peerId);
         peerStatuses.Remove(peerId);
@@ -540,9 +631,8 @@ public sealed partial class MultiplayerManager : IDisposable
         startCheckFailures.Remove(peerId);
         if (pendingStartResponses?.Remove(peerId) == true && pendingStartResponses.Count == 0)
             FinishStartCheck();
-        // Mid-fight, a missing party member usually dooms the mechanic -- end the run for
-        // the rest rather than fight on short. Tick()'s host branch does the actual
-        // broadcast once it sees ActiveScenario == null.
+        // A missing party member usually dooms the mechanic; Tick() broadcasts the end once
+        // ActiveScenario clears.
         if (running && Plugin.GameInstance.World.Map.IsInInstance)
         {
             DiagnosticLog.Info($"[Multiplayer] Ending the run because {who} left mid-fight.");
@@ -559,11 +649,28 @@ public sealed partial class MultiplayerManager : IDisposable
 
     // ---- Starting the scenario ---------------------------------------------
 
-    // Same preconditions RunScenarioInternal enforces, checked client-side up front so a
-    // failure produces an immediate message instead of a silent no-op. Null when ready.
-    // Also gates a claimed tank role on actually being on a tank job -- job-aware bot
-    // mitigation picks ability ids off whoever's in the seat. Pre-start only; a mid-run job
-    // swap isn't caught here (see JobForRole's Paladin fallback for that case).
+    // Also printed to chat: by the time it matters everyone is back in the inn and the window
+    // may be closed.
+    public string? RunEndReason { get; private set; }
+
+    internal void AnnounceRunEnded(string reason)
+    {
+        RunEndReason = reason;
+        DiagnosticLog.Warn($"[Multiplayer] Run ended: {reason}");
+        Plugin.ChatGui.PrintError($"[AnoMech] Run ended -- {reason}");
+        LobbyChanged?.Invoke();
+    }
+
+    private void AbortStart(string reason)
+    {
+        DiagnosticLog.Warn($"[Multiplayer] Refusing the host's start: {reason}.");
+        _ = relay?.SendAsync(new StartAbortMessage(MyPeerId, reason));
+        AnnounceRunEnded($"you couldn't start: {reason}");
+    }
+
+    // The preconditions RunScenarioInternal enforces, checked up front so a failure is reported
+    // instead of a silent no-op. A claimed tank role must be on a tank job: bot mitigation picks
+    // ability ids off the seat's job.
     private string? CheckOwnStartReadiness()
     {
         if (!ZoneSession.IsInInn()) return "not in an inn";
@@ -577,12 +684,9 @@ public sealed partial class MultiplayerManager : IDisposable
         return null;
     }
 
-    // Host only. myRole must already be claimed -- there is no spectator mode, the engine
-    // always seats this client's real character into a party slot.
-    //
-    // Doesn't start immediately: broadcasts StartCheckMessage and waits for every claimed
-    // peer to confirm readiness (see FinishStartCheck), so a peer who isn't in an inn fails
-    // loudly here instead of silently seconds later.
+    // Doesn't start immediately: every claimed peer first confirms readiness
+    // (StartCheckMessage), so a peer who isn't in an inn fails loudly here rather than
+    // silently seconds later.
     public void StartScenario()
     {
         if (!IsHost || relay == null) return;
@@ -596,32 +700,37 @@ public sealed partial class MultiplayerManager : IDisposable
             DiagnosticLog.Warn("[Multiplayer] Cannot start: host has not claimed a role.");
             return;
         }
-        // Same scenario/strat/waymark a solo Start would use, so every peer's
-        // OnStartReceived resolves the identical selection via LobbyStateMessage.
         if (Plugin.MainWindow.SelectedScenario is not { } selectedScenario
             || !selectedScenario.SupportsMultiplayer)
         {
             DiagnosticLog.Warn("[Multiplayer] Cannot start: no multiplayer-supported scenario is selected in the main window.");
             return;
         }
-        // A grouped scenario can leave SelectedStrat at -1 when the region has no strats;
-        // broadcasting that would crash a debug-bot peer indexing AiStrats[SelectedAi].
+        // A region with no strats leaves SelectedStrat at -1, which a debug-bot peer would index with.
         if (!Plugin.MainWindow.HasStartableStrat())
         {
             DiagnosticLog.Warn("[Multiplayer] Cannot start: no strat available for the selected scenario/region.");
+            return;
+        }
+        // Starting anyway would drop whatever the slot layout can't seat, giving the host a run
+        // they didn't set up.
+        if (selectedScenario.SettingsConflicts is { Count: > 0 } conflicts)
+        {
+            foreach (var conflict in conflicts)
+                DiagnosticLog.Warn($"[Multiplayer] Cannot start: {conflict}");
             return;
         }
         var scenarioIndex = Plugin.GameInstance.Scenarios.ToList().IndexOf(selectedScenario);
         Session.ScenarioIndex = scenarioIndex;
         Session.SelectedAi = Plugin.MainWindow.SelectedStrat;
         Session.SelectedWaymark = Plugin.MainWindow.SelectedWaymark;
-        // Belt-and-suspenders on top of ApplyClaim's own rejection (closes a race window).
+        // ApplyClaim already rejects these; this closes the race.
         if (Session.ClaimedBy.Values.Any(IsVersionMismatched))
         {
             DiagnosticLog.Warn("[Multiplayer] Cannot start: one or more claimed players are on a different plugin build.");
             return;
         }
-        if (IsStartCheckPending) return; // already mid-check from a previous click
+        if (IsStartCheckPending) return;
 
         if (CheckOwnStartReadiness() is { } ownReason)
         {
@@ -632,6 +741,7 @@ public sealed partial class MultiplayerManager : IDisposable
         }
 
         StartCheckFailureReason = null;
+        RunEndReason = null;
         startCheckFailures.Clear();
         startCheckTimer = 0f;
         pendingStartResponses = Session.ClaimedBy.Values.Where(id => id != MyPeerId).ToHashSet();
@@ -649,7 +759,6 @@ public sealed partial class MultiplayerManager : IDisposable
         if (pendingStartResponses.Count == 0) FinishStartCheck();
     }
 
-    // Host only: called once every claimed peer has answered (or Tick()'s timeout gave up).
     private void FinishStartCheck()
     {
         pendingStartResponses = null;
@@ -667,9 +776,9 @@ public sealed partial class MultiplayerManager : IDisposable
 
     private void ActuallyStartScenario()
     {
-        if (MyClaimedRole is not { } myRole) return; // re-checked defensively; shouldn't change mid-check
+        if (MyClaimedRole is not { } myRole) return;
 
-        var scenario = Plugin.GameInstance.Scenarios[Session.ScenarioIndex];
+        if (TryResolveScenario() is not { } scenario) return;
         var networkRoles = Session.ClaimedBy.Where(kv => kv.Value != MyPeerId).Select(kv => kv.Key).ToHashSet();
         DiagnosticLog.Info($"[Multiplayer] Host starting '{scenario.Name}' as {myRole}. Network roles: {string.Join(", ", networkRoles.Select(r => $"{r}={Session.NameOf(Session.ClaimedBy[r])}"))}.");
 
@@ -683,6 +792,7 @@ public sealed partial class MultiplayerManager : IDisposable
         hostEnemyLastLoggedAnimationTimeline.Clear();
         hostEnemyLastLoggedAnimationState.Clear();
         hostRoleLastLoggedStatuses.Clear();
+        hostRoleLastLoggedAnimationTimeline.Clear();
         hostTetherNetIds.Clear();
         hostEventObjectNetIds.Clear();
         nextEnemyNetId = 0;
@@ -698,14 +808,15 @@ public sealed partial class MultiplayerManager : IDisposable
                 peerLastSeenMs[peerId] = nowMs;
         Plugin.GameInstance.PartyMemberKilled += OnPartyMemberKilledHost;
         Plugin.GameInstance.World.OmenSpawned += OnOmenSpawnedHost;
-        Plugin.GameInstance.RunScenarioAsHost(scenario, myRole, Session.SelectedAi, Session.SelectedWaymark, networkRoles);
-        // RunScenarioAsHost's scenario.Run already scheduled the chosen Ai's full
-        // choreography against every role including the host's own; this flag is what stops
-        // PlayerMovement.MoveTo from no-op'ing those calls for the host's own character.
+        Plugin.GameInstance.RunScenarioAsHost(scenario, myRole, Session.SelectedAi, Session.SelectedWaymark, networkRoles, ClaimedRoleNames());
+        // scenario.Run already scheduled the Ai against every role; this lets it move the
+        // host's own character. The party exists only after the deferred RunScenarioInternal,
+        // so the obstacle field is wired one callback later.
         if (debugBotControlled)
         {
             DiagnosticLog.Info("[Multiplayer] Host: debug-bot mode active for own character this run.");
             DebugBotControl.Enabled = true;
+            _ = Plugin.Framework.Run(GiveLocalPlayerObstacles);
         }
         running = true;
         LobbyChanged?.Invoke();
@@ -713,9 +824,8 @@ public sealed partial class MultiplayerManager : IDisposable
 
     private void OnStartReceived()
     {
-        // Idempotent: a fresh start delivers both LobbyStateMessage(Started=true) and
-        // StartMessage in quick succession, and the LobbyStateMessage handler also calls
-        // this directly for a late join/reconnect.
+        // Idempotent: a fresh start delivers both LobbyState(Started) and StartMessage, and a
+        // late join replays it from LobbyState.
         if (IsHost) return;
         if (running)
         {
@@ -728,7 +838,20 @@ public sealed partial class MultiplayerManager : IDisposable
             return;
         }
 
-        var scenario = Plugin.GameInstance.Scenarios[Session.ScenarioIndex];
+        if (TryResolveScenario() is not { } scenario)
+        {
+            AbortStart("the host chose a scenario this build doesn't have");
+            return;
+        }
+        // The start check is advisory (a late join skips it, and state changes in between);
+        // RunScenarioInternal would silently no-op, so refuse and say why.
+        if (CheckOwnStartReadiness() is { } notReady)
+        {
+            AbortStart(notReady);
+            return;
+        }
+
+        RunEndReason = null;
         var networkRoles = Enum.GetValues<PartyRole>().Where(r => r != myRole).ToHashSet();
         DiagnosticLog.Info($"[Multiplayer] Peer entering '{scenario.Name}' as {myRole}.");
 
@@ -739,19 +862,29 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEnemyAnimationState.Clear();
         peerEnemyLastInstantCastSeq.Clear();
         peerEnemyLastCastSeq.Clear();
+        peerEnemyTemplateFailed.Clear();
         peerRoleLastLoggedStatuses.Clear();
+        peerRoleAnimationTimelineSeq.Clear();
+        peerRolePlayedActionSeq.Clear();
         peerRoleReconciledStatusIds.Clear();
         peerTethers.Clear();
         peerEventObjects.Clear();
         peerEventObjectState.Clear();
+        peerEventObjectAnimationSeq.Clear();
+        peerEventObjectFadeSeq.Clear();
+        peerEnemyEngineSeqs.Clear();
+        peerEnemyModelHidden.Clear();
         peerEnteredInstance = false;
         StopDebugBotReplay();
-        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles);
+        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles, ClaimedRoleNames());
         running = true;
     }
 
-    // Describes who/what occupies a role for logging purposes -- the local real player (with
-    // their real job), a network puppet (a peer, with the job they connected as), or a bot.
+    // Names for the puppets: every role claimed by someone else, the host's included from a
+    // peer's side.
+    private Dictionary<PartyRole, string> ClaimedRoleNames() =>
+        Session.ClaimedBy.Where(kv => kv.Value != MyPeerId).ToDictionary(kv => kv.Key, kv => Session.NameOf(kv.Value));
+
     private string DescribeRoleOwner(PartyRole role, SimCharacter? member)
     {
         if (member == null) return "empty";
@@ -761,8 +894,7 @@ public sealed partial class MultiplayerManager : IDisposable
         return "bot";
     }
 
-    // Shared by all four status-broadcast paths -- logs one line per status gained/lost/
-    // restacked instead of one "set changed" summary. `lastSeen` is mutated in place.
+    // One line per status gained/lost/restacked; lastSeen is mutated in place.
     private static void LogStatusChanges(string who, IReadOnlyList<(ushort StatusId, ushort Stacks, float RemainingTime)> current, Dictionary<ushort, ushort> lastSeen)
     {
         var currentIds = new HashSet<ushort>();

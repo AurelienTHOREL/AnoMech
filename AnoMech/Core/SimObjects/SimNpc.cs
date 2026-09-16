@@ -3,6 +3,7 @@ using System.Numerics;
 using AnoMech.Core.Game;
 using AnoMech.Core.Native;
 using AnoMech.Pointers;
+using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 
@@ -20,14 +21,35 @@ public unsafe class SimNpc : SimCharacter
     private bool pendingDraw;
     private int pendingDrawFrames;
 
+    // The CharacterManager slot this wrapper reads (InvalidIndex once despawned).
+    protected int Index => index;
+
+    // Forget the slot without touching what it holds: a packet spawn whose slot ended up with
+    // somebody else's actor.
+    protected void DetachSlot()
+    {
+        index = InvalidIndex;
+        pendingDraw = false;
+    }
+
+    // Re-arm the deferred EnableDraw for an actor created without one (see
+    // EnemySpawnConfig.PacketSpawnEnableDraw).
+    protected void RequestDraw()
+    {
+        pendingDraw = index != InvalidIndex;
+        pendingDrawFrames = 0;
+    }
+
     private protected override Movement Movement => field ??= new Movement(this);
-    
+
     internal override BattleChara* BattleCharaPtr => (BattleChara*)(index == InvalidIndex ? null : CharacterManager.Instance()->BattleCharas[index]);
 
-    protected SimNpc(int index, Coordinates coordinates) : base(coordinates)
+    // pendingDraw=false for an actor the engine's own spawn handler created: it enables the
+    // draw itself, as for a real server spawn.
+    protected SimNpc(int index, Coordinates coordinates, bool pendingDraw = true) : base(coordinates)
     {
         this.index = index;
-        pendingDraw = index != InvalidIndex;
+        this.pendingDraw = pendingDraw && index != InvalidIndex;
     }
 
     public override bool IsActive => index != InvalidIndex && BattleCharaPtr != null;
@@ -40,9 +62,7 @@ public unsafe class SimNpc : SimCharacter
         TimelineFunctions.SetModelState(&chara->Timeline, value);
     }
 
-    // Read side of SetModelState -- MultiplayerManager samples this so a scenario's
-    // SetModelState calls (Kefka's grow transformation, Omega-M's phase swaps, etc.)
-    // replicate to peers instead of only ever changing the host's own local model.
+    // Sampled for peers.
     public byte ModelState
     {
         get
@@ -94,6 +114,29 @@ public unsafe class SimNpc : SimCharacter
         }
     }
 
+    // Plays an action's own animation and VFX on this doppel through the same synthetic
+    // ActionEffect a boss cast fires -- what lets a bot tank visibly pop its LB3 in Umad P3
+    // Limit Cut. Effects (statuses, damage) stay the caller's job, exactly as for an enemy Cast.
+    //
+    // Here rather than on SimPartyNpc because the same seat is a SimNetworkPuppet on every peer,
+    // which has to play it too; SimEnemy inherits it but drives its own richer cast instead.
+    private SimCast? actionCast;
+
+    // Sampled for peers, same edge trigger as SimCast.LastInstantCastSeq.
+    public uint PlayedActionId { get; private set; }
+    public float PlayedActionAnimationLock { get; private set; }
+    public int PlayedActionSeq { get; private set; }
+
+    public void PlayAction(uint actionId, float animationLock = 0.6f)
+    {
+        PlayedActionId = actionId;
+        PlayedActionAnimationLock = animationLock;
+        PlayedActionSeq++;
+        actionCast ??= new SimCast(this, Coordinates);
+        actionCast.NativeActionEffect(actionId, animationLock, (ushort)actionId, 0, ActionType.Action, 0,
+            animationTargetId: GameObjectId, actionTargetId: GameObjectId);
+    }
+
     public override void Tick(float deltaSeconds)
     {
         base.Tick(deltaSeconds);
@@ -114,10 +157,7 @@ public unsafe class SimNpc : SimCharacter
             else
             {
                 pendingDrawFrames++;
-                // Only once, well past the point a normal model load should have
-                // resolved -- catches an IsReadyToDraw() that's stuck permanently
-                // false (e.g. a peer's early-reconstructed doppel) without spamming
-                // every frame in between.
+                // Once, well past a normal model load, for an IsReadyToDraw stuck false.
                 if (pendingDrawFrames == 300)
                     DiagnosticLog.Warn($"[SimNpc] still pendingDraw after {pendingDrawFrames} ticks, goid {obj->GetGameObjectId()} -- IsReadyToDraw() never returned true.");
             }
@@ -127,17 +167,12 @@ public unsafe class SimNpc : SimCharacter
     public override void Despawn()
     {
         if (index == InvalidIndex) return;
-        base.Despawn(); 
+        base.Despawn();
         var obj = BattleCharaPtr;
         if (obj != null)
         {
-            // Quiesce the action timeline before deletion: DeleteObjectByIndex runs the native
-            // Character::Terminate, whose scheduler teardown walks all 14 ActionTimelineSequencer
-            // slots and calls TimelineGroup::PlayAction on each. A still-live timeline there crashes
-            // on freed scheduler state (C0000005 at TimelineGroup.PlayAction). Clearing only slot 0
-            // is not enough for a mid-cast / mid-release-animation boss (the release animation
-            // occupies UpperBody/Facial/Lips slots), so quiesce every slot here. DisableDraw alone
-            // does not close this window either. See crash dumps 20260529_193455 and 20260603_221355.
+            // DeleteObjectByIndex runs Character::Terminate, which walks all 14 sequencer slots;
+            // a still-live one crashes on freed scheduler state (see QuiesceActionTimeline).
             QuiesceActionTimeline();
             obj->DisableDraw();
 

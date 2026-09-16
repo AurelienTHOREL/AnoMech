@@ -19,8 +19,10 @@ namespace AnoMech.Core;
 //  - A disk-backed, async rotating log: a bounded channel feeds one background writer task, so
 //    Info/Warn/Debug never block on I/O. The active segment gzips/rotates at SegmentMaxBytes or
 //    on RotateNow() (Game.Leave forces a fresh segment on leave). Archives are pruned
-//    oldest-first past TotalArchiveCapBytes. A leftover unrotated active file from a previous
-//    session (crash, plugin reload) is rotated at startup instead of being overwritten.
+//    oldest-first past TotalArchiveCapBytes. Leftover unrotated active files from previous
+//    sessions (crash, plugin reload, a load that threw before Plugin.Dispose) are rotated at
+//    startup instead of being overwritten; one still held open by a dead load is left alone and
+//    this session writes to a stamped sibling instead.
 internal static class DiagnosticLog
 {
     // ---- In-memory "this run" view (DamageDebugWindow's Snapshot) -----------------------
@@ -48,10 +50,8 @@ internal static class DiagnosticLog
         Add(message);
     }
 
-    // A multi-line structured block (DamageDebugWindow's party/AOE/enemy state), delimited so
-    // it reads distinctly from per-tick lines. Routed through the same Add() path as
-    // Info/Warn/Debug rather than a separate file. Skips Plugin.Log -- this can fire every few
-    // seconds mid-run and shouldn't spam the normal Dalamud log window.
+    // A delimited multi-line block (DamageDebugWindow's state dump). Skips Plugin.Log: it can
+    // fire every few seconds mid-run.
     public static void LogSnapshot(string label, string content)
         => Add($"=== {label} ==={Environment.NewLine}{content}{Environment.NewLine}=== end {label} ===");
 
@@ -69,18 +69,21 @@ internal static class DiagnosticLog
         if (ShouldPersistToDisk()) EnqueueForDisk(line);
     }
 
-    // Disk logging only happens while the plugin is actually doing something (main window open,
-    // an active sim, or a multiplayer session) -- otherwise idle time in the overworld generates
-    // log I/O for nothing. The in-memory buffer above is unaffected either way. Null-checked
-    // since this can run before Plugin's constructor has assigned these statics.
+    // Disk logging only while the plugin is doing something; idle time in the overworld would
+    // generate I/O for nothing. Null-checked since this can run before Plugin's constructor has
+    // assigned these statics.
     private static bool ShouldPersistToDisk()
-        => (Plugin.MainWindow?.IsOpen ?? false)
+        => ForcePersist
+           || (Plugin.MainWindow?.IsOpen ?? false)
            || Plugin.GameInstance?.ActiveScenario != null
            || Plugin.MultiplayerInstance?.SessionCode != null;
 
-    // Called at the start of each scenario run so a dump never mixes in an earlier attempt's
-    // lines. Only resets the in-memory view -- the disk log has no notion of "runs", it just
-    // keeps flowing and rotates on its own triggers.
+    // Set by DebugMenu's Position Logger: with MainWindow closed and no scenario active, nothing
+    // would reach disk. A bool, not a refcount, while it has one caller.
+    public static bool ForcePersist;
+
+    // Called at the start of each scenario run. Only resets the in-memory view; the disk log
+    // has no notion of runs.
     public static void Clear()
     {
         var marker = $"{DateTime.Now:HH:mm:ss.fff} === New run ===";
@@ -113,9 +116,7 @@ internal static class DiagnosticLog
     private static string? logDir;
     private static bool initialized;
 
-    // Called once from Plugin's constructor. Safe to call more than once (no-ops after the
-    // first) -- the only synchronous work is creating a directory; the rest runs on the
-    // background writer task.
+    // Called once from Plugin's constructor; the only synchronous work is creating a directory.
     public static void Initialize()
     {
         if (initialized) return;
@@ -149,12 +150,10 @@ internal static class DiagnosticLog
 
     private static void EnqueueForDisk(string line) => channel?.Writer.TryWrite(new LogCommand(line, false));
 
-    // Forces the active segment to compress/archive now regardless of size -- Game.Leave calls
-    // this so leaving a session always starts a fresh segment. Non-blocking like every call here.
+    // Archives the active segment now regardless of size (Game.Leave). Non-blocking.
     public static void RotateNow() => channel?.Writer.TryWrite(new LogCommand(null, true));
 
-    // Called once from Plugin.Dispose(). Completes the channel and waits briefly for the writer
-    // to flush and close the active file, so an unload/reload doesn't lose the queued tail.
+    // Waits briefly for the writer to flush, so an unload/reload doesn't lose the queued tail.
     public static void Shutdown()
     {
         channel?.Writer.TryComplete();
@@ -166,29 +165,32 @@ internal static class DiagnosticLog
         {
             // Best-effort -- an unusually slow disk shouldn't hang plugin teardown.
         }
+        channel = null;
+        writerTask = null;
+        initialized = false;
     }
 
     private static async Task RunWriterLoopAsync()
     {
-        var activePath = Path.Combine(logDir!, ActiveFileName);
+        string activePath;
         FileStream activeStream;
         StreamWriter activeWriter;
         long activeBytes;
 
         try
         {
-            // A leftover unrotated active file (reload or crash) -- preserve it instead of
-            // letting the fresh FileStream below truncate it.
-            await RotateActiveFileAsync(activePath);
-            (activeStream, activeWriter, activeBytes) = OpenFreshActiveFile(activePath);
+            // Leftover active files from a reload, crash or failed load are preserved, not truncated.
+            await RotateLeftoverActiveFilesAsync();
+            (activePath, activeStream, activeWriter, activeBytes) = OpenFreshActiveFile();
         }
         catch (Exception e)
         {
-            Plugin.Log.Warning($"[DiagnosticLog] Failed to open active log file -- disk logging disabled for this session: {e.Message}");
+            Plugin.Log.Warning($"[DiagnosticLog] Failed to open an active log file -- disk logging disabled for this session: {e.Message}");
             return;
         }
 
-        await foreach (var cmd in channel!.Reader.ReadAllAsync())
+        var reader = channel!.Reader;
+        await foreach (var cmd in reader.ReadAllAsync())
         {
             // Per-command try/catch -- one failed write/rotation shouldn't kill the writer.
             try
@@ -205,7 +207,13 @@ internal static class DiagnosticLog
                     await activeWriter.DisposeAsync();
                     await activeStream.DisposeAsync();
                     await RotateActiveFileAsync(activePath);
-                    (activeStream, activeWriter, activeBytes) = OpenFreshActiveFile(activePath);
+                    (activePath, activeStream, activeWriter, activeBytes) = OpenFreshActiveFile();
+                }
+                else if (reader.Count == 0)
+                {
+                    // Burst drained: flush so the active file is current mid-session or after a
+                    // crash. Writes still batch under load.
+                    await activeWriter.FlushAsync();
                 }
             }
             catch (Exception e)
@@ -218,23 +226,69 @@ internal static class DiagnosticLog
         await activeStream.DisposeAsync();
     }
 
-    private static (FileStream Stream, StreamWriter Writer, long Bytes) OpenFreshActiveFile(string activePath)
+    // The canonical name first, then stamped siblings: a load whose constructor threw keeps its
+    // handle on the canonical file until the game exits, which must cost a filename, not the log.
+    private static (string FilePath, FileStream Stream, StreamWriter Writer, long Bytes) OpenFreshActiveFile()
     {
-        var stream = new FileStream(activePath, FileMode.Create, FileAccess.Write, FileShare.Read);
-        // AutoFlush off -- StreamWriter's own buffer flushes once full, so at-risk data between
-        // explicit flushes stays tiny; flushing every line would make each log call synchronous.
-        var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = false };
-        // Stamped so a later rotation can recover which build wrote this segment, rather than
-        // mislabeling it with whatever build happens to be running when it's finally rotated.
-        var header = $"# AnoMech build={PluginBuildInfo.Checksum} started={DateTime.Now:yyyy-MM-dd HH:mm:ss}";
-        writer.WriteLine(header);
-        writer.Flush();
-        return (stream, writer, Encoding.UTF8.GetByteCount(header) + Environment.NewLine.Length);
+        var canonical = Path.Combine(logDir!, ActiveFileName);
+        foreach (var candidate in ActiveFileCandidates(canonical))
+        {
+            FileStream stream;
+            try
+            {
+                // CreateNew: anything still at this name couldn't be rotated and must not be
+                // truncated. FileShare.Delete so the next load can rename it away if this one
+                // dies without closing it.
+                stream = new FileStream(candidate, FileMode.CreateNew, FileAccess.Write, FileShare.Read | FileShare.Delete);
+            }
+            catch (IOException) when (File.Exists(candidate))
+            {
+                continue;
+            }
+
+            if (candidate != canonical)
+                Plugin.Log.Warning($"[DiagnosticLog] {ActiveFileName} is still held open by an earlier load -- this session logs to {Path.GetFileName(candidate)} instead.");
+
+            // Flushing every line would make each log call synchronous.
+            var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = false };
+            // Stamped so a later rotation knows which build wrote the segment.
+            var header = $"# AnoMech build={PluginBuildInfo.Checksum} started={DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+            writer.WriteLine(header);
+            writer.Flush();
+            return (candidate, stream, writer, Encoding.UTF8.GetByteCount(header) + Environment.NewLine.Length);
+        }
+
+        throw new IOException("every active log file name is already in use");
     }
 
-    // Moves the active file aside first, then compresses it -- so even if compression fails,
-    // the original survives instead of being clobbered by the fresh file the caller opens right
-    // after. No-op if nothing's there.
+    private static IEnumerable<string> ActiveFileCandidates(string canonical)
+    {
+        yield return canonical;
+        var stem = Path.GetFileNameWithoutExtension(ActiveFileName);
+        var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        yield return Path.Combine(logDir!, $"{stem}-{stamp}.log");
+        for (var i = 2; i <= 10; i++)
+            yield return Path.Combine(logDir!, $"{stem}-{stamp}-{i}.log");
+    }
+
+    // Every "AnoMech-active*.log", each on its own so one still held open doesn't stop the rest.
+    private static async Task RotateLeftoverActiveFilesAsync()
+    {
+        var stem = Path.GetFileNameWithoutExtension(ActiveFileName);
+        foreach (var file in new DirectoryInfo(logDir!).GetFiles($"{stem}*.log"))
+        {
+            try
+            {
+                await RotateActiveFileAsync(file.FullName);
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.Warning($"[DiagnosticLog] Skipping leftover {file.Name}: {e.Message}");
+            }
+        }
+    }
+
+    // Moved aside first, then compressed, so a failed compression leaves the original intact.
     private static async Task RotateActiveFileAsync(string activePath)
     {
         if (!File.Exists(activePath)) return;
@@ -251,7 +305,7 @@ internal static class DiagnosticLog
         }
         catch (Exception e)
         {
-            Plugin.Log.Warning($"[DiagnosticLog] Failed to move active log aside for rotation: {e.Message} (left in place).");
+            Plugin.Log.Warning($"[DiagnosticLog] Could not move {Path.GetFileName(activePath)} aside for rotation ({e.Message}) -- left in place. A load that died before Plugin.Dispose keeps its handle until the game exits; the file rotates on the first load after that.");
             return;
         }
 
@@ -266,7 +320,8 @@ internal static class DiagnosticLog
             var shortChecksum = checksum.Length >= 6 ? checksum[..6] : checksum;
             var archivePath = NextArchivePath(shortChecksum);
 
-            var openedSource = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            // ReadWrite|Delete share: a dead load's writer may still hold this file.
+            var openedSource = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             await using (openedSource)
             {
                 var openedDest = new FileStream(archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
@@ -319,8 +374,7 @@ internal static class DiagnosticLog
         }
     }
 
-    // Parses the "yyyyMMdd-HHmmss" stamp from "AnoMech-Debug-{stamp}-{checksum}[-N].log.gz".
-    // Null for anything that doesn't match, so the caller can fall back to filesystem metadata.
+    // Null for a non-matching name, so the caller can fall back to filesystem metadata.
     private static DateTime? ParseArchiveTimestamp(string fileName)
     {
         if (!fileName.StartsWith(ArchivePrefix)) return null;
@@ -335,8 +389,7 @@ internal static class DiagnosticLog
     {
         try
         {
-            // Sorted by the filename's embedded timestamp, not filesystem CreationTime, which a
-            // copy/move can reset. Falls back to CreationTimeUtc for a non-matching name.
+            // By the filename's stamp, not CreationTime, which a copy/move can reset.
             var files = new DirectoryInfo(logDir!)
                 .GetFiles($"{ArchivePrefix}*{ArchiveSuffix}")
                 .OrderBy(f => ParseArchiveTimestamp(f.Name) ?? f.CreationTimeUtc)

@@ -23,12 +23,7 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         assignedHole.Clear();
         var ai = new AiManager(world);
 
-        // Point the tether ordering at each wave's Kefka direction so
-        // ScenarioObjects.Tethers below reads already sorted clockwise from
-        // it. Lives here (not the scenario) since the AI is this data's only
-        // reader -- keeping it self-contained is what lets a peer's local
-        // debug-bot replay (see MultiplayerManager) reproduce it by calling
-        // this same Run, without needing the scenario's own timeline at all.
+        // Kept here so a peer's debug-bot replay gets it from the same Run.
         world.Events.Add(25.17f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[0]);
         world.Events.Add(55.70f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[1]);
         world.Events.Add(89.95f, () => state.ScenarioObjects.TetherSortFrom = state.KefkaPosition[2]);
@@ -36,20 +31,10 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
 
         ai.Move(7f, StackCentreTanksHoldBossesCentred);
         ai.Move(11f, StackCentre);
-        // No arrivalTime here, unlike the wave-2 DodgeSlap/DodgeImplosion sequence below --
-        // that pattern only works when each of a wave's staggered resolves gets its own
-        // Move call with a matching arrivalTime (see the wave-2 comment). RunSlapAttack's
-        // first wave has FOUR staggered resolves (rows at 22.14/22.79/23.44, then
-        // SlapHappy_FinalSlap ~24.75) funneled through this single Move call; giving it only
-        // the last one as arrivalTime made AiManager defer the walk past the first two rows,
-        // wiping the party on them. Moving immediately, like before arrivalTime was added
-        // here, is safe for all four since DodgeSlap's target holds through the whole wave.
+        // No arrivalTime: this wave has four staggered resolves behind one Move, and deferring
+        // to the last one wiped the party on the first rows.
         ai.Move(18f, () => DodgeSlap(slapIndex: 0, kefkaIndex: 0));
-        // Was ai.Move(26f, StackCentre) with GrabTether at 26.2f -- only a 0.2s gap. Move's own
-        // PromptMoveDelay landed StackCentre's MoveTo (~26.3s) AFTER GrabTether's Intercept
-        // (26.2s), and InternalMoveTo unconditionally clears interceptTether, silently
-        // cancelling the tether walk the instant it started. Pulled a full second earlier so
-        // StackCentre safely finishes before GrabTether fires.
+        // A full second before GrabTether, or StackCentre's deferred MoveTo cancels the Intercept.
         ai.Move(25f, StackCentre);
         world.Events.Add(26.2f, () => GrabTether(tetherIndex: 0, playerIndex: 4));
         world.Events.Add(28.2f, () => PullTether(playerIndex: 4));
@@ -60,24 +45,17 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         // Null (a Share plan) means no invuln -- mitigation handles it instead.
         if (ThunderIIIPlanning.InvulnRole(state.ThunderSet1) is { } set1InvulnRole)
             ai.GiveInvuln(38f, set1InvulnRole);
-        // Plain scheduled call, not ai.Move -- ResolveFirstThunder produces no AiMove
-        // coordinates (Follow self-sustains; see its own doc comment).
+        // Follow self-sustains, so no AiMove.
         world.Events.Add(40.5f, ResolveFirstThunder);
-        // Always scheduled -- SwapThunderTanks itself no-ops unless Set 1 is a Share.
         ai.Move(43.19f, SwapFirstThunderTanks);
-        // Standing invariant for the whole Set 1 danger window (see EnforceThunderClearanceOnce).
-        // Swaps roles at 43.5f, just after SwapFirstThunderTanks's own deferred MoveTo lands.
+        // Standing invariant for the Set 1 danger window; the swap lands at 43.5f.
         {
             var (set1First, set1Second) = ThunderIIIPlanning.Roles(state.ThunderSet1);
             ScheduleThunderClearance(39.5f, 43.5f, 46.2f, set1First, set1Second);
         }
         ai.Move(46.5f, DodgeEdict);
-        // Same reasoning as the wave-1 DodgeSlap above for why arrivalTime is off the table --
-        // four staggered resolves behind one Move call. Unlike wave 1, plain run speed isn't
-        // safe here either: DodgeEdict's landing spot can be ~20y from DodgeSlap's next
-        // target, more than RunSpeed covers in the ~1.7s available. Confirmed via
-        // AnoMech-DamageDebug: OffTank died ~9y short. sprint departs immediately, no deadline
-        // math to defer past an earlier row like arrivalTime did.
+        // Sprint: DodgeEdict's spot can be ~20y from the slap target, more than RunSpeed covers
+        // in the ~1.7s available.
         ai.Move(50.6f, () => DodgeSlap(slapIndex: 1, kefkaIndex: 1), sprint: true);
         ai.Move(56f, StackCentre);
         world.Events.Add(58.1f, () => GrabTether(tetherIndex: 0, playerIndex: 4));
@@ -92,17 +70,12 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         world.Events.Add(71f, () => ReturnToMiddle(playerIndex: 0));
         ai.Move(74f, DodgeEdictAndLookUpon);
         ai.Move(80f, StackCentre);
-        // Only fires for a Set 2 plan that's actually an InvulnsBoth override -- the sim's own
-        // default (ShareMtFirst) resolves to null here (see ThunderIIIPlanning.InvulnRole) and
-        // never grants a scripted invuln, relying on mitigation instead.
+        // Only an InvulnsBoth plan grants a scripted invuln; a Share relies on mitigation.
         if (ThunderIIIPlanning.InvulnRole(state.ThunderSet2) is { } set2InvulnRole)
             ai.GiveInvuln(79f, set2InvulnRole);
-        // Plain scheduled call -- see ResolveFirstThunder's own doc comment for why this no
-        // longer goes through ai.Move.
         world.Events.Add(82f, ResolveSecondThunder);
         ai.Move(84.5f, SwapSecondThunderTanks);
-        // Standing invariant for the whole Set 2 danger window -- see Set 1's own matching call
-        // above. Swaps roles at 84.9f, just after SwapSecondThunderTanks's own MoveTo lands.
+        // Same as Set 1; the swap lands at 84.9f.
         {
             var (set2First, set2Second) = ThunderIIIPlanning.Roles(state.ThunderSet2);
             ScheduleThunderClearance(80.5f, 84.9f, 87.5f, set2First, set2Second);
@@ -118,38 +91,15 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         world.Events.Add(100f, () => ReturnToMiddle(playerIndex: 5));
         world.Events.Add(103f, () => GrabTether(tetherIndex: 1, playerIndex: 2, intercept: 1f));
         world.Events.Add(105f, () => ReturnToMiddle(playerIndex: 1));
-        // playerIndex 7 (puller of tetherIndex 2, never handed off) and 6/2 (the
-        // intercept:1f handoff holders for tetherIndex 0/1, taking over from 5/1
-        // above) never got a return call here -- unlike 5 and 1, they just sat
-        // wherever their tether job left them, holding position for however
-        // long that took. That's correct while their hole's Nothingness volleys
-        // are still live (RunActiveBlackHole's 3-shot schedule for this wave
-        // resolves ~97-107): walking back to centre early would drag a still-
-        // dangerous, still-tethered hole's next Nothingness cast (which faces
-        // whoever it's tethered to) right onto the rest of the party stacked
-        // there. But by ~109.3 the wave's holes and tethers have all auto-
-        // despawned (RunActiveBlackHole's own scheduled Despawn calls) regardless
-        // of what any player does, so there's nothing left to drag -- and nothing
-        // was sending these three back afterward either. Confirmed via
-        // AnoMech-DamageDebug dumps: a player left standing wherever their tether
-        // job ended (up to ~20y out) had no way to cover that distance in the
-        // ~2s DodgeImplosion leaves before Implosion's own unconditionally-lethal
-        // Shockwave resolves, and died to it outright. Recalling them once it's
-        // actually safe to move, staggered with enough lead time before that
-        // window, closes the gap without reintroducing the drag risk.
+        // 7, 6 and 2 hold their tether spots until the wave's holes despawn (~109.3): earlier,
+        // a still-tethered hole's next Nothingness would follow them into the stack. Recalled
+        // with lead time before Implosion.
         world.Events.Add(109.5f, () => ReturnToMiddle(playerIndex: 7));
         world.Events.Add(110.5f, () => ReturnToMiddle(playerIndex: 6));
         world.Events.Add(111.5f, () => ReturnToMiddle(playerIndex: 2));
         world.Events.Add(110f, () => AnchorMtForImplosion(kefkaIndex: 3));
-        // arrivalTime values here are UmadP3BlackHoleScenario's own actual resolve
-        // times for each hit (Run_Chaos_4000414D's two Shockwave casts at 119.09/
-        // 121.11, Run_Kefka_400040E7_1's wave-2 RunSlapCone at 123.25) -- see
-        // AiManager.Move's doc comment for what giving it these buys: a role whose
-        // required speed exceeds RunSpeed but not SprintSpeed now sprints instead
-        // of arriving late. Confirmed via AnoMech-DamageDebug dumps that the wave-2
-        // DodgeSlap transition specifically can demand ~9y/s depending on how far
-        // DodgeImplosion's (independently computed) landing spot lands a given
-        // role's DodgeSlap target from wherever the party actually is.
+        // arrivalTime = each hit's actual resolve time, so a role that needs more than RunSpeed
+        // sprints instead of arriving late.
         ai.Move(117f, () => DodgeImplosion(shockwaveIndex: 0, slapIndex: 2, slapKefkaIndex: 3), jitter: 0f, arrivalTime: 119.09f);
         ai.Move(119.2f, () => DodgeImplosion(shockwaveIndex: 1, slapIndex: 2, slapKefkaIndex: 3), jitter: 0f, arrivalTime: 121.11f);
         ai.Move(121.3f, () => DodgeSlap(slapIndex: 2, kefkaIndex: 3), arrivalTime: 123.25f);
@@ -181,12 +131,8 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
 
     private static IAiMove StackCentre() => AiMove.All(new(0f, 0f));
 
-    // Right's 8 slots are grouped by role (roles 0-1, 2-3, 4-7 = NaturalOrder tanks,
-    // healers, dps), not just spread apart -- see UmadP3BlackHoleScenario.RunSlapCone /
-    // NextConeTargets: each wave individually targets exactly one tank, one healer, one dps
-    // with its own cone, and every OTHER member of that same role shares the target's
-    // position on purpose, so a cone aimed at the marked tank also lands on their co-tank
-    // (etc.) as an intentional shared soak, not a spread-and-dodge mechanic.
+    // Right's slots are grouped by role: each cone targets one tank, healer and dps, and the
+    // co-members share the target's spot as an intentional shared soak.
     private IAiMove DodgeSlap(int slapIndex, int kefkaIndex)
     {
         var direction = state.SlapAttacks[slapIndex] == ActionId.SlapHappy_Right
@@ -218,13 +164,7 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
     private const float ThunderBusterRadius = 8f;     // blast radius non-OTs must clear
     private const float ThunderClearDistance = 10f;   // where they park, just past it
 
-    // Role resolution (Roles/InvulnRole) now lives in ThunderIIIPlanning, shared with
-    // UmadP3BlackHoleScenario which needs the same assignment.
-
-    // Kicks off "first" chasing Exdeath directly instead of a one-time coordinate snapshot --
-    // Exdeath keeps following OffTank right up until RunThunder's freeze, so a static target
-    // goes stale immediately whenever `first` isn't OffTank. Follow keeps re-tracking on its
-    // own, so this only needs issuing once (unlike the Share seat, see EnforceThunderClearanceOnce).
+    // Follow, not a coordinate snapshot: Exdeath keeps chasing OffTank until RunThunder's freeze.
     private void ResolveFirstThunder()
     {
         if (state.ScenarioObjects.Exdeath is not { } exdeath) return;
@@ -233,7 +173,6 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
             firstMember.Follow(exdeath);
     }
 
-    // See ResolveFirstThunder's own doc comment -- same idea, Set 2's own "first" role.
     private void ResolveSecondThunder()
     {
         if (state.ScenarioObjects.Exdeath is not { } exdeath) return;
@@ -262,20 +201,12 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
     private IAiMove SwapFirstThunderTanks() => SwapThunderTanks(state.ThunderSet1);
     private IAiMove SwapSecondThunderTanks() => SwapThunderTanks(state.ThunderSet2);
 
-    // Keeps every role other than first/second at least ThunderClearDistance from Exdeath,
-    // reasserted repeatedly instead of computed once -- a one-shot "predict the blast, clear
-    // that point" approach kept losing the race against Exdeath's own continuous chase of
-    // OffTank. A standing "stay clear, always" invariant needs no prediction.
-    //
-    // Exdeath only, NOT Chaos -- MainTank permanently follows Chaos all fight, so checking
-    // Chaos here too fought that Follow every 0.4s with no convergence, dragging MainTank (and
-    // whoever was tracking them) 40+ yalms outside the arena. Only Exdeath casts Thunder III.
+    // Keeps every other role at least ThunderClearDistance from Exdeath, reasserted repeatedly
+    // rather than predicted once, since Exdeath keeps chasing OffTank. Exdeath only: MainTank
+    // permanently follows Chaos, and only Exdeath casts Thunder III.
     private void EnforceThunderClearanceOnce(PartyRole first, PartyRole? second)
     {
-        // Re-seats "second" relative to "first"'s LIVE position every check, not a one-time
-        // snapshot -- "first" is still converging on Exdeath via Follow, so a stale seat could
-        // catch both tanks at once (confirmed: a Share hit carried vuln into the second hit
-        // and killed second regardless of mitigation).
+        // Re-seated against first's live position each check; first is still converging on Exdeath.
         if (second is { } secondRole
             && world.Party.Get((int)first) is { } firstMember && firstMember.IsAlive()
             && world.Party.Get((int)secondRole) is { } secondMember && secondMember.IsAlive())
@@ -287,8 +218,7 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
             {
                 var away = firstPos.LengthSquared() > 1e-4f ? Vector2.Normalize(-firstPos) : new Vector2(0f, -1f);
                 var seat = firstPos + RotateVec(away, MathF.PI / 2f) * ThunderClearDistance;
-                // Same arena-boundary clamp as the boss-clearance loop below -- the seat can
-                // land past the wall whenever first itself is out near the edge.
+                // The seat can land past the wall when first is near the edge.
                 var seatClearRadius = ArenaRadius - 1f;
                 if (seat.LengthSquared() > seatClearRadius * seatClearRadius)
                     seat = seat.LengthSquared() > 1e-4f ? Vector2.Normalize(seat) * seatClearRadius : seat;
@@ -309,9 +239,7 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
                 if (offset.LengthSquared() >= ThunderClearDistance * ThunderClearDistance) continue;
                 var dir = offset.LengthSquared() > 1e-4f ? Vector2.Normalize(offset) : new Vector2(1f, 0f);
                 var target = bossPos + dir * ThunderClearDistance;
-                // Clamp inside the arena -- "away from Exdeath" can point through the wall
-                // whenever Exdeath is already near the edge. Confirmed via AnoMech-DamageDebug:
-                // the non-tanking party ended up ~23y out, past the 20y ring, doing exactly this.
+                // "Away from Exdeath" can point through the wall when Exdeath is near the edge.
                 var clearRadius = ArenaRadius - 1f;
                 if (target.LengthSquared() > clearRadius * clearRadius)
                     target = target.LengthSquared() > 1e-4f ? Vector2.Normalize(target) * clearRadius : target;
@@ -320,15 +248,8 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         }
     }
 
-    // Schedules repeated EnforceThunderClearanceOnce calls across [fromTime, toTime], close
-    // enough together that nobody can drift far into either boss's clear radius between checks.
-    //
-    // Split at swapTime because the seat-reassertion branch doesn't know a swap is happening --
-    // it keeps pulling "second" toward "first"'s live position, which fights SwapThunderTanks
-    // mid-crossing (confirmed: OffTank landed ~20y off target, MainTank alone as "closest").
-    // After the swap, "second" is settled at the boss and "first" is a normal bystander --
-    // passing second:null for the back half turns off seat-reassertion and stops excluding
-    // "first" from the boss-clearance loop, both at once.
+    // Split at swapTime: seat-reassertion would fight SwapThunderTanks mid-crossing. After the
+    // swap, second is settled at the boss and first is a normal bystander.
     private const float ThunderClearanceInterval = 0.4f;
 
     private void ScheduleThunderClearance(float fromTime, float swapTime, float toTime, PartyRole first, PartyRole? second)
@@ -530,15 +451,8 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         return new Vector3(edge * MathF.Sin(beta), 0f, -edge * MathF.Cos(beta));
     }
 
-    // Split into two ai.Move calls instead of one MoveTo-everyone method -- both trips are
-    // tight against this wave's cast deadline (3.67s), so both use sprint: true. Confirmed via
-    // AnoMech-DamageDebug: the holder didn't make it at plain run speed, and separately a
-    // non-holder (MeleeDpsB, ~25.7y in ~3.05s) also came up short.
-    // tetherPlayerIndex is a slot into state.Roles, NOT a PartyRole ordinal -- must be
-    // resolved through state.Roles before indexing coords[] (mirrors SwapThunderTanks).
-    // Indexing coords[tetherPlayerIndex] directly sent this duty to whatever PartyRole shares
-    // that ordinal instead of the actual randomized holder -- confirmed as the cause of a
-    // wrong-person sprint that killed both the true holder and an uninvolved role.
+    // Both trips sprint against a 3.67s deadline. tetherPlayerIndex is a slot into state.Roles,
+    // not a PartyRole ordinal.
     private IAiMove DodgeLookUponSplitHolder(int tetherPlayerIndex, int lookKefkaIndex)
     {
         var holderSpot = LookUponHolderSpot(tetherPlayerIndex, lookKefkaIndex);
@@ -559,22 +473,10 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         return AiMove.Create(coords).NaturalOrder();
     }
 
-    // playerIndex -> the specific black hole (tether.A) that player's most recent
-    // GrabTether call sent them toward. Needed because PassableEnd (the tether's dynamic
-    // holder resolution, see TetherEnd.cs) seeds an UNRELATED hole's tether with a random
-    // alive party member the instant it's created -- so a player can find themselves
-    // briefly holding a hole nobody sent them to, purely by bad luck, well before their
-    // own Intercept walk toward their ASSIGNED hole ever lands. PullTether must pull based
-    // on this recorded assignment, not "whatever tether the player happens to currently
-    // hold" -- see PullTether for what goes wrong otherwise.
-    //
-    // Deliberately the HOLE, not the SimTether object itself: on a peer, MultiplayerManager
-    // .OnWorldSnapshotReceived recreates its local SimTether (new instance) whenever that
-    // tether's endpoint changes over the network -- a cached SimTether reference goes stale
-    // the moment the real grab actually lands, permanently failing the match below and
-    // stranding the player with no MoveTo ever issued. The hole itself (a SimEnemy) is never
-    // recreated that way, only position-updated in place, so re-resolving "today's tether for
-    // this hole" from ScenarioObjects.Tethers each time stays correct on both host and peer.
+    // The hole (tether.A) each player's last GrabTether sent them to. PassableEnd seeds an
+    // unrelated hole's tether with a random member, so PullTether must pull on the assigned
+    // hole, not whatever tether the player happens to hold. The hole, not the SimTether: a
+    // peer recreates its local SimTether on every endpoint change.
     private readonly Dictionary<int, SimCharacter?> assignedHole = new();
 
     private void GrabTether(int tetherIndex, int playerIndex, float intercept = 3f)
@@ -594,31 +496,15 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         player?.Intercept(tether, intercept);
     }
 
-    // Grab and Pull are scheduled as two separate fixed-time events, but Grab only
-    // *starts* the walk to the tether (Intercept) -- how long that walk actually
-    // takes depends on live distance (a black hole can spawn ~17y out), which the
-    // schedule has no way to know in advance. A Pull that lands before the walk
-    // finishes used to just silently no-op, permanently stranding that player
-    // wherever they'd gotten to (often still near the party's own stack point) for
-    // the rest of the wave -- exactly the wrong place once the hole starts firing
-    // AT whoever it's tethered to. Retrying a few times, a second apart, covers the
-    // gap between "scheduled" and "actually arrived" without needing each wave's
-    // call sites to hand-tune a delay against a distance they don't know either.
+    // Grab only starts the walk, and a black hole can be ~17y out; a Pull that lands before
+    // arrival would otherwise no-op and strand the player.
     private const int PullTetherMaxRetries = 4;
 
     private void PullTether(int playerIndex, int retriesLeft = PullTetherMaxRetries)
     {
         var player = state.Roles.Get(playerIndex);
         var role = (player as ISimPartyMember)?.Role.ToString() ?? $"player#{playerIndex}";
-        // Must be holding the tether for the SPECIFIC hole the matching GrabTether sent
-        // them toward -- not just any tether TetherHeldBy would find. A random PassableEnd
-        // seed can hand this player an unrelated hole's tether before their real walk
-        // lands; pulling on THAT would drag them away from (and, via Movement's
-        // stale-Intercept cancel, abandon) the hole they were actually assigned, instead of
-        // just waiting for the legitimate one to resolve the same way the "still
-        // mid-Intercept" case already does. Re-resolved fresh each call (see assignedHole)
-        // rather than cached, since a peer's local tether object for that hole can be a
-        // brand new instance since the last time this ran.
+        // Only the assigned hole's tether counts (see assignedHole); re-resolved each call.
         var hole = assignedHole.GetValueOrDefault(playerIndex);
         var assigned = hole is null ? null : state.ScenarioObjects.Tethers.FirstOrDefault(t => ReferenceEquals(t.A, hole));
         if (assigned is not { A: { } blackHole, B: { } held } || !ReferenceEquals(held, player))
@@ -632,14 +518,8 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
         var heldPos = new Vector2(held.Position.X, held.Position.Z);
         // Pull spot, then nudged 1.5y farther from the black hole along the bh→player axis.
         var rawSpot = CardinalClockwise(bhPos) + Vector2.Normalize(heldPos - bhPos) * 1.5f;
-        // CardinalClockwise only reasons about the ACTIVE hole's own bearing -- it has no
-        // idea where this wave's passive/decorative black holes (also in world.Obstacles,
-        // see Run_BlackHoleObstacleWave) sit, and TetherPullRadius (14y) happens to land
-        // very close to their own ~13.5y radius from centre. A raw spot that coincides with
-        // one doesn't just clip the avoid radius -- Movement's per-tick ClampOutside keeps
-        // reprojecting to that same boundary while Steer's tangent-glide fights to actually
-        // arrive there, so the bot can stall for several real seconds standing on top of it.
-        // Push the spot out to a clearance clearly past that boundary up front instead.
+        // The raw spot can coincide with a passive hole's avoid radius (both ~14y out), where
+        // ClampOutside and Steer fight and the bot stalls; push it clear up front.
         var spot = world.Obstacles.ClampOutside(rawSpot, margin: 2f);
         AnoMech.Core.DiagnosticLog.Info($"[UmadP3BlackHoleAi] PullTether: {role} held at ({heldPos.X:F1},{heldPos.Y:F1}), black hole at ({bhPos.X:F1},{bhPos.Y:F1}) -- moving to ({spot.X:F1},{spot.Y:F1}) (dist {Vector2.Distance(heldPos, spot):F1}y){(spot != rawSpot ? $" [nudged from ({rawSpot.X:F1},{rawSpot.Y:F1}) to clear an obstacle]" : "")}.");
         player?.MoveTo(new Vector3(spot.X, 0f, spot.Y));
@@ -650,12 +530,8 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
             ? null
             : state.ScenarioObjects.Tethers.FirstOrDefault(t => ReferenceEquals(t.B, player));
 
-    // Non-tether players sit at arena centre for the whole of a Nothingness wave (no
-    // move away from StackCentre until well after the last shot) -- a pulled black
-    // hole needs to clear Nothingness's own hit radius from THAT point, not just from
-    // wherever the holder parks. 8y (the old radius) repeatedly still tagged the
-    // center-stacked group; 14y gives real separation while staying well inside
-    // ArenaRadius (20y).
+    // Non-tether players hold centre for the whole wave, so a pulled hole must clear
+    // Nothingness's radius from there; 8y still tagged the stack.
     private const float TetherPullRadius = 14f;
 
     private static Vector2 CardinalClockwise(Vector2 cardinal)

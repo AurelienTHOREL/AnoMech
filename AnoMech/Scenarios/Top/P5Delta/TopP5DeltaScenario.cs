@@ -19,6 +19,10 @@ public sealed class TopP5DeltaScenario : IMultiplayerReplayable
     public IPhase Phase => TopZone.P5;
     public bool SupportsMultiplayer => true;
     public void DrawSettings() => settingsWindow.Draw();
+    public bool HasPerPlayerSettings => true;
+    public void DrawPerPlayerSettings() => settingsWindow.DrawPerPlayer();
+    public object SettingsOverrides => settingsWindow.Overrides;
+    public IReadOnlyList<string> SettingsConflicts => settingsWindow.Overrides.Validate().Problems;
     private readonly TopP5DeltaSettingsWindow settingsWindow = new();
 
     public IReadOnlyList<IScenarioAi> AiStrats => [new TopP5DeltaAi()];
@@ -208,7 +212,7 @@ public sealed class TopP5DeltaScenario : IMultiplayerReplayable
                                              Targetable: false,
                                              EnemyList: EnemyListMode.Always,
                                              Placement: placement));
-            punch?.AddVfx("vfx/monster/m0114/eff/m0114cbbm_sp_pop_c0i.avfx", persistent: false);
+            punch?.AddVfx(VfxPath.RocketPunchSpawn, persistent: false);
             return punch;
         }).ToList();
     }
@@ -358,25 +362,19 @@ public sealed class TopP5DeltaScenario : IMultiplayerReplayable
     {
         if (omega is null) return;
         SimCharacter? target;
-        switch (state.BeyondDefenceForPlayer)
+        if (state.ForcedBeyondDefenceRole is { } forced)
+            target = party.Get(forced);
+        else if (state.BeyondDefenceExcluded.Count > 0)
         {
-            case true:
-                target = party.Get(party.PlayerRole);
-                break;
-            case false:
-            {
-                var player = party.Get(party.PlayerRole);
-                var closest2 = party.Find.ClosestN(omega.Position, 2);
-                if (closest2.Any(m => m == player))
-                    target = closest2.FirstOrDefault(m => m != player);
-                else
-                    target = closest2.Count > 0 ? closest2[Random.Shared.Next(closest2.Count)] : null;
-                break;
-            }
-            default:
-                target = party.Find.RandomClosestN(omega.Position, 2);
-                break;
+            var refused = state.BeyondDefenceExcluded.Select(party.Get).OfType<SimCharacter>().ToHashSet();
+            var closest2 = party.Find.ClosestN(omega.Position, 2);
+            // Someone within range has to eat it, so a refusal only counts while anyone else can.
+            var allowed = closest2.Where(m => !refused.Contains(m)).ToList();
+            if (allowed.Count == 0) allowed = closest2.ToList();
+            target = allowed.Count > 0 ? allowed[Random.Shared.Next(allowed.Count)] : null;
         }
+        else
+            target = party.Find.RandomClosestN(omega.Position, 2);
         if (target is null) return;
         state.BeyondDefenseTarget = ((ISimPartyMember)target).Role;
         Plugin.Log.Info($"Beyond defense target {((ISimPartyMember)target).Role}");

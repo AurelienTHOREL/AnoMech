@@ -1,38 +1,47 @@
 using System.Collections.Generic;
+using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using FFXIVClientStructs.FFXIV.Client.LayoutEngine;
 using FFXIVClientStructs.FFXIV.Client.LayoutEngine.Group;
 using FFXIVClientStructs.FFXIV.Client.LayoutEngine.Node;
 
 namespace AnoMech.Core.Native;
 
-// Shared by anything that spawns/toggles a native SharedGroup (MapEffects' arena pieces,
-// SimEventObject's EObj scenery): describes whether a layout id's SharedGroupLayoutInstance
-// has actually finished streaming in on this client. Extracted out of MapEffects since the
-// same asset-streaming race affects both.
+// Whether a native SharedGroup (MapEffects' arena pieces, SimEventObject's EObj scenery) has
+// actually finished streaming in on this client, and native activation of it.
 internal static unsafe class LayoutInstanceDiagnostics
 {
-    // HavePrimary/IsPrimaryLoaded/IsPrimaryReady only say the object loaded, not whether the
-    // engine considers it active or draws it -- IsActive/WantToBeActive are the real
-    // activation state; GetGraphics() null despite IsPrimaryReady=True means the renderable
-    // scene object was never created.
+    // HavePrimary/IsPrimaryLoaded/IsPrimaryReady only say the object loaded; IsActive/
+    // WantToBeActive are the activation state, and GetGraphics() null despite IsPrimaryReady
+    // means the renderable scene object was never created.
     public static string Describe(uint layoutId)
     {
         var world = LayoutWorld.Instance();
         if (world == null) return "LayoutWorld null";
         var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
         if (instance == null) return "GetLayoutInstance returned null (no such SharedGroup instance on this client)";
-        var sg = (SharedGroupLayoutInstance*)instance;
+        return Describe((SharedGroupLayoutInstance*)instance);
+    }
+
+    // For an instance already held by pointer (an EObj's own actor+0x108, which has no layout id).
+    public static string Describe(SharedGroupLayoutInstance* sg)
+    {
+        if (sg == null) return "SharedGroupLayoutInstance null (SG context not attached to the actor yet)";
+        var instance = (ILayoutInstance*)sg;
+        var layer = instance->Layer;
+        var layerDesc = layer == null ? "Layer=null" : $"Layer=0x{layer->LayerGroupId:X}(flags=0x{layer->Flags:X})";
+        var idDesc = $"Id={instance->Id.Type}/{instance->Id.LayerKey:X}:{instance->Id.InstanceKey:X} SubId=0x{instance->SubId:X} Flags1-3=0x{instance->Flags1:X}/0x{instance->Flags2:X}/0x{instance->Flags3:X}";
         var graphics = instance->GetGraphics();
         var graphics2 = instance->GetGraphics2();
-        // Whether the reveal/hide is an animated timeline transition rather than an instant
-        // flip. TimelineObject null means no timeline data; IsTimelinePlaying false despite a
-        // just-issued "show" means the animation never started.
         var timelinePlaying = sg->IsTimelinePlaying(sg->PlayingTimelineIndex);
-        // Graphics/Graphics2 on the parent can read null even when it renders fine -- the real
-        // mesh usually belongs to child instances (a prefab's placed BgParts). A child
-        // diverging from the parent is the gap the parent's own fields can't show. Capped at
-        // 16 (engine's own FixedSizeArray16 convention) and recurses one level into nested
-        // SharedGroup children.
+        // The parent's Graphics can read null while it renders fine: the mesh usually belongs to
+        // child instances (a prefab's BgParts), so children are listed too, capped at 16 (the
+        // engine's FixedSizeArray16) and one level deep. A timeline-driven SGB (the statue
+        // props) with children active but nothing visible points at the timelines.
+        var timelineCount = sg->TimeLineContainer.Instances.Count;
+        var playing = new List<int>();
+        for (var i = 0; i < 16; i++)
+            if (sg->IsTimelineIndexValid((uint)i) && sg->IsTimelinePlaying((uint)i)) playing.Add(i);
+        var timelineDesc = $"Timelines={timelineCount} playing=[{string.Join(",", playing)}]";
         var childCount = sg->Instances.Instances.Count;
         var childSummaries = new List<string>();
         for (var i = 0; i < childCount && i < 16; i++)
@@ -41,14 +50,106 @@ internal static unsafe class LayoutInstanceDiagnostics
             var childInstance = child != null ? child->Instance : null;
             childSummaries.Add($"[{i}]={FormatChild(childInstance, depth: 1)}");
         }
-        return $"HavePrimary={instance->HavePrimary()} IsPrimaryLoaded={instance->IsPrimaryLoaded()} IsPrimaryReady={instance->IsPrimaryReady()} "
+        return $"{layerDesc} {idDesc} HavePrimary={instance->HavePrimary()} IsPrimaryLoaded={instance->IsPrimaryLoaded()} IsPrimaryReady={instance->IsPrimaryReady()} "
              + $"IsActive={instance->IsActive} WantToBeActive={instance->WantToBeActive()} Graphics=0x{(nint)graphics:X} Graphics2=0x{(nint)graphics2:X} "
-             + $"TimelineObject=0x{(nint)sg->TimelineObject:X} PlayingTimelineIndex=0x{sg->PlayingTimelineIndex:X} IsTimelinePlaying={timelinePlaying} "
+             + $"TimelineObject=0x{(nint)sg->TimelineObject:X} PlayingTimelineIndex=0x{sg->PlayingTimelineIndex:X} IsTimelinePlaying={timelinePlaying} {timelineDesc} "
              + $"PrefabFlags1=0x{sg->PrefabFlags1:X} PrefabFlags2=0x{sg->PrefabFlags2:X} ChildCount={childCount} Children=[{string.Join("; ", childSummaries)}]";
     }
 
-    // True once the instance and all direct children report fully loaded -- the simple
-    // "done yet?" signal; Describe() above is the full detail dump.
+    // Sets a SharedGroup and, optionally, every child (BgPart, Vfx and Sound) to `active`;
+    // ProcessMapEffect's hide flag only blanks the BgParts. False until the SGB has streamed
+    // in. Nothing persists: leaving the sim reloads the territory.
+    public static bool SetSharedGroupActive(uint layoutId, bool active, bool recurseChildren)
+    {
+        var world = LayoutWorld.Instance();
+        if (world == null) return false;
+        var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
+        if (instance == null) return false;
+        SetActiveRecursive(instance, active, recurseChildren ? 3 : 0);
+        return true;
+    }
+
+    // True if either table the engine keeps for a spawn packet's LayoutId has an instance --
+    // EObj spawn packets refer to EventObject placements, MapEffect slots to SharedGroups.
+    public static bool Exists(uint layoutId)
+    {
+        var world = LayoutWorld.Instance();
+        if (world == null) return false;
+        return world->GetLayoutInstance(InstanceType.SharedGroup, layoutId) != null
+            || world->GetLayoutInstance(InstanceType.EventObject, layoutId) != null;
+    }
+
+    // Debug aid for EObj-created for_bg SharedGroups the engine leaves at WantToBeActive=True/
+    // IsActive=False forever. Returns true if it had to act.
+    public static bool ForceActive(SharedGroupLayoutInstance* sg)
+    {
+        if (sg == null || ((ILayoutInstance*)sg)->IsActive) return false;
+        SetActiveRecursive((ILayoutInstance*)sg, true, 3);
+        return true;
+    }
+
+    private static void SetActiveRecursive(ILayoutInstance* inst, bool active, int depth)
+    {
+        if (inst == null) return;
+        inst->SetActive(active);
+        if (depth <= 0 || inst->Id.Type != InstanceType.SharedGroup) return;
+        var sg = (SharedGroupLayoutInstance*)inst;
+        var count = sg->Instances.Instances.Count;
+        for (var i = 0; i < count && i < 16; i++)
+        {
+            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
+            if (child != null && child->Instance != null)
+                SetActiveRecursive(child->Instance, active, depth - 1);
+        }
+    }
+
+    // For sequencing beats one timeline at a time.
+    public static bool IsAnyTimelinePlaying(SharedGroupLayoutInstance* sg)
+    {
+        if (sg == null) return false;
+        for (var i = 0; i < 16; i++)
+            if (sg->IsTimelineIndexValid((uint)i) && sg->IsTimelinePlaying((uint)i)) return true;
+        return false;
+    }
+
+    // Deactivates only the Sound children. An SGB's timeline re-activates them as it advances,
+    // so this runs every frame; the native call is skipped unless one is active again.
+    public static bool SilenceSounds(SharedGroupLayoutInstance* sg)
+        => sg != null && SilenceSoundsRecursive(sg, depth: 3);
+
+    private static bool SilenceSoundsRecursive(SharedGroupLayoutInstance* sg, int depth)
+    {
+        var changed = false;
+        var count = sg->Instances.Instances.Count;
+        for (var i = 0; i < count && i < 16; i++)
+        {
+            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
+            var inst = child != null ? child->Instance : null;
+            if (inst == null) continue;
+            if (inst->Id.Type is InstanceType.Sound or InstanceType.SoundEnvSet)
+            {
+                if (inst->IsActive) { inst->SetActive(false); changed = true; }
+            }
+            else if (inst->Id.Type == InstanceType.SharedGroup && depth > 0)
+            {
+                changed |= SilenceSoundsRecursive((SharedGroupLayoutInstance*)inst, depth - 1);
+            }
+        }
+        return changed;
+    }
+
+    // SilenceSounds for an arena slot resolved by LayoutId; false until its SGB resolves.
+    public static bool SilenceSlotSounds(uint layoutId)
+    {
+        var world = LayoutWorld.Instance();
+        if (world == null) return false;
+        var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
+        if (instance == null) return false;
+        SilenceSoundsRecursive((SharedGroupLayoutInstance*)instance, depth: 3);
+        return true;
+    }
+
+    // The instance and all direct children report fully loaded.
     public static bool IsFullyLoaded(uint layoutId)
     {
         var world = LayoutWorld.Instance();
@@ -74,6 +175,14 @@ internal static unsafe class LayoutInstanceDiagnostics
         var childGraphics = childInstance->GetGraphics();
         var summary = $"Type={childInstance->Id.Type} HavePrimary={childInstance->HavePrimary()} "
             + $"IsPrimaryLoaded={childInstance->IsPrimaryLoaded()} IsActive={childInstance->IsActive} Graphics=0x{(nint)childGraphics:X}";
+        // The BgPart's model path is what identifies an arena piece; nothing else on the struct
+        // says what loaded.
+        if (childInstance->Id.Type == InstanceType.BgPart && childGraphics != null)
+        {
+            var bgObject = (BgObject*)childGraphics;
+            var handle = bgObject->ModelResourceHandle;
+            summary += handle != null ? $" ModelPath=\"{handle->FileName}\"" : " ModelPath=(no ModelResourceHandle)";
+        }
         if (depth <= 0 || childInstance->Id.Type != InstanceType.SharedGroup) return summary;
         var nested = (SharedGroupLayoutInstance*)childInstance;
         var nestedCount = nested->Instances.Instances.Count;

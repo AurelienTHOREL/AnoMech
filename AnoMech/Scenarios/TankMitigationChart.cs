@@ -10,30 +10,15 @@ public enum TankJob { Any, Paladin, Warrior, DarkKnight, Gunbreaker }
 // own separate bool) is orthogonal -- for an enemy-debuffing mitigation like Reprisal.
 public enum MitigationScope { Self, Party, Ally }
 
-// One tank mitigation/defensive ability. Percent/Duration/Cooldown null = not yet pinned
-// down against a numeric source -- check the tooltip before trusting a guess. StatusId/
-// ActionId 0 = not yet confirmed against a real press (use DebugMenu's recent-actions/
-// active-statuses lists). ActionId is what UseActionDetour's interception matches on --
-// 0 is never intercepted, a safe placeholder. Radius only matters for SourceSide (the AoE
-// centered on the caster, e.g. Reprisal's 5y). A press made OUTSIDE a scenario is the only
-// trustworthy confirmation -- inside one, interception just echoes back the status id we
-// told it to apply (see Hallowed Ground's Notes for how that went wrong once already).
-// Percentages cross-checked against thebalanceffxiv.com (2026-09).
+// One tank mitigation ability. Null Percent/Duration/Cooldown = not pinned against a numeric
+// source; StatusId/ActionId 0 = not confirmed against a real press (0 is never intercepted).
+// Only a press made outside a scenario confirms an id: inside one, interception echoes back
+// the id it was told to apply. Radius only matters for SourceSide.
 //
-// Shield opts a no-Percent entry into interception anyway (real ability blocked, sim-only
-// cooldown) -- without it, ByActionId's Percent filter would silently exclude it, letting
-// the real ability fire and burn its real cooldown.
-//
-// A Shield entry's absorb size is exactly one of two mutually exclusive fields, both always
-// a percentage of the CASTER's own max HP (every FFXIV shield scales off whoever cast it,
-// not whoever catches it):
-//   - ShieldPercentOfMaxHp: the tooltip states the size directly (Divine Veil 10%, etc.).
-//   - ShieldPotency: only a potency number is given (e.g. Sentinel's 1000) -- this engine
-//     can't convert that precisely (needs the caster's real stats), so TankShieldEstimate
-//     below is a rough single-screenshot calibration, not a real formula.
-// A caller converts the caster-relative percentage to absolute HP once, then re-expresses
-// that as a fraction of EACH recipient's own max HP before banking it -- see
-// LocalPlayerInputHooks.GrantShield.
+// Shield opts a no-Percent entry into interception, or the real ability would fire and burn
+// its cooldown. A shield's size is one of ShieldPercentOfMaxHp or ShieldPotency, both a
+// percentage of the CASTER's max HP (TankShieldEstimate converts potency roughly); the caller
+// re-expresses it against each recipient's max HP (LocalPlayerInputHooks.GrantShield).
 public readonly record struct TankMitigationAbility(
     string Name, TankJob Job, ushort StatusId, uint ActionId, float? Percent, float? Duration, float? Cooldown,
     int Charges = 1, bool SourceSide = false, float? Radius = null, MitigationScope Scope = MitigationScope.Self,
@@ -41,9 +26,8 @@ public readonly record struct TankMitigationAbility(
 
 public static class TankShieldEstimate
 {
-    // Estimated from a real screenshot: Sentinel's 1000-potency shield covered ~15% of a
-    // Paladin's own HP bar. NOT the server's real formula (needs the caster's real stats) --
-    // a single calibration point scaled linearly, good enough for "does it survive," not exact HP.
+    // From one screenshot (Sentinel's 1000 potency covered ~15% of a Paladin's bar), scaled
+    // linearly; not the server's formula.
     private const float EstimatedPercentOfCasterMaxHpPer1000Potency = 0.15f;
 
     public static float PercentOfCasterMaxHp(float potency)
@@ -52,8 +36,6 @@ public static class TankShieldEstimate
 
 public static class TankMitigationChart
 {
-    // See the "Party Compensation (placeholder)" entry below. Exposed here so a caller can
-    // reference it by name instead of a bare magic number.
     public const ushort PartyCompensationPlaceholderStatusId = 60002;
 
     public static readonly IReadOnlyList<TankMitigationAbility> All =
@@ -103,8 +85,6 @@ public static class TankMitigationChart
                    "survive here since tankbusters resolve as binary lethal/not."),
 
         // ---- Job 40%, 120s-cooldown mitigations ----
-        // 40% confirmed across all four jobs via thebalanceffxiv.com (corrected from an
-        // earlier 30% guess).
         new("Vengeance", TankJob.Warrior, 3832, 44, 0.40f, 15f, 120f,
             Notes: "ActionId 44 and StatusId 3832 both confirmed via a real, un-intercepted press (Warrior), " +
                    "15s duration. The status itself is actually named \"Damnation\" in the current Status " +
@@ -173,8 +153,7 @@ public static class TankMitigationChart
                    "Castable on self or a party member -- Scope.Ally applies it to whichever role is " +
                    "actually targeted. Cooldown still unverified."),
 
-        // ---- Party-wide mitigations (Scope.Party) -- applied to every current party role,
-        // not just whoever pressed it, matching how these actually work in real FFXIV.
+        // ---- Party-wide mitigations (Scope.Party) ----
         new("Dark Missionary", TankJob.DarkKnight, 1894, 16471, 0.05f, 15f, 90f, Scope: MitigationScope.Party,
             Notes: "ActionId 16471 and StatusId 1894 both confirmed via a real, un-intercepted press (Dark " +
                    "Knight), 15s duration. 10% magic / 5% physical -- Percent above uses the physical value. " +
@@ -221,8 +200,7 @@ public static class TankMitigationChart
                    "the true length). Shields each affected ally for 10% of the CASTING Paladin's own max " +
                    "HP once (not each recipient's own), not a flat % reduction while active -- deliberately " +
                    "no Percent set, forcing one in would misrepresent the mechanic."),
-        // TODO: Passage of Arms -- deliberately unmodeled. It's a channel, party-wide, and
-        // positional -- none of which fit this chart's one-ability/one-tank/one-Percent shape.
+        // TODO: Passage of Arms is channeled, party-wide and positional; none of it fits this shape.
         new("Passage of Arms", TankJob.Paladin, 1175, 7385, null, null, 120f,
             Notes: "TODO -- too complicated for now (channeled, party-wide, positional). See the comment " +
                    "above this entry."),
@@ -234,23 +212,32 @@ public static class TankMitigationChart
                    "Knight's Resolve (a timer) expiring into 2676 Knight's Benediction (a self HoT) -- " +
                    "neither is the target's mitigation and neither is tracked here. Scope.Ally applies 1174 " +
                    "to whichever role is actually targeted (usually the co-tank)."),
-        // TODO: Cover -- deliberately out of scope. A pure damage REDIRECT, not a % reduction,
-        // needs a different mechanism (rerouting who a tankbuster resolves against).
+        // TODO: Cover is a damage redirect, not a reduction; needs a different mechanism.
         new("Cover", TankJob.Paladin, 0, 0, null, 12f, 120f,
             Notes: "TODO -- out of scope (pure damage redirect, not a %). See the comment above this entry."),
 
+        // ---- Tank limit break 3 ----
+        // Party-wide 80% for 8s. The "cooldown" stands in for the gauge: one per run. The gauge
+        // itself is faked full while a sim runs (LocalPlayerInputHooks.UpdateLimitBreakIllusion).
+        new("Last Bastion", TankJob.Paladin, 196, 199, 0.80f, 8f, 600f, Scope: MitigationScope.Party,
+            Notes: "Tank LB3. Action 199 / status 196 per the Action and Status sheets (2026-09-14)."),
+        new("Land Waker", TankJob.Warrior, 863, 4240, 0.80f, 8f, 600f, Scope: MitigationScope.Party,
+            Notes: "Tank LB3. Action 4240 / status 863 confirmed in real logs (Network_30208_20260902.log: " +
+                   "the '1090 Land Waker' AoE on 8 targets, then status 35F=863 on each with dur=8.00)."),
+        new("Dark Force", TankJob.DarkKnight, 864, 4241, 0.80f, 8f, 600f, Scope: MitigationScope.Party,
+            Notes: "Tank LB3. Action 4241 / status 864 per the Action and Status sheets (2026-09-14)."),
+        new("Gunmetal Soul", TankJob.Gunbreaker, 1931, 17105, 0.80f, 8f, 600f, Scope: MitigationScope.Party,
+            Notes: "Tank LB3. Action 17105 / status 1931 per the Action and Status sheets (2026-09-14)."),
+
         // ---- Placeholder (bot-only, no real ability) ----
-        // TEMPORARY stand-in for real party-wide mitigation on a bot-driven tank -- this
-        // engine doesn't simulate a bot casting Reprisal/Dark Missionary/etc. yet. StatusId
-        // picked outside any real FFXIV range; ActionId 0 keeps it un-interceptable. Delete
-        // once real party-buff simulation for bots exists.
+        // Stand-in for party-wide mitigation on a bot tank until bots cast their own. StatusId
+        // outside any real range; ActionId 0 keeps it un-interceptable.
         new("Party Compensation (placeholder)", TankJob.Any, PartyCompensationPlaceholderStatusId, 0, 0.20f, 5f, null,
             Notes: "Placeholder, not a real ability -- see the comment above this entry. Delete once real " +
                    "party-buff simulation for bots exists."),
     ];
 
-    // Native ClassJob row id -> that job's real invuln status id. SimParty.GiveInvuln uses
-    // this so a scripted invuln shows the tank's OWN job's real ability, not one hardcoded id.
+    // Native ClassJob row id -> that job's real invuln status id (SimParty.GiveInvuln).
     public static readonly IReadOnlyDictionary<uint, ushort> InvulnStatusIdByJob = new Dictionary<uint, ushort>
     {
         [19] = 82,   // Paladin: Hallowed Ground
