@@ -25,6 +25,7 @@ public sealed partial class MultiplayerManager
     private void EndHostRunLocally()
     {
         running = false;
+        runGeneration++;
         DebugBotControl.Enabled = false;
         Plugin.GameInstance.PartyMemberKilled -= OnPartyMemberKilledHost;
         Plugin.GameInstance.World.OmenSpawned -= OnOmenSpawnedHost;
@@ -212,6 +213,7 @@ public sealed partial class MultiplayerManager
             {
                 DiagnosticLog.Info("[Multiplayer] Peer's zone was unloaded out from under the run (IsInInstance went false) -- stopping locally.");
                 running = false;
+                runGeneration++;
                 StopDebugBotReplay();
                 return;
             }

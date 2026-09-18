@@ -10,8 +10,8 @@ namespace AnoMech.Multiplayer;
 // enforce different numbers, so these are what the readout compares against, not a promise.
 internal static class RelayStats
 {
-    public const int MaxMessagesPerSecond = 5000;
-    public const long MaxBytesPerSecond = 10L * 1024 * 1024;
+    public const int MaxMessagesPerSecond = AnoMech.Network.RelayWire.MessagesPerSecond;
+    public const long MaxBytesPerSecond = AnoMech.Network.RelayWire.BytesPerSecond;
     public const long MaxMessageBytes = 1 * 1024 * 1024;
     public const int MaxPeersPerSession = 8;
 
@@ -78,15 +78,17 @@ internal static class RelayStats
         }
     }
 
-    public static void RecordSent(int bytes)
+    // The relay caps what crosses the wire, so the rate is charged in wire bytes; raw size is
+    // kept only for the total.
+    public static void RecordSent(int bytes, int wireBytes)
     {
         lock (Gate)
         {
             windowMessages++;
-            windowSentBytes += bytes;
+            windowSentBytes += wireBytes;
             totalSentBytes += bytes;
-            lastMessageBytes = bytes;
-            if (bytes > largestMessageBytes) largestMessageBytes = bytes;
+            lastMessageBytes = wireBytes;
+            if (wireBytes > largestMessageBytes) largestMessageBytes = wireBytes;
             Roll();
         }
     }

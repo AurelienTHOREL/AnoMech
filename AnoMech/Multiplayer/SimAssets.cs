@@ -124,7 +124,7 @@ internal static class SimAssets
 
     private static void WarnOnce(SimAssetKind kind, string key, string context, string shown)
     {
-        if (!warned.Add((kind, key))) return;
+        if (warned.Count >= 1024 || !warned.Add((kind, key))) return;
         DiagnosticLog.Warn($"[SimAssets] {context}: {kind} {shown} is not referenced anywhere in this build -- rejected. "
             + "If this is a real scenario asset, it needs to be a constant in a class or field named for its kind.");
     }

@@ -4,8 +4,7 @@ using System.Numerics;
 
 namespace AnoMech.Multiplayer;
 
-// Validation for everything off the wire; the relay forwards whatever any session member
-// sends. Limits are ~10x what a real 8-player run produces.
+// Simulation-side validation after bounded transport parsing.
 internal static class NetGuard
 {
     public const int MaxStringLength = 192;
@@ -13,8 +12,8 @@ internal static class NetGuard
     public const int MaxTethersPerSnapshot = 128;
     public const int MaxEventObjectsPerSnapshot = 256;
     public const int MaxStatusesPerEntity = 64;
-    public const int MaxLockonVfxPerEntity = 32;
-    public const int MaxVfxPerEntity = 32;
+    public const int MaxLockonVfxPerEntity = AnoMech.Network.RelayWire.MaxVfxPerEntity;
+    public const int MaxVfxPerEntity = AnoMech.Network.RelayWire.MaxVfxPerEntity;
     public const int MaxLiveOmens = 512;
     public const int MaxPendingMapCalls = 512;
     // Bound how long a burst can hold the framework thread.

@@ -12,4 +12,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Compile Include="../Shared/RelayWire.cs" Link="Multiplayer/RelayWire.cs" />
+    <Compile Include="../Shared/SessionInbox.cs" Link="Multiplayer/SessionInbox.cs" />
+  </ItemGroup>
 </Project>

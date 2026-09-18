@@ -115,6 +115,7 @@ public sealed class RunningSimWindow : Window
             ImGui.EndTable();
         }
         ImGui.TextDisabled("Caps are the relay's defaults; one started with other flags differs.");
+        ImGui.TextDisabled("Sent/sec and message size count wire bytes, as the relay does; received and totals count uncompressed data.");
     }
 
     private static void Header()

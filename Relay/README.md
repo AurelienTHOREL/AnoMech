@@ -1,8 +1,9 @@
 # AnoMech.Relay
 
 A small WebSocket relay for AnoMech's multiplayer mode. It forwards frames between
-clients in the same session code (`/session/<code>`) — it doesn't understand AnoMech's
-message format at all. Dalamud clients can't reach each other directly (NAT, and
+clients in the same session code (`/session/<code>`), tagging each with its
+authenticated sender. It never decompresses or parses what it forwards; the receiving
+clients validate every message. Dalamud clients can't reach each other directly (NAT, and
 AnoMech firewalls off FFXIV's own server traffic during a scenario), so this process
 exists just to get them talking.
 
@@ -104,8 +105,9 @@ is already overkill for a relay this light.
    sudo systemctl enable --now anomech-relay
    ```
 
-6. **Point the plugin at it**: your VPS IP or domain (see [TLS](#adding-tls-wss) for
-   `wss://`).
+6. **Point the plugin at it**: `ws://<your VPS IP>:7890`, or `wss://<your domain>` once
+   TLS is set up (see [TLS](#adding-tls-wss)). An address typed without `ws://` or
+   `wss://` is treated as `wss://`.
 
 ---
 
@@ -125,9 +127,10 @@ stay on for the session.
    (external TCP 7890 → this PC's LAN IP, port 7890) if anyone joining isn't on your
    home LAN.
 
-3. **Find your public IP** (search "what is my ip") and share it as the relay
-   address. No static IP? A dynamic-DNS service (No-IP, DuckDNS) gives you a stable
-   hostname instead.
+3. **Find your public IP** (search "what is my ip") and share `ws://<that IP>:7890`
+   as the relay address. Keep the `ws://`: without it the plugin uses `wss://`, which
+   this setup doesn't have. No static IP? A dynamic-DNS service (No-IP, DuckDNS) gives
+   you a stable hostname instead.
 
 4. **Run it**: `.\publish\AnoMech.Relay.exe --port 7890` (`./publish/AnoMech.Relay
    --port 7890` on Linux). Closing the console kills it — see
@@ -247,8 +250,8 @@ anomech-relay --port 7890 --token <shared-secret> --admin-token <a-different-sec
   | `--max-peers-per-session` | 8 | Peers in one room |
   | `--max-connections-per-ip` | 64 | Live sockets from one source address at once, across every room. Sized with slack for CGNAT/mobile carriers sharing one IP across many real users — a public relay sees much more of this than a friend-only one, so don't set it too tight (see [Security notes](#security-notes)) |
   | `--max-message-bytes` | 1048576 (1 MiB) | One logical message's size |
-  | `--max-messages-per-second` | 5000 | Messages from one connection before it gets cut off. A host broadcasting a snapshot pair every frame peaks near 450/s, so this is ~10x the worst legitimate case |
-  | `--max-bytes-per-second` | 10485760 (10 MiB) | Bytes from one connection per second. A full 8-peer run peaks around 2 MB/s on the host's connection |
+  | `--max-messages-per-second` | 20000 | Messages from one connection per second |
+  | `--max-bytes-per-second` | 41943040 (40 MiB) | Bytes on the wire from one connection per second (the relay never decompresses) |
   | `--max-fragments-per-message` | 2000 | Fragments allowed while assembling one message, independent of its byte size — bounds someone deliberately sending many tiny frames to burn CPU rather than a large one |
   | `--max-failed-joins` | 10 | Failed attempts per address before a 5-minute lockout — shared across session-code guesses and a wrong `--token`. Wrong `--admin-token` attempts use their own separate bucket, so an admin-endpoint scan can never lock players out |
   | `--usage-warn-fraction` | 0.5 | Logs one `[NEAR-LIMIT]` line per connection once it passes this fraction of either rate cap — how you find out a real scenario is creeping toward a limit before anyone is cut off |
@@ -387,10 +390,11 @@ Bans and limit changes live in memory only — they reset when the relay restart
   can join (capped at 8 peers per session). Set `--token` to require a shared password
   for anyone to connect at all; see [Running it as a public
   service](#running-it-as-a-public-service), including the TLS enforcement that comes
-  with it. Trust is scoped to one session, not the whole relay: anyone who has that
-  session's code is trusted for the duration of that session, nothing more — the host
-  still can't kick a peer once they've joined it, and nothing about one session
-  carries over to another.
+  with it. Hosts can kick and ban participants through relay-enforced controls. Room
+  bans cover the participant credential and source address (IPv6 /64), including other
+  connections already using that address. This can affect players sharing a network.
+  Unbanning removes that room's address restriction; room bans end when the room ends.
+  Anonymous users can still evade an address ban by changing networks.
 - **Session-code guessing**: codes are drawn from a cryptographically random
   generator (not a predictable PRNG), so a stranger who's observed some issued codes
   can't predict a future one. Repeated failed joins from one address get locked out
@@ -398,8 +402,9 @@ Bans and limit changes live in memory only — they reset when the relay restart
 - **Resource exhaustion (the relay itself)**: caps on total sessions, peers per
   session, connections per address, one message's size, and both the message rate and
   the byte rate of a single connection, plus timeouts on a stalled handshake, a message
-  that never finishes arriving, and every close handshake. Each rate cap is roughly 10x
-  what a full 8-peer run produces, and the relay logs a `[NEAR-LIMIT]` line plus a
+  that never finishes arriving, and every close handshake. Rate defaults are 20,000
+  messages/sec and 40 MiB/sec, counted in bytes on the wire. The relay
+  logs a `[NEAR-LIMIT]` line plus a
   peak-vs-cap figure in its minute summary so you can see headroom rather than guess at
   it. All tunable via CLI flags (and live from the admin dashboard); see [Running it as
   a public service](#running-it-as-a-public-service).
@@ -410,13 +415,25 @@ Bans and limit changes live in memory only — they reset when the relay restart
   share one address more often than in a friend-only deployment (mobile carriers,
   corporate NAT). `--max-connections-per-ip` defaults with slack for this, but if you
   see real users getting capped, raise it rather than assume it's abuse.
-- **Message impersonation**: every forwarded message is tagged with the relay-assigned
-  connection it came from, plus whether that connection is the room's host. A peer who
-  joins a session therefore can't forge a host-authoritative message (world state, run
-  start/end, ...), and can't send a peer message carrying somebody else's identity to
-  steal their role or force a reset — the plugin drops both. Best-effort: needs both the
-  relay and the plugin build to be reasonably current (see `RelayVersion`/capabilities
-  in `Program.cs`).
+- **Message impersonation**: the relay and plugin must come from the same version.
+  The client keeps one private random credential per room (relay address and session
+  code), so leaving and rejoining the same room resumes the same identity. A newly
+  hosted room gets a fresh one. The relay derives the public participant ID from it and
+  tags every forwarded message with that ID, the connection number, and host status;
+  receivers drop any message whose claimed ID doesn't match the tag. A public ID alone
+  cannot claim another participant's role. Peer traffic reaches only the host. The host
+  disconnecting closes the room; hosting again creates a new room. Relay operators and
+  hosts remain trusted for simulation content; this protocol does not make arbitrary
+  native effects safe.
+- **Bounded parsing**: the relay never decompresses or parses a forwarded message. The
+  only body it reads is a host's small, uncompressed `relayControl` frame. Receiving
+  clients decompress with a cap (8 MiB from the host, 64 KiB from a peer) and validate
+  nesting, string and collection sizes, duplicate fields, numbers, and sender identity
+  before creating protocol objects. A host drops a bad peer message rather than
+  disconnecting, holds each peer to its own rate budget, and kicks a peer through the
+  relay after repeated invalid messages. Client queues are bounded by count and 32 MiB
+  of payload data. These are resource bounds, not guarantees about frame time in every
+  encounter.
 - **It cannot be used to attack a third party.** It's TCP (WebSocket), not the
   connectionless UDP protocols IP-spoofing reflection/amplification attacks need — you
   can't fake a TCP source address without completing the handshake back to that faked
@@ -458,12 +475,55 @@ Bans and limit changes live in memory only — they reset when the relay restart
 
 Open the Multiplayer window (`/anomech mp`, or the "Multiplayer..." button once a
 multiplayer-supported scenario is selected) and type your relay's address into the
-**Relay URL** field. Just the address is enough (`relay.example.com`, or
-`203.0.113.5:7890` without TLS) — the plugin tries `wss://` first and falls back to
-`ws://` only if that relay doesn't support it, telling you which one it used. An
-explicit `ws://`/`wss://` also works. Remembered across sessions once set.
+**Relay URL** field. A bare address such as `relay.example.com` uses `wss://`
+and port 443; an explicit port is preserved. TLS failures never trigger a plaintext
+retry. For local development without TLS, enter `ws://127.0.0.1:7890` explicitly.
 
-If the relay you typed requires `--token`, a **Relay password** field appears
-automatically underneath (the plugin asks the relay's plain `/info` endpoint whether
-one is needed before showing it) — also remembered across sessions. A relay with no
-token set never shows the field at all.
+The **Relay password** field is always available for a valid address. A saved password
+is bound to its scheme, host, and port. While the address points at another origin the
+password is hidden and never sent; switching back restores it. Previous unscoped
+passwords must be entered again. Passwords are never sent over `ws://`. The `/info`
+check is optional and does not authorize sending a saved password to a different
+server.
+
+## Wire protocol
+
+Update the relay and plugin together; there is no compatibility mode for older builds.
+Connections send `X-AnoMech-Protocol: 1` and a 64-character hexadecimal
+`X-AnoMech-Peer-Secret`. Treat the latter as a credential and exclude it from proxy
+logs. The public peer ID is the first 16 SHA-256 digest bytes interpreted as a .NET
+GUID. The greeting is bounded JSON with version 1, capabilities `binaryCompression`,
+`authenticatedIdentity`, `roomModeration`, and `peerId`; hosting also returns
+`sessionCode`.
+
+Client messages use text frames for JSON or binary frames for Brotli JSON. Every
+forwarded relay frame is binary: host flag (1 byte), connection ID (4 bytes), peer
+GUID (16 bytes), compression flag (1 byte), then payload. Connection IDs use the
+platform's little-endian format; GUID bytes use .NET's GUID byte layout. Raw identity
+bytes must never be prepended to a WebSocket text frame because they need not be UTF-8.
+
+Host moderation uses `{ "t": "relayControl", "Operation": "kick|ban|unban",
+"PeerId": "..." }`, sent as an uncompressed text frame with `t` as its first property
+and at most 1 KiB. The relay consumes these commands instead of broadcasting them. A ban
+also removes the banned participant's other connections from the same address; the
+relay tells the host who they were with a frame from connection ID 0 and an empty GUID
+carrying `{ "t": "relayNotice", "Removed": [ ... ] }`.
+Sending data and close frames shares a per-socket lock, and a peer becomes eligible
+for broadcasts only after its greeting completes.
+
+Remote admin-console URLs require HTTPS. HTTP is accepted only for literal loopback
+addresses or `localhost`. The admin client does not follow redirects.
+
+## Regression checks
+
+With .NET 8 and .NET 10 SDKs and Python installed, run from the repository root:
+
+```powershell
+dotnet run --project tests/SecurityTests/SecurityTests.csproj
+python -m unittest discover -s tests -p test_replay_export.py -v
+```
+
+The transport tests use the production room, fan-out, moderation, greeting, and
+client-side validation code over loopback WebSockets, with a small test HTTP upgrade adapter so they do not
+require Windows HTTP.sys permissions. Native FFXIV object behavior and deployment
+proxy/TLS configuration still require integration testing in their actual environments.
