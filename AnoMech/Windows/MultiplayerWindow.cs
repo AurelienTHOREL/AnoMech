@@ -1,5 +1,4 @@
 using System;
-using AnoMech.Network;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
@@ -39,7 +38,7 @@ public class MultiplayerWindow : Window, IDisposable
         SizeCondition = ImGuiCond.FirstUseEver;
         IsOpen = false;
         relayUrl = plugin.Configuration.RelayServerUrl;
-        relayToken = plugin.Configuration.TokenForRelay(relayUrl);
+        relayToken = plugin.Configuration.RelayAccessToken;
         // ObjectTable.LocalPlayer is main-thread-only and plugins are constructed off-thread,
         // so the name is prefilled in Draw().
     }
@@ -88,6 +87,7 @@ public class MultiplayerWindow : Window, IDisposable
         if (mp.SessionCode == null
             && (Plugin.MainWindow.SelectedScenario is not { } sel || !sel.SupportsMultiplayer))
         {
+            // IsHost is never reset on leave, so this isn't gated on it.
             ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f),
                 "Select a multiplayer-supported scenario in the main window before hosting.");
         }
@@ -107,10 +107,7 @@ public class MultiplayerWindow : Window, IDisposable
     private void DrawJoiningPanel()
     {
         ImGui.TextUnformatted($"Connecting to session {mp.SessionCode}...");
-        ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
-            mp.IsReconnecting ? $"Reconnecting to the relay (attempt {mp.ReconnectAttempt + 1})." : "Waiting for the host to respond.");
-        if (mp.ConnectionError is { } err)
-            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), $"Last error: {err}");
+        ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "Waiting for the host to respond.");
         ImGui.Spacing();
         if (ImGui.Button("Cancel"))
             mp.LeaveSession();
@@ -120,8 +117,12 @@ public class MultiplayerWindow : Window, IDisposable
     // absolute URI on its own (scheme "host"), so "://" is checked first.
     private static bool IsPlausibleRelayUrl(string url)
     {
-        try { return !string.IsNullOrWhiteSpace(url) && RelayWire.Endpoint(url, "").Host.Length > 0; }
-        catch (Exception) { return false; }
+        var trimmed = url.Trim();
+        if (trimmed.Length == 0) return false;
+        if (trimmed.Contains("://", StringComparison.Ordinal))
+            return Uri.TryCreate(trimmed, UriKind.Absolute, out var explicitUri)
+                && explicitUri.Scheme is "ws" or "wss" or "http" or "https";
+        return Uri.TryCreate($"ws://{trimmed}", UriKind.Absolute, out var probe) && !string.IsNullOrEmpty(probe.Host);
     }
 
     private void DrawConnectPanel()
@@ -133,9 +134,6 @@ public class MultiplayerWindow : Window, IDisposable
         ImGui.SetNextItemWidth(300);
         if (ImGui.InputText("Relay URL##relayUrl", ref relayUrl, 256))
         {
-            // Hidden, not cleared, while the URL points elsewhere: TokenForRelay already keeps
-            // it from being sent to another origin, and clearing it lost it to a single typo.
-            relayToken = plugin.Configuration.TokenForRelay(relayUrl);
             plugin.Configuration.RelayServerUrl = relayUrl;
             plugin.Configuration.Save();
         }
@@ -144,36 +142,29 @@ public class MultiplayerWindow : Window, IDisposable
         {
             ImGui.TextColored(new Vector4(1f, 0.5f, 0.4f, 1f),
                 string.IsNullOrWhiteSpace(relayUrl)
-                    ? "Enter your relay's address, e.g. wss://relay.example.com, or ws://203.0.113.5:7890 for a relay without TLS"
+                    ? "Enter your relay's address, e.g. relay.example.com or 203.0.113.5:7890"
                     : "Doesn't look like a valid relay address.");
         }
-        else
+        // Re-checked once per distinct valid URL; unreachable/old-relay failures default to
+        // "no token needed".
+        else if (relayInfoCheckedForUrl != relayUrl)
         {
-            if (!relayUrl.Contains("://", StringComparison.Ordinal))
-                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f),
-                    "Connects with wss://. Type ws:// in front for a relay without TLS.");
-            // Re-checked once per distinct valid URL; unreachable/old-relay failures default to
-            // "no token needed".
-            if (relayInfoCheckedForUrl != relayUrl)
+            relayInfoCheckedForUrl = relayUrl;
+            relayRequiresToken = null;
+            var urlSnapshot = relayUrl;
+            _ = RelayClient.FetchInfoAsync(urlSnapshot).ContinueWith(t =>
             {
-                relayInfoCheckedForUrl = relayUrl;
-                relayRequiresToken = null;
-                var urlSnapshot = relayUrl;
-                _ = RelayClient.FetchInfoAsync(urlSnapshot).ContinueWith(t =>
-                {
-                    if (t.Status == System.Threading.Tasks.TaskStatus.RanToCompletion && t.Result is { } info)
-                        Plugin.Framework.Run(() => { if (relayInfoCheckedForUrl == urlSnapshot) relayRequiresToken = info.RequiresToken; });
-                });
-            }
+                if (t.Result is { } info)
+                    Plugin.Framework.Run(() => { if (relayInfoCheckedForUrl == urlSnapshot) relayRequiresToken = info.RequiresToken; });
+            });
         }
 
-        if (validUrl)
+        if (relayRequiresToken == true)
         {
             ImGui.SetNextItemWidth(300);
             if (ImGui.InputText("Relay password##relayToken", ref relayToken, 128, ImGuiInputTextFlags.Password))
             {
                 plugin.Configuration.RelayAccessToken = relayToken;
-                plugin.Configuration.RelayTokenOrigin = RelayWire.Origin(relayUrl);
                 plugin.Configuration.Save();
             }
         }
@@ -233,8 +224,18 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.SameLine();
             ImGui.TextColored(mp.IsEncrypted ? new Vector4(0.4f, 0.9f, 0.4f, 1f) : new Vector4(1f, 0.7f, 0.3f, 1f),
                 mp.IsEncrypted ? "(encrypted)"
+                : mp.FellBackToUnencrypted ? "(NOT encrypted -- this relay doesn't support wss://)"
                 : "(NOT encrypted)");
         }
+        if (stable && !mp.SupportsCompression)
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "This relay does not support compression.");
+        if (stable && !mp.RelayAttestsSender)
+        {
+            ImGui.TextColored(new Vector4(1f, 0.55f, 0.15f, 1f), "⚠ This relay can't tell who sent a message -- anyone in the session could act as the host.");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Only join sessions of people you trust on this relay, or update the relay (senderIdentity support).");
+        }
+
         if (mp.IsHost && mp.SessionCode == null)
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "Requesting a session code from the relay...");
         else if (mp.IsHost && mp.SessionCode != null)
@@ -410,7 +411,7 @@ public class MultiplayerWindow : Window, IDisposable
 
         if (ImGui.SmallButton("Kick")) ImGui.OpenPopup("##confirmkick");
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip($"Remove {who} from the session. Removing a seated player mid-fight ends the run. Asks first.");
+            ImGui.SetTooltip($"Remove {who} from the session; mid-fight it ends the run for everyone. Asks first.");
         if (ImGui.BeginPopup("##confirmkick"))
         {
             ImGui.TextUnformatted($"Kick {who}?");
@@ -429,7 +430,6 @@ public class MultiplayerWindow : Window, IDisposable
         {
             ImGui.TextUnformatted($"Ban {who}?");
             ImGui.TextDisabled("They stay out until you unban them in the Multiplayer window.");
-            ImGui.TextDisabled("Players sharing their network are also removed and blocked.");
             if (ImGui.Button("Ban them")) { mp.BanPeer(peerId); ImGui.CloseCurrentPopup(); }
             ImGui.SameLine();
             if (ImGui.Button("Cancel##ban")) ImGui.CloseCurrentPopup();

@@ -668,7 +668,6 @@ public sealed partial class MultiplayerManager
         DiagnosticLog.Info($"[Multiplayer] Peer received EndMessage (ReturnedToInn={msg.ReturnedToInn}, Reason={msg.Reason ?? "none"}).");
         if (NetGuard.Clean(msg.Reason) is { Length: > 0 } reason) AnnounceRunEnded(reason);
         running = false;
-        runGeneration++;
         StopDebugBotReplay();
         // Leave() assumes a zone was entered; before the deferred entry it would teleport the
         // real character to garbage coordinates.

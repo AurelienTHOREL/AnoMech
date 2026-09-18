@@ -10,7 +10,7 @@ using AnoMech.Scenarios.Umad.P3BlackHole;
 
 namespace AnoMech.Multiplayer;
 
-// Wire format. Positions are
+// Wire format; the relay is a per-session broadcaster that knows nothing of it. Positions are
 // flattened to floats: System.Text.Json doesn't serialize Vector3's fields without a converter.
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "t", UnknownDerivedTypeHandling = JsonUnknownDerivedTypeHandling.FallBackToBaseType)]
 [JsonDerivedType(typeof(HelloMessage), "hello")]
@@ -64,7 +64,9 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(KickMessage), "kick")]
 public abstract record MpMessage;
 
-// Accepted only with an authenticated host tag.
+// Only the host legitimately sends these; DispatchCore drops one the relay says came from
+// elsewhere. A relay without "senderIdentity" can't attest, and the tag then defaults to
+// trusted.
 internal interface IHostOnlyMessage;
 
 // One generic Dispatch case per interface instead of one per scenario (see IMultiplayerReplayable).

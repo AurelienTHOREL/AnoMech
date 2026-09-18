@@ -141,21 +141,15 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
         var spawned = new SimVfx(this, path, duration, fromLockon);
         if (persistent && spawned.IsActive)
             vfx.Add(spawned);
-        else if (!persistent && !fromLockon && Plugin.MultiplayerInstance is { IsHost: true, IsRunning: true })
-        {
-            if (pendingVfx.Count < AnoMech.Multiplayer.NetGuard.MaxVfxPerEntity) pendingVfx.Add((path, duration));
-            else droppedPendingVfx++;
-        }
+        else if (!persistent && !fromLockon)
+            pendingVfx.Add((path, duration));
     }
 
     // Every non-persistent AddVfx since the last drain, sampled for peers like the lockons.
     private readonly List<(string Path, float Duration)> pendingVfx = [];
-    private int droppedPendingVfx;
 
-    public IReadOnlyList<(string Path, float Duration)> DrainPendingVfx(out int dropped)
+    public IReadOnlyList<(string Path, float Duration)> DrainPendingVfx()
     {
-        dropped = droppedPendingVfx;
-        droppedPendingVfx = 0;
         if (pendingVfx.Count == 0) return [];
         var result = pendingVfx.ToArray();
         pendingVfx.Clear();
@@ -168,12 +162,9 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     // Every lockon attached since the last drain, so two in one tick (P4's Blizzard+Lightning
     // orbs) both replicate.
     private readonly List<uint> pendingLockonVfxIds = [];
-    private int droppedPendingLockonVfxIds;
 
-    public IReadOnlyList<uint> DrainPendingLockonVfxIds(out int dropped)
+    public IReadOnlyList<uint> DrainPendingLockonVfxIds()
     {
-        dropped = droppedPendingLockonVfxIds;
-        droppedPendingLockonVfxIds = 0;
         if (pendingLockonVfxIds.Count == 0) return [];
         var result = pendingLockonVfxIds.ToArray();
         pendingLockonVfxIds.Clear();
@@ -185,11 +176,7 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
         if (VfxFunctions.LockonVfxIconName(lockonId) is not {} iconName) return;
         AddVfx($"vfx/lockon/eff/{iconName}.avfx", duration, persistent, fromLockon: true);
         LastLockonVfxId = lockonId;
-        if (Plugin.MultiplayerInstance is { IsHost: true, IsRunning: true })
-        {
-            if (pendingLockonVfxIds.Count < AnoMech.Multiplayer.NetGuard.MaxLockonVfxPerEntity) pendingLockonVfxIds.Add(lockonId);
-            else droppedPendingLockonVfxIds++;
-        }
+        pendingLockonVfxIds.Add(lockonId);
     }
 
     // Sampled for peers and reconciled there like the statuses: unlike the fire-and-forget ones

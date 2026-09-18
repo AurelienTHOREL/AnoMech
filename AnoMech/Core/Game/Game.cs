@@ -137,16 +137,16 @@ public sealed class Game : IDisposable
 
     // Multiplayer host: RunScenario with `networkRoles` spawned as SimNetworkPuppet, named
     // after their players (`networkNames`).
-    public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Func<bool> stillCurrent)
+    public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames)
     {
-        Plugin.Framework.Run(() => { if (stillCurrent()) RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false); });
+        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false));
     }
 
     // Multiplayer peer: same zone/party/waymarks, but never zone/phase/scenario.Run; every
     // other slot is a puppet driven by the host's snapshots.
-    public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Func<bool> stillCurrent)
+    public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames)
     {
-        Plugin.Framework.Run(() => { if (stillCurrent()) RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true); });
+        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true));
     }
 
     // Raised when Kill actually takes a slot down; the host broadcasts RoleKilled from it. A
@@ -161,8 +161,6 @@ public sealed class Game : IDisposable
             return presets[selectedWaymark].Markers;
         return presets[0].Markers;
     }
-
-    private int sceneRevision;
 
     private void RunScenarioInternal(IScenario scenario, PartyRole? roleOverride, int? selectedAi, int selectedWaymark, IReadOnlySet<PartyRole>? networkRoles, IReadOnlyDictionary<PartyRole, string>? networkNames, bool isPeer)
     {
@@ -188,7 +186,6 @@ public sealed class Game : IDisposable
             return;
         }
 
-        sceneRevision++;
         ResetInternal();
 
         var player = Plugin.ObjectTable.LocalPlayer;
@@ -305,9 +302,8 @@ public sealed class Game : IDisposable
         if (Paused) return;
         Events.Tick(deltaSeconds * EventTimeScale);
         World.Tick(deltaSeconds);
-        // A peer's own tick would fight OnRolesSnapshotReceived's HP writes. Only a peer in a
-        // networked run: the manager always exists and is not the host when solo.
-        if (Plugin.MultiplayerInstance is not { IsHost: false, IsRunning: true })
+        // A peer's own tick would fight OnRolesSnapshotReceived's HP writes.
+        if (Plugin.MultiplayerInstance is not { IsHost: false })
             TankHpRegen.Tick(World.Party, deltaSeconds);
         if (activeScenario != null)
         {
@@ -414,17 +410,13 @@ public sealed class Game : IDisposable
         ui->ShowErrorText($"{DescribeName(target)} died: {cause}", true);
     }
 
-    public void Reset()
+    public void Reset() => Plugin.Framework.Run(() =>
     {
-        var revision = sceneRevision;
-        Plugin.Framework.Run(() =>
-        {
-            if (revision != sceneRevision) return;
-            if (activeScenario is not null) TeleportPlayerToSpawnIfOutsideArena();
-            ResetInternal();
-            Bgm.Reset();
-        });
-    }
+        if (activeScenario is not null)
+            TeleportPlayerToSpawnIfOutsideArena();
+        ResetInternal();
+        Bgm.Reset();
+    });
 
     // Pull the player back to the scenario's spawn point only if they're standing
     // outside the arena ring (e.g. knocked out of bounds, or wandered off). No-op
@@ -457,13 +449,10 @@ public sealed class Game : IDisposable
     // Resets the encounter first, then reverts the zone — Reset stays in-zone.
     public void Leave()
     {
-        var revision = sceneRevision;
         // Leaving always finalizes its own log segment.
         AnoMech.Core.DiagnosticLog.RotateNow();
         Plugin.Framework.Run(() =>
         {
-            if (revision != sceneRevision) return;
-            sceneRevision++;
             ResetInternal();
             Bgm.Reset();
             World.Map.Unload();
@@ -500,7 +489,6 @@ public sealed class Game : IDisposable
     // Framework.Run wrapper would never fire.
     public void Dispose()
     {
-        sceneRevision++;
         activeScenario = null;
         Events.Clear();
         Bgm.Dispose();

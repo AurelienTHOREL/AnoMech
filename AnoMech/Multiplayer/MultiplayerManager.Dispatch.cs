@@ -1,5 +1,5 @@
 using System;
-using AnoMech.Network;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
@@ -23,85 +23,36 @@ public sealed partial class MultiplayerManager
 
     // Queued and drained in Tick rather than one Framework.Run per message: Dalamud's task
     // scheduler doesn't run pending tasks in insertion order, and wire order matters.
-    private readonly SessionInbox<(MpMessage Message, bool IsFromHost, uint SenderId, Guid PeerId)> pendingMessages =
-        new(NetGuard.MaxQueuedMessages, RelayWire.MaxQueuedBytes);
+    private readonly ConcurrentQueue<(MpMessage Message, bool IsFromHost, uint SenderId)> pendingMessages = new();
+    private int pendingMessageCount;
+    private long droppedQueuedMessages;
 
-    private long shedMessages;
+    private void OnMessageReceivedOffThread(MpMessage message, bool isFromHost, uint senderId)
+    {
+        if (Interlocked.Increment(ref pendingMessageCount) > NetGuard.MaxQueuedMessages)
+        {
+            Interlocked.Decrement(ref pendingMessageCount);
+            if (Interlocked.Increment(ref droppedQueuedMessages) % 1000 == 1)
+                DiagnosticLog.Warn($"[Multiplayer] Inbound queue is over {NetGuard.MaxQueuedMessages} deep -- dropping messages (total {Interlocked.Read(ref droppedQueuedMessages)}).");
+            return;
+        }
+        pendingMessages.Enqueue((message, isFromHost, senderId));
+    }
 
+    // A snapshot directly followed by another of the same type is skipped: under a bad
+    // connection they back up and would replay as a burst.
     private void DrainPendingMessages()
     {
         var budget = NetGuard.MaxMessagesPerDrain;
         while (budget-- > 0 && pendingMessages.TryDequeue(out var entry))
-            Dispatch(entry.Message, entry.IsFromHost, entry.SenderId, entry.PeerId);
-    }
-
-    // Receive thread. Snapshots and poses are superseded by the next one, so they're shed first
-    // when the frame loop falls behind. On overflow a peer reconnects to resync; the host has
-    // nothing to resync from and drops peer messages instead of ending the room.
-    private void OnMessageReceivedOffThread(RelayClient client, MpMessage message, bool fromHost, uint connection, Guid peerId, int bytes)
-    {
-        if (!ReferenceEquals(relay, client)) return;
-        if (message is WorldSnapshotMessage or RolesSnapshotMessage or SelfPoseMessage && pendingMessages.IsBacklogged)
         {
-            if (Interlocked.Increment(ref shedMessages) % 500 == 1)
-                DiagnosticLog.Warn($"[Multiplayer] Falling behind -- shedding superseded snapshots and poses ({Interlocked.Read(ref shedMessages)} so far).");
-            return;
+            Interlocked.Decrement(ref pendingMessageCount);
+            if ((entry.Message is WorldSnapshotMessage && pendingMessages.TryPeek(out var next) && next.Message is WorldSnapshotMessage)
+                || (entry.Message is RolesSnapshotMessage && pendingMessages.TryPeek(out var next2) && next2.Message is RolesSnapshotMessage))
+                continue;
+            Dispatch(entry.Message, entry.IsFromHost, entry.SenderId);
         }
-        if (pendingMessages.TryEnqueue(client, (message, fromHost, connection, peerId), bytes) != InboxResult.Full) return;
-        if (!fromHost)
-        {
-            if (Interlocked.Increment(ref shedMessages) % 500 == 1)
-                DiagnosticLog.Warn($"[Multiplayer] Inbound queue full -- dropping peer messages ({Interlocked.Read(ref shedMessages)} shed so far).");
-            return;
-        }
-        DiagnosticLog.Warn($"[Multiplayer] Inbound queue full of messages that can't be skipped -- dropping the connection to resync.");
-        client.Dispose();
     }
-
-    // ---- Abuse handling (host) ----------------------------------------------
-
-    // The relay forwards bodies unread, so the host is where a peer sending messages that
-    // don't decode or validate gets caught. A few is a build mismatch; this many is not.
-    private const int StrikesBeforeKick = 10;
-    private const long StrikeWindowMs = 10_000;
-    private readonly object strikeGate = new();
-    private readonly Dictionary<Guid, (int Count, long WindowStartMs)> strikes = new();
-
-    private void OnMessageRejectedOffThread(RelayClient client, Guid sender, bool fromHost, string reason)
-    {
-        if (!ReferenceEquals(relay, client)) return;
-        int count;
-        lock (strikeGate)
-        {
-            var now = Environment.TickCount64;
-            if (strikes.Count > 256) strikes.Clear();
-            var entry = strikes.GetValueOrDefault(sender);
-            if (now - entry.WindowStartMs > StrikeWindowMs) entry = (0, now);
-            count = ++entry.Count;
-            strikes[sender] = entry;
-        }
-        if (count == 1 || count == StrikesBeforeKick)
-            DiagnosticLog.Warn($"[Multiplayer] Dropped an invalid message from {(fromHost ? "the host" : sender.ToString())}: {reason}");
-        if (count != StrikesBeforeKick || fromHost || !IsHost) return;
-        _ = Plugin.Framework.Run(() =>
-        {
-            if (!ReferenceEquals(relay, client)) return;
-            DiagnosticLog.Warn($"[Multiplayer] Kicking {Session.NameOf(sender)} ({sender}) -- {StrikesBeforeKick} invalid messages in {StrikeWindowMs / 1000}s.");
-            _ = relay?.ModerateAsync("kick", sender);
-            RemovePeer(sender);
-        });
-    }
-
-    // Others the relay removed alongside a ban (same address). They leave without a
-    // SessionEnded, so without this the host would keep them seated.
-    private void OnPeersRemovedOffThread(RelayClient client, IReadOnlyList<Guid> removed)
-        => Plugin.Framework.Run(() =>
-        {
-            if (!ReferenceEquals(relay, client) || !IsHost) return;
-            foreach (var id in removed) RemovePeer(id);
-        });
-
-    private long lastIdleEndSentMs;
 
     // The ReferenceEquals guard drops events from superseded clients, and a manual Leave
     // (which nulls `relay` first) never gets past it.
@@ -109,20 +60,6 @@ public sealed partial class MultiplayerManager
         => Plugin.Framework.Run(() =>
         {
             if (!ReferenceEquals(relay, source)) return;
-            pendingMessages.SetSource(null);
-            // A joiner that never reached the relay has nothing to resume. Retrying a wrong
-            // address or a TLS mismatch would otherwise loop forever behind "Waiting for the host".
-            if (IsHost || failure is RelaySessionRejectedException || !source.HasConnected)
-            {
-                var reason = failure?.Message ?? "Connection lost -- room ended.";
-                DiagnosticLog.Warn($"[Multiplayer] Session over ({(IsHost ? "host" : "peer")}): {reason}");
-                if (Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
-                LeaveSessionInternal(notifyOthers: false);
-                SessionEndReason = reason;
-                ConnectionError = failure?.Message;
-                LobbyChanged?.Invoke();
-                return;
-            }
             source.Dispose();
             relay = null;
             disconnectedSinceMs ??= Environment.TickCount64;
@@ -139,12 +76,12 @@ public sealed partial class MultiplayerManager
             BeginReconnect();
         });
 
-    private void Dispatch(MpMessage message, bool isFromHost, uint senderId, Guid authenticatedPeerId)
+    private void Dispatch(MpMessage message, bool isFromHost, uint senderId)
     {
         // One bad message must not take down the tick.
         try
         {
-            DispatchCore(message, isFromHost, senderId, authenticatedPeerId);
+            DispatchCore(message, isFromHost, senderId);
         }
         catch (Exception e)
         {
@@ -152,7 +89,17 @@ public sealed partial class MultiplayerManager
         }
     }
 
+    // Host-only: the relay connection each PeerId was first seen on. PeerIds are self-chosen;
+    // connection ids are relay-assigned and can't be forged.
     private readonly Dictionary<Guid, uint> peerConnectionIds = new();
+    private readonly Dictionary<uint, long> connectionLastSeenMs = new();
+
+    // Above the 2s ping/pong cadence.
+    private const long ConnectionLivenessMs = 3000;
+
+    // How long after a peer registers a leave is treated as having crossed that rejoin. Sized
+    // for a network race, not for a player who joins and immediately leaves again.
+    private const long RejoinGraceMs = 2000;
 
     private static readonly Lumina.Excel.ExcelSheet<Lumina.Excel.Sheets.Weather> WeatherSheet =
         Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Weather>();
@@ -179,27 +126,43 @@ public sealed partial class MultiplayerManager
         _ => null,
     };
 
-    private void DispatchCore(MpMessage message, bool isFromHost, uint senderId, Guid authenticatedPeerId)
+    // The binding may move to a new connection (a reconnect) only once the old one has stopped
+    // sending. Liveness is per connection, so a forged message can't keep the real one alive.
+    private bool IsImpersonating(Guid peerId, uint senderId)
+    {
+        if (senderId == 0) return false; // relay doesn't attest identity
+        if (peerConnectionIds.TryGetValue(peerId, out var bound) && bound != senderId)
+        {
+            if (Environment.TickCount64 - connectionLastSeenMs.GetValueOrDefault(bound) <= ConnectionLivenessMs)
+            {
+                DiagnosticLog.Warn($"[Multiplayer] Dropped a message claiming to be {Session.NameOf(peerId)} ({peerId}) from connection #{senderId} -- that peer is live on #{bound}.");
+                return true;
+            }
+            DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(peerId)} reconnected on connection #{senderId} (was #{bound}).");
+            connectionLastSeenMs.Remove(bound);
+        }
+        peerConnectionIds[peerId] = senderId;
+        connectionLastSeenMs[senderId] = Environment.TickCount64;
+        return false;
+    }
+
+    private void DispatchCore(MpMessage message, bool isFromHost, uint senderId)
     {
         if (message is IHostOnlyMessage && !isFromHost)
         {
             DiagnosticLog.Warn($"[Multiplayer] Dropped {message.GetType().Name} -- relay says it wasn't from the host.");
             return;
         }
-        if (IsHost)
+        if (IsHost && ClaimedPeerId(message) is { } claimedId)
         {
-            if (isFromHost || authenticatedPeerId == MyPeerId || ClaimedPeerId(message) != authenticatedPeerId) return;
-            if (bannedPeers.ContainsKey(authenticatedPeerId))
+            if (IsImpersonating(claimedId, senderId)) return;
+            if (bannedPeers.ContainsKey(claimedId))
             {
-                // A ban issued while they were disconnected never reached the relay's live list;
-                // repeating it now closes the connection instead of leaving a silent listener.
-                if (message is HelloMessage) _ = relay?.ModerateAsync("ban", authenticatedPeerId);
+                // Repeat the kick for a banned client that rejoins or never got it.
+                if (message is HelloMessage) _ = relay?.SendAsync(new KickMessage(claimedId, Banned: true));
                 return;
             }
-            if (message is not HelloMessage && (!Session.Names.ContainsKey(authenticatedPeerId)
-                || peerConnectionIds.GetValueOrDefault(authenticatedPeerId) != senderId)) return;
         }
-        else if (!isFromHost || (message is LobbyStateMessage lobby && lobby.HostId != authenticatedPeerId)) return;
         // Host liveness: only types the host itself broadcasts (SessionEnded excluded, any peer
         // can send it). Keep in sync with the `when !IsHost` cases below.
         if (!IsHost && message is LobbyStateMessage or StartMessage or WorldSnapshotMessage or RolesSnapshotMessage
@@ -221,8 +184,8 @@ public sealed partial class MultiplayerManager
                     DiagnosticLog.Warn($"[Multiplayer] Ignoring Hello from {hello.PeerId} -- roster already holds {NetGuard.MaxSessionPeers} peers.");
                     break;
                 }
-                peerConnectionIds[hello.PeerId] = senderId;
                 peerLastSeenMs[hello.PeerId] = Environment.TickCount64;
+                peerLastHelloMs[hello.PeerId] = Environment.TickCount64;
                 var build = new PeerBuildInfo(NetGuard.Clean(hello.Version), NetGuard.Clean(hello.Checksum));
                 Session.Names[hello.PeerId] = NetGuard.Clean(hello.DisplayName);
                 Session.Builds[hello.PeerId] = build;
@@ -343,12 +306,10 @@ public sealed partial class MultiplayerManager
                 if (pendingStartResponses.Count == 0) FinishStartCheck();
                 break;
             // Ending the run beats simulating around a player who never entered.
-            case StartAbortMessage abort when IsHost && running && Session.RoleOf(abort.PeerId) != null:
+            case StartAbortMessage abort when IsHost:
             {
                 var who = Session.NameOf(abort.PeerId);
-                // Cleaned as a whole: two peer strings side by side can exceed what a receiver's
-                // validator accepts, and then no peer would see the run end.
-                var reason = NetGuard.Clean($"{who} couldn't start: {abort.Reason}");
+                var reason = $"{who} couldn't start: {NetGuard.Clean(abort.Reason)}";
                 DiagnosticLog.Warn($"[Multiplayer] {reason} -- ending the run for everyone.");
                 if (Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
                 BroadcastRunEnded(returnedToInn: true, reason);
@@ -404,6 +365,14 @@ public sealed partial class MultiplayerManager
             }
             case SessionEndedMessage ended when IsHost:
             {
+                // A leave sent on the way out can still be in flight when the same peer comes
+                // back. It said Hello more recently than this arrived, so it is here, not gone.
+                var sinceHello = Environment.TickCount64 - peerLastHelloMs.GetValueOrDefault(ended.PeerId, long.MinValue / 2);
+                if (sinceHello < RejoinGraceMs)
+                {
+                    DiagnosticLog.Info($"[Multiplayer] Ignoring a leave from {Session.NameOf(ended.PeerId)} -- they registered {sinceHello}ms ago, so it crossed their rejoin.");
+                    break;
+                }
                 RemovePeer(ended.PeerId);
                 break;
             }
@@ -418,27 +387,17 @@ public sealed partial class MultiplayerManager
                 LobbyChanged?.Invoke();
                 break;
             // Only a seated peer can end the run for everyone.
-            case ResetRequestMessage req when IsHost && Session.RoleOf(req.PeerId) != null && Plugin.GameInstance.World.Map.IsInInstance:
+            case ResetRequestMessage req when IsHost && Session.RoleOf(req.PeerId) != null:
                 DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(req.PeerId)} requested a reset.");
                 Plugin.GameInstance.Reset();
                 break;
-            // IsInInstance, not running: Leave must still work after a Reset. Answered even with
-            // nothing to end, or a peer that missed the end of a run waits on its Leave forever.
+            // IsInInstance, not running: Leave must still work after a Reset.
             case LeaveRequestMessage req when IsHost && Session.RoleOf(req.PeerId) != null:
                 DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(req.PeerId)} requested to leave the instance.");
-                if (running || Plugin.GameInstance.World.Map.IsInInstance)
-                {
-                    if (Plugin.GameInstance.World.Map.IsInInstance)
-                        Plugin.GameInstance.Leave();
-                    BroadcastRunEnded(returnedToInn: true);
-                }
-                // A bare EndMessage, at most once a second, so repeated requests can't make the
-                // host rebroadcast its whole end-of-run sequence.
-                else if (Environment.TickCount64 - lastIdleEndSentMs >= 1000)
-                {
-                    lastIdleEndSentMs = Environment.TickCount64;
-                    _ = relay?.SendAsync(new EndMessage(ReturnedToInn: true, Reason: null));
-                }
+                if (Plugin.GameInstance.World.Map.IsInInstance)
+                    Plugin.GameInstance.Leave();
+                // Unconditional, or the requester's own Leave button waits forever.
+                BroadcastRunEnded(returnedToInn: true);
                 break;
             // Can't loop into a re-broadcast: the map-event handlers gate on IsHost.
             case MapEffectMessage effect when PeerInRun:

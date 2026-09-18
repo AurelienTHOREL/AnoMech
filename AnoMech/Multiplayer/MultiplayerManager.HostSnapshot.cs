@@ -99,11 +99,9 @@ public sealed partial class MultiplayerManager
                 hostEnemyLastLoggedAnimationTimeline[enemy] = enemy.AnimationTimelineSeq;
                 DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationTimelineId -> 0x{timelineId:X4} (seq {enemy.AnimationTimelineSeq}).");
             }
-            var who = $"enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId})";
-            var newLockonVfxIds = enemy.DrainPendingLockonVfxIds(out var droppedLockons);
-            WarnOverVfxCap(who, droppedLockons, "head markers");
+            var newLockonVfxIds = enemy.DrainPendingLockonVfxIds();
             if (newLockonVfxIds.Count > 0)
-                DiagnosticLog.Info($"[Multiplayer] Host: {who} NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
             if (enemy.AnimationState is { } animState
                 && (!hostEnemyLastLoggedAnimationState.TryGetValue(enemy, out var lastStateSeq) || lastStateSeq != enemy.AnimationStateSeq))
             {
@@ -113,7 +111,7 @@ public sealed partial class MultiplayerManager
             var (castTargetEnemyNetId, castTargetRole) = ResolveTargetId(world, enemy.CastTargetId);
             var (instantTargetEnemyNetId, instantTargetRole) = ResolveTargetId(world, enemy.LastInstantCastTargetId);
             var (instantActionTargetEnemyNetId, instantActionTargetRole) = ResolveTargetId(world, enemy.LastInstantCastActionTargetId);
-            var newVfx = DrainVfx(enemy, who);
+            var newVfx = DrainVfx(enemy, $"enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId})");
             SimAssets.WarnIfUnknown(SimAssetKind.BNpcBase, enemy.BNpcBaseId, "enemy BNpcBase");
             SimAssets.WarnIfUnknown(SimAssetKind.Action, enemy.CastActionId, "enemy cast");
             SimAssets.WarnIfUnknown(SimAssetKind.Action, enemy.LastInstantCastActionId, "enemy instant cast");
@@ -144,7 +142,7 @@ public sealed partial class MultiplayerManager
                         enemy.TimelineHoldState, enemy.TimelineHoldId, enemy.TimelineHoldSeq,
                         enemy.DirectTimelineId, enemy.DirectTimelineSeq, enemy.ForceLoadTimelineSeq)
                     : null,
-                PersistentVfxForPeers(enemy, who)));
+                enemy.ActivePersistentVfxPaths));
         }
 
         var liveTethers = world.Children.OfType<SimTether>().Where(t => t.IsActive).ToList();
@@ -200,25 +198,9 @@ public sealed partial class MultiplayerManager
         return relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, eventObjects));
     }
 
-    private static void WarnOverVfxCap(string who, int dropped, string what)
-    {
-        if (dropped > 0)
-            DiagnosticLog.Warn($"[Multiplayer] Host: {who} had {dropped} {what} over the {NetGuard.MaxVfxPerEntity}-per-snapshot cap -- not sent to peers.");
-    }
-
-    // Receivers reject a longer list, so the host sends the cap and logs what it left out.
-    private static IReadOnlyList<string> PersistentVfxForPeers(SimCharacter? character, string who)
-    {
-        var paths = character?.ActivePersistentVfxPaths ?? [];
-        if (paths.Count <= NetGuard.MaxVfxPerEntity) return paths;
-        WarnOverVfxCap(who, paths.Count - NetGuard.MaxVfxPerEntity, "persistent VFX");
-        return paths.Take(NetGuard.MaxVfxPerEntity).ToList();
-    }
-
     private static IReadOnlyList<AttachedVfxState> DrainVfx(SimCharacter character, string who)
     {
-        var pending = character.DrainPendingVfx(out var dropped);
-        WarnOverVfxCap(who, dropped, "VFX");
+        var pending = character.DrainPendingVfx();
         if (pending.Count == 0) return [];
         var result = new List<AttachedVfxState>(pending.Count);
         foreach (var (path, duration) in pending)
@@ -250,8 +232,7 @@ public sealed partial class MultiplayerManager
                 if (!hostRoleLastLoggedStatuses.TryGetValue(role, out var lastStatuses))
                     hostRoleLastLoggedStatuses[role] = lastStatuses = new Dictionary<ushort, ushort>();
                 LogStatusChanges($"Host: role {role} ({DescribeRoleOwner(role, member)})", statusSnapshot, lastStatuses);
-                newLockonVfxIds = member.DrainPendingLockonVfxIds(out var droppedLockons);
-                WarnOverVfxCap($"role {role}", droppedLockons, "head markers");
+                newLockonVfxIds = member.DrainPendingLockonVfxIds();
                 if (newLockonVfxIds.Count > 0)
                     DiagnosticLog.Info($"[Multiplayer] Host: role {role} NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
                 newVfx = DrainVfx(member, $"role {role}");
@@ -281,7 +262,7 @@ public sealed partial class MultiplayerManager
                 member?.Position.X ?? 0f, member?.Position.Y ?? 0f, member?.Position.Z ?? 0f, member?.Rotation ?? 0f,
                 statuses, newLockonVfxIds, currentHp, maxHp,
                 member?.AnimationTimelineId, member?.AnimationTimelineLoopId ?? 0, member?.AnimationTimelineSeq ?? 0, newVfx,
-                PersistentVfxForPeers(member, $"role {role}"),
+                member?.ActivePersistentVfxPaths ?? [],
                 (member as SimNpc)?.PlayedActionId ?? 0, (member as SimNpc)?.PlayedActionAnimationLock ?? 0.6f,
                 (member as SimNpc)?.PlayedActionSeq ?? 0));
         }

@@ -1,7 +1,5 @@
 using Dalamud.Configuration;
 using System;
-using System.Collections.Generic;
-using AnoMech.Network;
 
 namespace AnoMech;
 
@@ -19,45 +17,15 @@ public class Configuration : IPluginConfiguration
     // sessions so the user only has to type it once.
     public string RelayServerUrl { get; set; } = "";
 
-    // Optional shared secret some relays require to connect. Bound to the origin it was entered
-    // for (RelayTokenOrigin) and only ever sent there; never logged.
+    // Optional shared secret some relays require to connect -- remembered the same way as
+    // RelayServerUrl. Only ever sent to the relay URL above; never logged.
     public string RelayAccessToken { get; set; } = "";
 
-    public string RelayTokenOrigin { get; set; } = "";
-
-    public string TokenForRelay(string url)
-    {
-        try { return RelayTokenOrigin == RelayWire.Origin(url) ? RelayAccessToken : ""; }
-        catch (Exception) { return ""; }
-    }
-
-    // The peer credential for each room joined, so a player coming back to the same room after
-    // a crash or a manual rejoin is the same identity and resumes their seat. Oldest first.
-    public List<RoomCredential> RoomCredentials { get; set; } = [];
-    private const int MaxRoomCredentials = 16;
-
-    public string RoomSecret(string relayUrl, string sessionCode)
-    {
-        string origin;
-        try { origin = RelayWire.Origin(relayUrl); }
-        catch (Exception) { origin = relayUrl.Trim(); }
-        var room = $"{origin}|{sessionCode}";
-        var existing = RoomCredentials.Find(c => c.Room == room);
-        if (existing != null && IsValidSecret(existing.Secret)) return existing.Secret;
-        if (existing != null) RoomCredentials.Remove(existing);
-        var created = new RoomCredential { Room = room, Secret = RelayWire.NewSecret() };
-        RoomCredentials.Add(created);
-        if (RoomCredentials.Count > MaxRoomCredentials)
-            RoomCredentials.RemoveRange(0, RoomCredentials.Count - MaxRoomCredentials);
-        Save();
-        return created.Secret;
-    }
-
-    private static bool IsValidSecret(string secret)
-    {
-        try { RelayWire.PeerId(secret); return true; }
-        catch (Exception) { return false; }
-    }
+    // Stable per-install multiplayer identity. Reused across Host/Join calls
+    // (instead of a fresh Guid each time) so that if a peer's connection drops
+    // and they rejoin the same session, the host's still-held role claim for
+    // their old identity matches their new connection instead of orphaning it.
+    public Guid LocalPeerId { get; set; } = Guid.NewGuid();
 
     // Firewall opcode config — updated automatically by OpcodeUpdater on game version change.
     public uint[] ZoneDownOpcodes { get; set; } = [];
@@ -77,11 +45,4 @@ public class Configuration : IPluginConfiguration
     {
         Plugin.PluginInterface.SavePluginConfig(this);
     }
-}
-
-[Serializable]
-public class RoomCredential
-{
-    public string Room { get; set; } = "";
-    public string Secret { get; set; } = "";
 }

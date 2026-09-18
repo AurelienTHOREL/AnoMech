@@ -2,349 +2,445 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Net.Http;
 using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using AnoMech.Core;
-using AnoMech.Network;
 
 namespace AnoMech.Multiplayer;
 
-// The relay refused this client or ended the room. Retrying the same code can't help.
+// The relay rejected the connection with a close frame right after the upgrade (see
+// ReadGreetingAsync), almost always "session not found" after a relay restart. Retrying the
+// same code can never succeed, so the reconnect loop gives up instead of backing off forever.
 internal sealed class RelaySessionRejectedException(string reason) : Exception(reason);
 
-public sealed class RelayClient(string peerSecret) : IDisposable
+// ClientWebSocket wrapper for AnoMech.Relay (Relay/README.md), which only forwards opaque
+// frames. The WebSocket message type doubles as the compression flag: Text = raw JSON,
+// Binary = Brotli (from CompressionThresholdBytes up; below that Brotli's framing costs more
+// than it saves).
+public sealed class RelayClient : IDisposable
 {
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true, MaxDepth = 16 };
-    private static readonly HttpMessageInvoker WebSocketHttp = new(new SocketsHttpHandler { AllowAutoRedirect = false, UseCookies = false });
-    private const int MaxInboundFrameBytes = 2 * 1024 * 1024;
-    private readonly ClientWebSocket socket = new();
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private const int CompressionThresholdBytes = 256;
+
+    // Replaced per fallback attempt: a ClientWebSocket can only ConnectAsync once.
+    private ClientWebSocket socket = new();
     private readonly CancellationTokenSource cts = new();
-    private readonly object sendLock = new();
-    private readonly SemaphoreSlim sendSignal = new(0);
-    private readonly Queue<PendingSend> priority = new();
-    private readonly Queue<PendingSend> bulk = new();
-    private int queuedBytes;
-    private volatile bool disposed;
-    private bool host;
-    private volatile bool ready;
-    private sealed record PendingSend(byte[] Bytes, int RawBytes, WebSocketMessageType Type, TaskCompletionSource Completion);
-    private sealed record RelayNotice(string? T, Guid[]? Removed);
+    // Two queues so a large WorldSnapshot can't hog the single send slot ahead of small urgent
+    // messages; bulk is drained only while the priority queue is empty.
+    private readonly Channel<(byte[] Bytes, WebSocketMessageType Type, TaskCompletionSource Completion)> sendQueue =
+        Channel.CreateUnbounded<(byte[], WebSocketMessageType, TaskCompletionSource)>();
+    private readonly Channel<(byte[] Bytes, WebSocketMessageType Type, TaskCompletionSource Completion)> bulkSendQueue =
+        Channel.CreateUnbounded<(byte[], WebSocketMessageType, TaskCompletionSource)>();
+    private bool disposed;
 
-    public event Action<MpMessage, bool, uint, Guid, int>? MessageReceived;
-    // A message that failed to decode, validate or deserialize, from this relay-authenticated
-    // sender. Dropped rather than fatal: one bad message must not take the connection down.
-    public event Action<Guid, bool, string>? MessageRejected;
-    // Relay-side removals the host didn't ask for by id, e.g. others on a banned address.
-    public event Action<IReadOnlyList<Guid>>? PeersRemoved;
+    // The relay is untrusted; 2 MB is ~100x the largest real message.
+    private const int MaxIncomingMessageBytes = 2 * 1024 * 1024;
+    private const int MaxIncomingFragments = 4096;
+
+    // (message, isFromHost, relay-assigned sender connection id or 0) -- see IHostOnlyMessage.
+    public event Action<MpMessage, bool, uint>? MessageReceived;
     public event Action<Exception?>? Disconnected;
-    public bool IsConnected => ready && socket.State == WebSocketState.Open;
-    // Stays true after the connection drops, so a lost session can be told from one that
-    // never reached the relay at all.
-    public bool HasConnected { get; private set; }
+
+    public bool IsConnected => socket.State == WebSocketState.Open;
+
+    // The scheme actually dialed; the relay can't say (wss:// terminates in a reverse proxy).
     public bool IsEncrypted { get; private set; }
+
+    // Distinct from a ws:// the user typed on purpose.
+    public bool FellBackToUnencrypted { get; private set; }
+
+    // From the relay's greeting; a missing entry just means "not supported".
     public IReadOnlySet<string> RelayCapabilities { get; private set; } = new HashSet<string>();
-    public bool SupportsCompression => RelayCapabilities.Contains("binaryCompression");
-    public bool SupportsSenderIdentity => RelayCapabilities.Contains("authenticatedIdentity");
+    public bool HasRelayCapability(string name) => RelayCapabilities.Contains(name);
+    public bool SupportsCompression => HasRelayCapability("binaryCompression");
+    public bool SupportsSenderIdentity => HasRelayCapability("senderIdentity");
 
+    // Each connection's usage is counted from zero: the caps it is measured against are
+    // per-connection too.
     public Task ConnectAsync(string relayUrl, string sessionCode, string? accessToken = null)
-        => ConnectCoreAsync(relayUrl, $"session/{Uri.EscapeDataString(sessionCode)}", accessToken);
+    {
+        RelayStats.Reset();
+        return ConnectCoreAsync(relayUrl, $"session/{Uri.EscapeDataString(sessionCode)}", accessToken);
+    }
 
+    // Only the relay can guarantee a collision-free session code.
     public Task<string?> ConnectAndHostAsync(string relayUrl, string? accessToken = null)
-        => ConnectCoreAsync(relayUrl, "host", accessToken);
+    {
+        RelayStats.Reset();
+        return ConnectCoreAsync(relayUrl, "host", accessToken);
+    }
+
+    // A bare host tries wss:// then falls back to ws://; the only way to learn whether a server
+    // speaks TLS is to try. Default ports match Relay/README.md (443 behind Caddy, 7890
+    // direct). An explicit scheme is tried once, literally.
+    private static IReadOnlyList<Uri> ResolveCandidateUris(string relayUrl, string path)
+    {
+        var trimmed = relayUrl.Trim();
+        var explicitScheme = trimmed.IndexOf("://", StringComparison.Ordinal) is var idx && idx > 0
+            ? trimmed[..idx].ToLowerInvariant()
+            : null;
+        if (explicitScheme is not null)
+        {
+            var mapped = explicitScheme switch { "https" => "wss", "http" => "ws", _ => explicitScheme };
+            return [BuildUri($"{mapped}://{trimmed[(idx + 3)..]}", path)];
+        }
+
+        var (host, explicitPort) = SplitHostPort(trimmed);
+        return
+        [
+            BuildUri($"wss://{host}:{explicitPort ?? 443}", path),
+            BuildUri($"ws://{host}:{explicitPort ?? 7890}", path),
+        ];
+    }
+
+    // A probe scheme with no default port: "ws://host" would resolve an unspecified port to 80.
+    private static (string Host, int? Port) SplitHostPort(string hostAndOptionalPort)
+    {
+        if (!Uri.TryCreate($"anomech-probe://{hostAndOptionalPort}", UriKind.Absolute, out var probe))
+            return (hostAndOptionalPort, null);
+        return (probe.Host, probe.Port < 0 ? null : probe.Port);
+    }
+
+    private static Uri BuildUri(string baseUrl, string path) => new($"{baseUrl.TrimEnd('/')}/{path}");
+
+    // Same host/port resolution mapped to https/http; /info lives on the same host:port as the
+    // WS endpoint.
+    private static IReadOnlyList<Uri> ResolveInfoCandidateUris(string relayUrl)
+    {
+        var trimmed = relayUrl.Trim();
+        var explicitScheme = trimmed.IndexOf("://", StringComparison.Ordinal) is var idx && idx > 0
+            ? trimmed[..idx].ToLowerInvariant()
+            : null;
+        if (explicitScheme is not null)
+        {
+            var mapped = explicitScheme switch { "wss" => "https", "ws" => "http", _ => explicitScheme };
+            return [BuildUri($"{mapped}://{trimmed[(idx + 3)..]}", "info")];
+        }
+        var (host, explicitPort) = SplitHostPort(trimmed);
+        return
+        [
+            BuildUri($"https://{host}:{explicitPort ?? 443}", "info"),
+            BuildUri($"http://{host}:{explicitPort ?? 7890}", "info"),
+        ];
+    }
 
     private sealed record RelayInfo(int RelayVersion, string[]? Capabilities, bool RequiresToken);
-    private sealed record RelayGreeting(int RelayVersion, string[]? Capabilities, string? SessionCode, Guid PeerId);
-    private static readonly HttpClient InfoHttpClient = new(new HttpClientHandler { AllowAutoRedirect = false })
-        { Timeout = TimeSpan.FromSeconds(5), MaxResponseContentBufferSize = 64 * 1024 };
 
+    private static readonly HttpClient InfoHttpClient = new() { Timeout = TimeSpan.FromSeconds(5), MaxResponseContentBufferSize = 64 * 1024 };
+
+    // Plain HTTP, so the UI can learn whether a relay needs a token before the user has one.
+    // Null = unreachable or an old relay without /info; callers assume no token needed.
     public static async Task<(int RelayVersion, bool RequiresToken)?> FetchInfoAsync(string relayUrl, CancellationToken ct = default)
     {
-        try
+        foreach (var uri in ResolveInfoCandidateUris(relayUrl))
         {
-            var endpoint = RelayWire.Endpoint(relayUrl, "info");
-            var uri = new UriBuilder(endpoint) { Scheme = endpoint.Scheme == "wss" ? "https" : "http" }.Uri;
-            var json = await InfoHttpClient.GetStringAsync(uri, ct).ConfigureAwait(false);
-            var info = JsonSerializer.Deserialize<RelayInfo>(json, JsonOptions);
-            return info is null ? null : (info.RelayVersion, info.RequiresToken);
+            try
+            {
+                var json = await InfoHttpClient.GetStringAsync(uri, ct).ConfigureAwait(false);
+                var info = JsonSerializer.Deserialize<RelayInfo>(json, JsonOptions);
+                if (info != null) return (info.RelayVersion, info.RequiresToken);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                DiagnosticLog.Info($"[RelayClient] /info fetch from {uri} failed: {e.Message}");
+            }
         }
-        catch (Exception e) when (e is not OperationCanceledException) { return null; }
+        return null;
     }
 
     private async Task<string?> ConnectCoreAsync(string relayUrl, string path, string? accessToken)
     {
-        RelayStats.Reset();
+        var candidates = ResolveCandidateUris(relayUrl, path);
+        // A password must never go over ws://, whether from the fallback or typed explicitly
+        // (the relay enforces the same; see Program.cs IsRequestEncrypted).
+        if (!string.IsNullOrEmpty(accessToken))
+        {
+            var encryptedOnly = candidates.Where(u => u.Scheme == "wss").ToList();
+            if (encryptedOnly.Count == 0)
+            {
+                var reason = "A relay password is set, but this connection isn't encrypted (wss://) -- refusing to send it in plaintext.";
+                DiagnosticLog.Warn($"[RelayClient] {reason}");
+                Disconnected?.Invoke(new InvalidOperationException(reason));
+                return null;
+            }
+            candidates = encryptedOnly;
+        }
+        Exception? lastFailure = null;
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            if (i > 0)
+            {
+                socket.Dispose();
+                socket = new ClientWebSocket();
+            }
+            // Options only apply before ConnectAsync, so they are set per instance.
+            if (!string.IsNullOrEmpty(accessToken))
+                socket.Options.SetRequestHeader("X-AnoMech-Relay-Token", accessToken);
+            var uri = candidates[i];
+            IsEncrypted = uri.Scheme == "wss";
+            try
+            {
+                await socket.ConnectAsync(uri, cts.Token).ConfigureAwait(false);
+                DiagnosticLog.Info($"[RelayClient] Connected to {uri}.");
+                if (i > 0)
+                {
+                    FellBackToUnencrypted = true;
+                    DiagnosticLog.Warn($"[RelayClient] {candidates[0]} wasn't reachable -- fell back to {uri}, unencrypted.");
+                }
+                var assignedCode = await ReadGreetingAsync().ConfigureAwait(false);
+                _ = Task.Run(ReceiveLoopAsync);
+                _ = Task.Run(SendLoopAsync);
+                return assignedCode;
+            }
+            catch (Exception e)
+            {
+                lastFailure = e;
+                DiagnosticLog.Info($"[RelayClient] {uri} failed: {e.Message}"
+                    + (i < candidates.Count - 1 ? " -- trying the next candidate." : ""));
+            }
+        }
+        // Callers are fire-and-forget; without Disconnected a failed handshake would only be
+        // an unobserved Task exception.
+        DiagnosticLog.Warn($"[RelayClient] Connect failed: {lastFailure?.Message}");
+        Disconnected?.Invoke(lastFailure);
+        return null;
+    }
+
+    private sealed record RelayGreeting(int RelayVersion, string[]? Capabilities, string? SessionCode);
+
+    private const int GreetingTimeoutMs = 5000;
+
+    // The greeting is not an MpMessage (the relay stays protocol-agnostic) and is consumed once
+    // before ReceiveLoopAsync starts. An old relay that sends none times out to "no capabilities".
+    private async Task<string?> ReadGreetingAsync()
+    {
+        var buffer = new byte[1024];
+        WebSocketReceiveResult result;
         try
         {
-            var uri = RelayWire.Endpoint(relayUrl, path);
-            IsEncrypted = uri.Scheme == "wss";
-            host = path == "host";
-            if (!IsEncrypted && !string.IsNullOrEmpty(accessToken))
-                throw new RelaySessionRejectedException("Use wss:// to send a relay password.");
-            if (!string.IsNullOrEmpty(accessToken)) socket.Options.SetRequestHeader("X-AnoMech-Relay-Token", accessToken);
-            socket.Options.SetRequestHeader("X-AnoMech-Peer-Secret", peerSecret);
-            socket.Options.SetRequestHeader("X-AnoMech-Protocol", RelayWire.Version.ToString());
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(10));
-            await socket.ConnectAsync(uri, WebSocketHttp, timeout.Token).ConfigureAwait(false);
-            // Only a refusal in the greeting itself is terminal. A slow or dropped greeting is an
-            // ordinary network failure, and a reconnect has to be free to try again.
-            var code = await ReadGreetingAsync().ConfigureAwait(false);
-            ready = true;
-            HasConnected = true;
-            DiagnosticLog.Info($"[RelayClient] Connected to {uri}{(code is null ? "" : $" and assigned session {code}")}.");
-            _ = Task.Run(ReceiveLoopAsync);
-            _ = Task.Run(SendLoopAsync);
-            return code;
+            var receiveTask = socket.ReceiveAsync(buffer, cts.Token);
+            if (await Task.WhenAny(receiveTask, Task.Delay(GreetingTimeoutMs, cts.Token)).ConfigureAwait(false) != receiveTask)
+            {
+                DiagnosticLog.Warn("[RelayClient] No greeting from the relay within timeout -- assuming an old relay with no advertised capabilities.");
+                return null;
+            }
+            result = await receiveTask.ConfigureAwait(false);
         }
         catch (Exception e)
         {
-            if (!cts.IsCancellationRequested)
-                DiagnosticLog.Warn($"[RelayClient] Connect to {relayUrl} failed: {e.GetType().Name}: {e.Message}");
-            socket.Abort();
-            Disconnected?.Invoke(e);
+            DiagnosticLog.Warn($"[RelayClient] Failed to read the relay's greeting: {e.Message} -- assuming an old relay with no advertised capabilities.");
+            return null;
+        }
+
+        // The relay accepts the WS upgrade before validating the session code, so a rejected
+        // /session/<code> or /host arrives here as a close frame. Surfaced distinctly so the
+        // reconnect loop can tell "give up" from "keep retrying".
+        if (result.MessageType == WebSocketMessageType.Close)
+            throw new RelaySessionRejectedException(socket.CloseStatusDescription ?? "the relay closed the connection");
+
+        try
+        {
+            var greeting = JsonSerializer.Deserialize<RelayGreeting>(buffer.AsSpan(0, result.Count), JsonOptions);
+            if (greeting is null) return null;
+            RelayCapabilities = greeting.Capabilities is { } caps ? new HashSet<string>(caps) : new HashSet<string>();
+            DiagnosticLog.Info($"[RelayClient] Relay version {greeting.RelayVersion}, capabilities: [{string.Join(", ", RelayCapabilities)}].");
+            return greeting.SessionCode;
+        }
+        catch (JsonException e)
+        {
+            DiagnosticLog.Warn($"[RelayClient] Failed to read the relay's greeting: {e.Message} -- assuming an old relay with no advertised capabilities.");
             return null;
         }
     }
 
-    private async Task<string?> ReadGreetingAsync()
+    public async Task SendAsync(MpMessage message)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-        timeout.CancelAfter(TimeSpan.FromSeconds(5));
-        using var message = new MemoryStream();
-        var buffer = new byte[1024];
-        WebSocketReceiveResult result;
-        var fragments = 0;
-        do
-        {
-            result = await socket.ReceiveAsync(buffer, timeout.Token).ConfigureAwait(false);
-            if (result.MessageType == WebSocketMessageType.Close)
-                throw new RelaySessionRejectedException(result.CloseStatusDescription ?? "Room closed.");
-            if (result.MessageType != WebSocketMessageType.Text || message.Length + result.Count > 4096 || ++fragments > 16)
-                throw new RelaySessionRejectedException("Invalid relay greeting.");
-            message.Write(buffer, 0, result.Count);
-        } while (!result.EndOfMessage);
-        RelayGreeting? greeting;
-        try { greeting = JsonSerializer.Deserialize<RelayGreeting>(message.ToArray(), JsonOptions); }
-        catch (JsonException) { throw new RelaySessionRejectedException("Invalid relay greeting."); }
-        if (greeting is null) throw new RelaySessionRejectedException("Missing relay greeting.");
-        RelayCapabilities = new HashSet<string>(greeting.Capabilities ?? []);
-        if (greeting.RelayVersion != RelayWire.Version || !SupportsCompression || !SupportsSenderIdentity
-            || !RelayCapabilities.Contains("roomModeration") || greeting.PeerId != RelayWire.PeerId(peerSecret)
-            || (host && string.IsNullOrEmpty(greeting.SessionCode)))
-            throw new RelaySessionRejectedException("This relay doesn't match your AnoMech version -- update the relay.");
-        return greeting.SessionCode;
-    }
-
-    public Task SendAsync(MpMessage message)
-    {
-        byte[] raw;
-        try { raw = JsonSerializer.SerializeToUtf8Bytes(message, JsonOptions); }
-        catch (Exception e)
-        {
-            DiagnosticLog.Warn($"[RelayClient] Couldn't serialize {message.GetType().Name} -- not sent: {e.Message}");
-            return Task.CompletedTask;
-        }
-        return QueueSend(raw, message is WorldSnapshotMessage, compress: true);
-    }
-
-    // Always uncompressed: the relay reads this one body, and it never decompresses.
-    internal Task ModerateAsync(string operation, Guid peerId)
-        => QueueSend(JsonSerializer.SerializeToUtf8Bytes(new { t = RelayWire.ControlType, Operation = operation, PeerId = peerId }), false, compress: false);
-
-    private Task QueueSend(byte[] raw, bool isBulk, bool compress)
-    {
-        if (!IsConnected) return Task.CompletedTask;
-        if (raw.Length > RelayWire.MaxMessageBytes)
-        {
-            DiagnosticLog.Warn($"[RelayClient] Dropped an outgoing message of {raw.Length} bytes, over the {RelayWire.MaxMessageBytes}-byte limit.");
-            return Task.CompletedTask;
-        }
-        var bytes = raw;
-        var type = WebSocketMessageType.Text;
-        if (compress && raw.Length >= 256)
-        {
-            using var output = new MemoryStream();
-            using (var brotli = new BrotliStream(output, CompressionLevel.Fastest, true)) brotli.Write(raw);
-            bytes = output.ToArray();
-            type = WebSocketMessageType.Binary;
-        }
+        if (!IsConnected) return;
+        var jsonBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, JsonOptions));
+        var (bytes, type) = SupportsCompression && jsonBytes.Length >= CompressionThresholdBytes
+            ? (Compress(jsonBytes), WebSocketMessageType.Binary)
+            : (jsonBytes, WebSocketMessageType.Text);
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        lock (sendLock)
-        {
-            if (disposed) return Task.CompletedTask;
-            if (priority.Count + bulk.Count >= 1024 || queuedBytes + bytes.Length > RelayWire.MaxQueuedBytes)
-            {
-                DiagnosticLog.Warn($"[RelayClient] Send queue full ({priority.Count + bulk.Count} messages, {queuedBytes} bytes) -- the connection has stalled; dropping it.");
-                socket.Abort();
-                return Task.CompletedTask;
-            }
-            queuedBytes += bytes.Length;
-            (isBulk ? bulk : priority).Enqueue(new PendingSend(bytes, raw.Length, type, completion));
-            sendSignal.Release();
-        }
-        return completion.Task;
+        var queue = message is WorldSnapshotMessage ? bulkSendQueue : sendQueue;
+        if (!queue.Writer.TryWrite((bytes, type, completion))) return;
+        await completion.Task.ConfigureAwait(false);
     }
+
+    private static byte[] Compress(byte[] data)
+    {
+        using var output = new MemoryStream();
+        using (var brotli = new BrotliStream(output, CompressionLevel.Fastest))
+            brotli.Write(data, 0, data.Length);
+        return output.ToArray();
+    }
+
+    // CopyTo has no output limit, so a compression bomb could exhaust the game's own memory.
+    // ~100x the largest real snapshot.
+    private const int MaxDecompressedBytes = 8 * 1024 * 1024;
+
+    private static byte[] Decompress(byte[] data)
+    {
+        using var input = new MemoryStream(data);
+        using var brotli = new BrotliStream(input, CompressionMode.Decompress);
+        using var output = new MemoryStream();
+        var chunk = new byte[64 * 1024];
+        int read;
+        while ((read = brotli.Read(chunk, 0, chunk.Length)) > 0)
+        {
+            output.Write(chunk, 0, read);
+            if (output.Length > MaxDecompressedBytes)
+                throw new InvalidDataException($"Decompressed message exceeded {MaxDecompressedBytes} bytes.");
+        }
+        return output.ToArray();
+    }
+
+    // ClientWebSocket allows one outstanding send with no timeout; aborting also faults the
+    // receive loop's pending read, which triggers Disconnected/reconnect.
+    private const int SendTimeoutMs = 10_000;
 
     private async Task SendLoopAsync()
     {
         try
         {
-            while (!cts.IsCancellationRequested)
+            while (true)
             {
-                await sendSignal.WaitAsync(cts.Token).ConfigureAwait(false);
-                PendingSend entry;
-                lock (sendLock)
+                if (sendQueue.Reader.TryRead(out var entry) || bulkSendQueue.Reader.TryRead(out entry))
                 {
-                    if (!priority.TryDequeue(out entry!) && !bulk.TryDequeue(out entry!)) continue;
-                    queuedBytes -= entry.Bytes.Length;
+                    await SendOneAsync(entry.Bytes, entry.Type, entry.Completion).ConfigureAwait(false);
+                    continue;
                 }
-                try
-                {
-                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-                    timeout.CancelAfter(TimeSpan.FromSeconds(10));
-                    await socket.SendAsync(entry.Bytes, entry.Type, true, timeout.Token).ConfigureAwait(false);
-                    RelayStats.RecordSent(entry.RawBytes, entry.Bytes.Length);
-                }
-                finally { entry.Completion.TrySetResult(); }
+                var prioritySignal = sendQueue.Reader.WaitToReadAsync(cts.Token).AsTask();
+                var bulkSignal = bulkSendQueue.Reader.WaitToReadAsync(cts.Token).AsTask();
+                await Task.WhenAny(prioritySignal, bulkSignal).ConfigureAwait(false);
+                if (sendQueue.Reader.Completion.IsCompleted && bulkSendQueue.Reader.Completion.IsCompleted) return;
             }
         }
-        catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
+        catch (OperationCanceledException)
+        {
+            // cancelled by Dispose()
+        }
+    }
+
+    private async Task SendOneAsync(byte[] bytes, WebSocketMessageType type, TaskCompletionSource completion)
+    {
+        try
+        {
+            var sendTask = socket.SendAsync(bytes, type, true, cts.Token);
+            if (await Task.WhenAny(sendTask, Task.Delay(SendTimeoutMs, cts.Token)).ConfigureAwait(false) != sendTask)
+            {
+                DiagnosticLog.Warn($"[RelayClient] Send stuck for over {SendTimeoutMs / 1000}s -- treating the connection as dead.");
+                try { socket.Abort(); } catch { /* best-effort */ }
+                completion.SetException(new TimeoutException($"Send timed out after {SendTimeoutMs}ms."));
+                return;
+            }
+            await sendTask.ConfigureAwait(false);
+            RelayStats.RecordSent(bytes.Length);
+            completion.SetResult();
+        }
         catch (Exception e)
         {
-            DiagnosticLog.Warn($"[RelayClient] Send failed ({e.GetType().Name}: {e.Message}) -- dropping the connection.");
-            socket.Abort();
+            DiagnosticLog.Warn($"[RelayClient] Send failed: {e.Message}");
+            completion.SetException(e);
         }
-        finally { CompletePending(); }
     }
 
     private async Task ReceiveLoopAsync()
     {
         var buffer = new byte[64 * 1024];
-        // Per sender: the host hears from every peer at once, and one budget shared between
-        // them let a few peers inside their own relay limits exhaust it together.
-        var budgets = new Dictionary<Guid, TrafficBudget>();
-        long overBudget = 0;
         Exception? failure = null;
         try
         {
             while (socket.State == WebSocketState.Open)
             {
-                using var message = new MemoryStream();
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+                using var ms = new MemoryStream();
                 WebSocketReceiveResult result;
                 var fragments = 0;
                 do
                 {
-                    result = await socket.ReceiveAsync(buffer, timeout.Token).ConfigureAwait(false);
-                    if (fragments == 0) timeout.CancelAfter(TimeSpan.FromSeconds(30));
+                    result = await socket.ReceiveAsync(buffer, cts.Token).ConfigureAwait(false);
                     if (result.MessageType == WebSocketMessageType.Close)
-                        throw new RelaySessionRejectedException(result.CloseStatusDescription ?? "Room closed.");
-                    if (message.Length + result.Count > MaxInboundFrameBytes || ++fragments > 4096)
-                        throw new InvalidDataException("Relay message too large.");
-                    message.Write(buffer, 0, result.Count);
+                    {
+                        DiagnosticLog.Info($"[RelayClient] Received close frame: status={result.CloseStatus}, description=\"{result.CloseStatusDescription}\".");
+                        return;
+                    }
+                    ms.Write(buffer, 0, result.Count);
+                    if (ms.Length > MaxIncomingMessageBytes || ++fragments > MaxIncomingFragments)
+                    {
+                        failure = new InvalidDataException(
+                            $"Relay sent a message over {MaxIncomingMessageBytes / (1024 * 1024)} MB or {MaxIncomingFragments} fragments -- dropping the connection.");
+                        DiagnosticLog.Warn($"[RelayClient] {failure.Message}");
+                        try { socket.Abort(); } catch { /* best-effort */ }
+                        return;
+                    }
                 } while (!result.EndOfMessage);
-                var frame = message.ToArray();
-                // The relay writes every prefix, so a bad one means the relay itself is broken.
-                if (result.MessageType != WebSocketMessageType.Binary || frame.Length < RelayWire.PrefixBytes || frame[0] > 1 || frame[21] > 1)
-                    throw new InvalidDataException("Missing relay identity.");
-                var fromHost = frame[0] == 1;
-                var connectionId = BitConverter.ToUInt32(frame, 1);
-                var sender = new Guid(frame.AsSpan(5, 16));
-                if (connectionId == 0 && sender == Guid.Empty)
-                {
-                    ReadNotice(frame);
-                    continue;
-                }
-                if (connectionId == 0 || sender == Guid.Empty) throw new InvalidDataException("Invalid relay sender.");
-                if (!host && !fromHost) continue;
-                if (!budgets.TryGetValue(sender, out var budget))
-                {
-                    if (budgets.Count >= 64) budgets.Clear();
-                    // The host is trusted with the whole simulation already; a peer's budget is
-                    // what keeps one sender from flooding the host.
-                    budget = fromHost
-                        ? new TrafficBudget(int.MaxValue, long.MaxValue)
-                        : new TrafficBudget(RelayWire.PeerMessagesPerSecond, RelayWire.PeerBytesPerSecond);
-                    budgets[sender] = budget;
-                }
-                byte[] raw;
-                MpMessage? parsed;
+                RelayStats.RecordReceived(ms.Length);
+
+                MpMessage? message;
+                var isFromHost = true;
+                uint senderConnectionId = 0;
                 try
                 {
-                    raw = RelayWire.Decode(frame[RelayWire.PrefixBytes..], frame[21] == 1, budget,
-                                           fromHost ? RelayWire.MaxMessageBytes : RelayWire.MaxPeerMessageBytes);
-                    RelayWire.Validate(raw, fromHost, sender);
-                    parsed = JsonSerializer.Deserialize<MpMessage>(raw, JsonOptions);
+                    var raw = ms.ToArray();
+                    // Relay-written prefix (Relay/Program.cs BroadcastAsync): host-tag byte,
+                    // then the sender's connection id.
+                    if (SupportsSenderIdentity)
+                    {
+                        if (raw.Length < 5) throw new InvalidDataException("frame shorter than the senderIdentity prefix.");
+                        isFromHost = raw[0] == 1;
+                        senderConnectionId = BitConverter.ToUInt32(raw, 1);
+                        raw = raw[5..];
+                    }
+                    if (result.MessageType == WebSocketMessageType.Binary) raw = Decompress(raw);
+                    message = JsonSerializer.Deserialize<MpMessage>(raw, JsonOptions);
                 }
-                catch (TrafficLimitException)
-                {
-                    if (overBudget++ % 1000 == 0)
-                        DiagnosticLog.Warn($"[RelayClient] Dropping traffic over the per-sender budget from {sender} ({overBudget} so far).");
-                    continue;
-                }
+                // One bad message shouldn't take the connection down.
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
-                    MessageRejected?.Invoke(sender, fromHost, e.Message);
+                    DiagnosticLog.Warn($"[RelayClient] Malformed message dropped: {e.Message}");
                     continue;
                 }
-                RelayStats.RecordReceived(raw.Length);
-                if (parsed != null) MessageReceived?.Invoke(parsed, fromHost, connectionId, sender, raw.Length);
+                if (message != null) MessageReceived?.Invoke(message, isFromHost, senderConnectionId);
             }
         }
-        catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
-        catch (RelaySessionRejectedException e)
+        catch (OperationCanceledException)
         {
-            failure = e;
-            DiagnosticLog.Info($"[RelayClient] The relay closed the connection: {e.Message}");
-            socket.Abort();
+            // cancelled by Dispose()
         }
         catch (Exception e)
         {
             failure = e;
-            DiagnosticLog.Warn($"[RelayClient] Receive failed ({e.GetType().Name}: {e.Message}) -- dropping the connection.");
-            socket.Abort();
+            var code = e is WebSocketException wse ? $" (WebSocketErrorCode={wse.WebSocketErrorCode})" : "";
+            DiagnosticLog.Warn($"[RelayClient] Receive loop faulted: {e}{code}");
         }
-        finally { ready = false; Disconnected?.Invoke(failure); }
-    }
-
-    private void ReadNotice(byte[] frame)
-    {
-        try
+        finally
         {
-            var notice = JsonSerializer.Deserialize<RelayNotice>(frame.AsSpan(RelayWire.PrefixBytes), JsonOptions);
-            if (notice?.T == RelayWire.NoticeType && notice.Removed is { Length: > 0 and <= 64 } removed)
-                PeersRemoved?.Invoke(removed);
-        }
-        catch (JsonException e)
-        {
-            DiagnosticLog.Warn($"[RelayClient] Ignored an unreadable relay notice: {e.Message}");
-        }
-    }
-
-    private void CompletePending()
-    {
-        lock (sendLock)
-        {
-            while (priority.TryDequeue(out var entry)) entry.Completion.TrySetResult();
-            while (bulk.TryDequeue(out var entry)) entry.Completion.TrySetResult();
-            queuedBytes = 0;
+            DiagnosticLog.Debug($"[RelayClient] Receive loop exiting -- final socket state {socket.State}.");
+            Disconnected?.Invoke(failure);
         }
     }
 
     public void Dispose()
     {
-        lock (sendLock)
-        {
-            if (disposed) return;
-            disposed = true;
-            ready = false;
-            cts.Cancel();
-            socket.Abort();
-            socket.Dispose();
-            CompletePending();
-        }
+        if (disposed) return;
+        disposed = true;
+        DiagnosticLog.Debug($"[RelayClient] Dispose() -- socket state was {socket.State}.");
+        // Complete before Cancel, so an enqueued SendAsync caller sees a failed send instead
+        // of hanging.
+        sendQueue.Writer.TryComplete();
+        bulkSendQueue.Writer.TryComplete();
+        while (sendQueue.Reader.TryRead(out var pending))
+            pending.Completion.TrySetException(new ObjectDisposedException(nameof(RelayClient)));
+        while (bulkSendQueue.Reader.TryRead(out var pending))
+            pending.Completion.TrySetException(new ObjectDisposedException(nameof(RelayClient)));
+        cts.Cancel();
+        try { socket.Abort(); } catch { /* best-effort */ }
+        socket.Dispose();
+        cts.Dispose();
     }
 }
