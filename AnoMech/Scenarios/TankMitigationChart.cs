@@ -34,11 +34,10 @@ public static class TankShieldEstimate
         => potency / 1000f * EstimatedPercentOfCasterMaxHpPer1000Potency;
 }
 
-// Real abilities only. Party mitigation nobody in the sim casts is not an entry here: it was
-// once a synthetic status id, which the status writer drops for having no Status sheet row, so
-// it never applied. See TankMitigation.BotPartyMitigationFraction.
 public static class TankMitigationChart
 {
+    public const ushort PartyCompensationPlaceholderStatusId = 60002;
+
     public static readonly IReadOnlyList<TankMitigationAbility> All =
     [
         // ---- Shared role actions ----
@@ -230,6 +229,12 @@ public static class TankMitigationChart
         new("Gunmetal Soul", TankJob.Gunbreaker, 1931, 17105, 0.80f, 8f, 600f, Scope: MitigationScope.Party,
             Notes: "Tank LB3. Action 17105 / status 1931 per the Action and Status sheets (2026-09-14)."),
 
+        // ---- Placeholder (bot-only, no real ability) ----
+        // Stand-in for party-wide mitigation on a bot tank until bots cast their own. StatusId
+        // outside any real range; ActionId 0 keeps it un-interceptable.
+        new("Party Compensation (placeholder)", TankJob.Any, PartyCompensationPlaceholderStatusId, 0, 0.20f, 5f, null,
+            Notes: "Placeholder, not a real ability -- see the comment above this entry. Delete once real " +
+                   "party-buff simulation for bots exists."),
     ];
 
     // Native ClassJob row id -> that job's real invuln status id (SimParty.GiveInvuln).

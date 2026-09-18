@@ -322,8 +322,8 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
     // non-zero marker. The actual kit is resolved fresh at apply time (job-dependent).
     private const ushort ThunderSharePlanned = 1;
 
-    // Each job's real self-mit kit, 61-73% alone. Warrior and Dark Knight are the weak end and
-    // only survive a Share hit once TankMitigation's stand-in party mitigation is folded in.
+    // Each job's real self-mit kit (~61-73% alone), plus PartyCompensationPlaceholderStatusId
+    // (20%) standing in for party mitigation bots don't cast yet; Warrior/Dark Knight need it.
     // Job read live off the BattleChara; Paladin's kit if unrecognized.
     private static readonly IReadOnlyDictionary<uint, ushort[]> ThunderShareKit = new Dictionary<uint, ushort[]>
     {
@@ -345,6 +345,8 @@ public sealed class UmadP3BlackHoleScenario : IMultiplayerReplayable
             var duration = TankMitigationChart.All.FirstOrDefault(a => a.StatusId == statusId).Duration ?? 15f;
             target.AddStatus(statusId, duration);
         }
+        // Placeholder; delete together with the chart entry.
+        target.AddStatus(TankMitigationChart.PartyCompensationPlaceholderStatusId, duration: 5f);
     }
 
     // Only the Share case; InvulnsBoth is the Ai's GiveInvuln. Skipped for a peer, whose plan

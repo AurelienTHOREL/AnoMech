@@ -97,10 +97,6 @@ public sealed partial class MultiplayerManager
     // Above the 2s ping/pong cadence.
     private const long ConnectionLivenessMs = 3000;
 
-    // How long after a peer registers a leave is treated as having crossed that rejoin. Sized
-    // for a network race, not for a player who joins and immediately leaves again.
-    private const long RejoinGraceMs = 2000;
-
     private static readonly Lumina.Excel.ExcelSheet<Lumina.Excel.Sheets.Weather> WeatherSheet =
         Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Weather>();
 
@@ -185,7 +181,6 @@ public sealed partial class MultiplayerManager
                     break;
                 }
                 peerLastSeenMs[hello.PeerId] = Environment.TickCount64;
-                peerLastHelloMs[hello.PeerId] = Environment.TickCount64;
                 var build = new PeerBuildInfo(NetGuard.Clean(hello.Version), NetGuard.Clean(hello.Checksum));
                 Session.Names[hello.PeerId] = NetGuard.Clean(hello.DisplayName);
                 Session.Builds[hello.PeerId] = build;
@@ -364,18 +359,8 @@ public sealed partial class MultiplayerManager
                 break;
             }
             case SessionEndedMessage ended when IsHost:
-            {
-                // A leave sent on the way out can still be in flight when the same peer comes
-                // back. It said Hello more recently than this arrived, so it is here, not gone.
-                var sinceHello = Environment.TickCount64 - peerLastHelloMs.GetValueOrDefault(ended.PeerId, long.MinValue / 2);
-                if (sinceHello < RejoinGraceMs)
-                {
-                    DiagnosticLog.Info($"[Multiplayer] Ignoring a leave from {Session.NameOf(ended.PeerId)} -- they registered {sinceHello}ms ago, so it crossed their rejoin.");
-                    break;
-                }
                 RemovePeer(ended.PeerId);
                 break;
-            }
             // Everyone else learns of it from the lobby state broadcast alongside.
             case KickMessage kick when !IsHost && kick.PeerId == MyPeerId:
                 DiagnosticLog.Info($"[Multiplayer] {(kick.Banned ? "Banned" : "Removed")} from the session by the host.");
