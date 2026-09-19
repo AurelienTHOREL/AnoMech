@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.Threading;
@@ -80,6 +81,16 @@ public sealed partial class MultiplayerManager : IDisposable
     private bool peerEntryQueued;
     // An EndMessage that arrived while the entry was queued: acted on once it completes.
     private bool? endAfterPeerEntry;
+    // The host's clocks from the message that started this run, and when it arrived; applied by
+    // SyncClocksToHost once the entry completes (event clock) and the replay exists (Ai clock).
+    private RunClockState? hostClockAtStart;
+    private long hostClockReceivedAt;
+    private bool eventClockSynced;
+    private bool replayClockSynced;
+    // Smoothed frame time, sent in RunClockState; load hitches are left out.
+    private float averageFrameSeconds = 1f / 60f;
+    private const float MaxFrameSampleSeconds = 0.1f;
+    private const float FrameSmoothing = 0.05f;
 
     // ---- Connection-quality tracking (runs in the lobby too) ---------------
     private const float PingIntervalSeconds = 2f;
@@ -688,7 +699,17 @@ public sealed partial class MultiplayerManager : IDisposable
     private void BroadcastLobbyState()
     {
         LobbyChanged?.Invoke();
-        _ = relay?.SendAsync(Session.ToMessage());
+        _ = relay?.SendAsync(LobbyMessage());
+    }
+
+    private LobbyStateMessage LobbyMessage() => Session.ToMessage() with { Clock = HostRunClock() };
+
+    // Null until the host's own run is up, so a broadcast while the start is queued can't hand
+    // out the idle clock.
+    private RunClockState? HostRunClock()
+    {
+        if (!IsHost || !running || Plugin.GameInstance.ActiveScenario is not { } active) return null;
+        return new RunClockState(Plugin.GameInstance.EventClockNow, (active as IMultiplayerReplayable)?.ReplayClockSeconds, averageFrameSeconds);
     }
 
     // ---- Starting the scenario ---------------------------------------------
@@ -717,8 +738,7 @@ public sealed partial class MultiplayerManager : IDisposable
     // ability ids off the seat's job.
     private string? CheckOwnStartReadiness()
     {
-        if (!ZoneSession.IsInInn()) return "not in an inn";
-        if (ZoneSession.IsPlayerBusy()) return "busy";
+        if (ZoneSession.StartBlockedReason() is { } blocked) return blocked;
         if (MyClaimedRole is { } role && role.IsTank())
         {
             var jobId = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId ?? 0;
@@ -878,12 +898,12 @@ public sealed partial class MultiplayerManager : IDisposable
             BroadcastRunEnded(returnedToInn: true);
             return;
         }
-        _ = relay?.SendAsync(Session.ToMessage());
-        _ = relay?.SendAsync(new StartMessage());
+        _ = relay?.SendAsync(LobbyMessage());
+        _ = relay?.SendAsync(new StartMessage(HostRunClock()));
         if (debugBotControlled) GiveLocalPlayerObstacles();
     }
 
-    private void OnStartReceived()
+    private void OnStartReceived(RunClockState? clock)
     {
         // Idempotent: a fresh start delivers both LobbyState(Started) and StartMessage, and a
         // late join replays it from LobbyState.
@@ -940,6 +960,10 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEnteredInstance = false;
         peerEntryQueued = true;
         endAfterPeerEntry = null;
+        hostClockAtStart = clock;
+        hostClockReceivedAt = Stopwatch.GetTimestamp();
+        eventClockSynced = false;
+        replayClockSynced = false;
         StopDebugBotReplay();
         running = true;
         Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles, ClaimedRoleNames(), OnPeerStartResolved);
@@ -970,6 +994,40 @@ public sealed partial class MultiplayerManager : IDisposable
         DiagnosticLog.Info("[Multiplayer] Peer's deferred zone entry completed -- applying snapshots and sending SelfPose.");
         peerEnteredInstance = true;
         TryStartDebugBotReplay();
+    }
+
+    // Starting from zero would leave this run behind the host's by the host's load time plus the
+    // travel time. It also runs ahead of the host by our poses' own delay (the trip back, plus
+    // about a host frame since the host applies poses after that frame's hit checks), so the host
+    // judges our character in step with its own bots. Compared at this frame's event tick, the
+    // instant Events.Elapsed describes.
+    private void SyncClocksToHost()
+    {
+        if (hostClockAtStart is not { } clock) return;
+        if (eventClockSynced && (replayClockSynced || debugShadowStateGeneric == null)) return;
+        var game = Plugin.GameInstance;
+        var eventAtStart = NetGuard.Clamp(clock.EventClock, 0f, 3600f);
+        var oneWay = NetGuard.Clamp(peerStatuses.GetValueOrDefault(MyPeerId)?.LatencyMs ?? 0f, 0f, 4000f) / 2000f;
+        var hostFrame = NetGuard.Clamp(clock.FrameSeconds, 0f, MaxFrameSampleSeconds);
+        var poseLead = oneWay + (hostFrame > 0f ? hostFrame : 1f / 60f);
+        var target = eventAtStart + oneWay + poseLead
+            + (float)Stopwatch.GetElapsedTime(hostClockReceivedAt, game.LastEventTick).TotalSeconds;
+
+        if (!eventClockSynced)
+        {
+            eventClockSynced = true;
+            var advance = target - game.Events.Elapsed;
+            game.Events.Advance(advance);
+            DiagnosticLog.Info($"[Multiplayer] Peer: run clock {(advance > 0f ? $"moved up {advance * 1000f:F0} ms" : "left as is")}: the host's time plus a {poseLead * 1000f:F0} ms lead (Start sent {eventAtStart:F3}s into the host's run, {oneWay * 1000f:F0} ms one-way, {hostFrame * 1000f:F1} ms host frame).");
+        }
+
+        if (replayClockSynced || debugShadowStateGeneric == null) return;
+        replayClockSynced = true;
+        if (clock.ReplayClock is not { } replayAtStart
+            || TryResolveScenario() is not IMultiplayerReplayable replayable) return;
+        var replayTarget = target - (eventAtStart - NetGuard.Clamp(replayAtStart, 0f, 3600f));
+        replayable.AdvanceReplayClockTo(debugShadowStateGeneric, replayTarget);
+        DiagnosticLog.Info($"[Multiplayer] Peer: replay clock brought up to {replayTarget:F3}s, the host's plus the same lead (never moved back).");
     }
 
     // Names for the puppets: every role claimed by someone else, the host's included from a

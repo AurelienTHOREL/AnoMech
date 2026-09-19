@@ -74,8 +74,9 @@ public sealed class MapController : IDisposable
     public bool IsZoneLoaded => zone.IsActive;
     public bool IsInInn() => ZoneSession.IsInInn();
 
-    // Load the target territory client-side. Must be called from the Inn.
-    public void Load(uint territoryId, Vector3 playerPosition, byte levelSync, ushort itemLevelSync) => zone.Enter(territoryId, playerPosition, levelSync, itemLevelSync);
+    // Load the target territory client-side. Must be called from the Inn. False when refused
+    // (see ZoneSession.StartBlockedReason); nothing is loaded then.
+    public bool Load(uint territoryId, Vector3 playerPosition, byte levelSync, ushort itemLevelSync) => zone.Enter(territoryId, playerPosition, levelSync, itemLevelSync);
 
     // Apply weather after a zone load (1-second delayed to let the engine settle).
     public void ApplyWeather(byte weatherId) => zone.ApplyWeather(weatherId);
@@ -198,10 +199,10 @@ public sealed class MapController : IDisposable
 
     // Enter the scenario's target instance if conditions are met.
     // Sets IsInInstance when the zone is already active or the Inn load succeeds.
-    // No-op (IsInInstance stays false) when target is null or the player isn't in the Inn.
-    public void TryLoad(TargetInstance? target, byte levelSync, ushort itemLevelSync)
+    // False (IsInInstance stays false) when target is null or the load was refused.
+    public bool TryLoad(TargetInstance? target, byte levelSync, ushort itemLevelSync)
     {
-        if (target == null) return;
+        if (target == null) return false;
         // A restart re-runs the phase's own InitArena, which re-registers what it suppresses.
         suppressedArenaSlots.Clear();
         // Fresh load only when no zone is active yet (must be in the Inn). When a
@@ -210,8 +211,7 @@ public sealed class MapController : IDisposable
         bool freshLoad = false;
         if (!IsZoneLoaded)
         {
-            if (!IsInInn()) return;
-            Load(target.TerritoryId, target.PlayerPosition, levelSync, itemLevelSync);
+            if (!Load(target.TerritoryId, target.PlayerPosition, levelSync, itemLevelSync)) return false;
             freshLoad = true;
         }
         // Per phase, before the weather write; a phase without a hold clears a previous one's.
@@ -228,6 +228,7 @@ public sealed class MapController : IDisposable
         // freshLoad=false reuses a zone from an earlier run, where a stale SGB never shows up as
         // a retry or failure.
         DiagnosticLog.Info($"[MapController] TryLoad: freshLoad={freshLoad}, territoryId={target.TerritoryId}.");
+        return true;
     }
 
     private void ArmBarrierDrop(Vector3 center, float radius)

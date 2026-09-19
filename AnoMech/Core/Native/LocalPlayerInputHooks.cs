@@ -67,6 +67,7 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
     {
         // GeneralAction 1 is the auto-attack engage/re-engage action -- fires constantly, pure noise here.
         if (type == ActionType.GeneralAction && actionId == 1) return;
+        Core.Map.ZoneSession.NoteActionPressed(type, actionId);
         recentActions.Enqueue((actionId, type));
         while (recentActions.Count > RecentActionsCapacity) recentActions.Dequeue();
         var jobId = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId;

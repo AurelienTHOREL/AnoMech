@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.Threading;
@@ -317,10 +318,13 @@ public sealed partial class MultiplayerManager
         ? peerLastSeenMs.TryGetValue(peerId, out var lastSeen) && Environment.TickCount64 - lastSeen > PeerStaleTimeoutMs
         : peerStatuses.TryGetValue(peerId, out var entry) && entry.SecondsSinceLastSeen * 1000f > PeerStaleTimeoutMs;
 
+    // TickCount64 only moves every ~15.6 ms, too coarse for the clock lead built on this ping.
+    private static long PingClockMs() => Stopwatch.GetElapsedTime(0).Ticks / TimeSpan.TicksPerMillisecond;
+
     private void SendPingAndRefreshStatuses()
     {
         var nowMs = Environment.TickCount64;
-        _ = relay!.SendAsync(new PingMessage(nowMs));
+        _ = relay!.SendAsync(new PingMessage(PingClockMs()));
 
         peerStatuses.Clear();
         foreach (var peerId in Session.ClaimedBy.Values.Distinct())

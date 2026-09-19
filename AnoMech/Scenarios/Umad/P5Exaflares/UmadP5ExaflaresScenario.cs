@@ -287,4 +287,12 @@ public sealed class UmadP5ExaflaresScenario : IMultiplayerReplayable
         shadowState.Timeline.Tick(deltaSeconds);
         shadowState.SpreadTick?.Invoke(deltaSeconds);
     }
+
+    public float? ReplayClockSeconds => (float)(timeline.Elapsed + (wallClock.Elapsed.TotalSeconds - lastWall));
+
+    public void AdvanceReplayClockTo(object shadowStateObj, float seconds)
+    {
+        if (shadowStateObj is UmadP5ExaflaresState shadowState)
+            shadowState.Timeline.Advance(seconds - shadowState.Timeline.Elapsed);
+    }
 }

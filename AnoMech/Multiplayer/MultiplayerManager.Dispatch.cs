@@ -220,7 +220,7 @@ public sealed partial class MultiplayerManager
                 break;
             case PongMessage pong when IsHost:
                 peerLastSeenMs[pong.PeerId] = Environment.TickCount64;
-                peerLatencyMs[pong.PeerId] = Environment.TickCount64 - pong.SentAtMs;
+                peerLatencyMs[pong.PeerId] = PingClockMs() - pong.SentAtMs;
                 break;
             // Mitigation reports put statuses on the host's own characters: seated peers only,
             // chart ids only, durations and shields clamped.
@@ -295,10 +295,10 @@ public sealed partial class MultiplayerManager
                 // A late join or mid-fight rejoin never gets a StartMessage; OnStartReceived is
                 // idempotent, so this is safe on a fresh start too.
                 if (lobby.Started && MyClaimedRole != null)
-                    OnStartReceived();
+                    OnStartReceived(lobby.Clock);
                 break;
-            case StartMessage when !IsHost:
-                OnStartReceived();
+            case StartMessage start when !IsHost:
+                OnStartReceived(start.Clock);
                 break;
             case StartCheckMessage when !IsHost:
             {

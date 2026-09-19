@@ -34,9 +34,15 @@ namespace AnoMech.Scenarios.Umad.P4KefkaSays;
 // That covers every positional mechanic through to the LightOfJudgment enrage
 // (~120s). Mana Charge and Ultima Upsurge are raidwides that need no movement. See
 // UmadP2ForsakenRinonAiHelper for the fuller pattern.
-public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
+public sealed class UmadP4KefkaSaysAi(UmadP4KefkaSaysAi.GazeLayout gazeLayout) : IScenarioAi<UmadP4KefkaSaysState>
 {
-    public string Name => "Kefka Says (WIP)";
+    public enum GazeLayout { CentreLane, SupportsNorthDpsSouth }
+
+    public string Name => gazeLayout switch
+    {
+        GazeLayout.SupportsNorthDpsSouth => "Kefka Says (WIP), gazes: supports N / DPS S",
+        _ => "Kefka Says (WIP)",
+    };
 
     public void Run(UmadP4KefkaSaysState state, SimWorld world)
     {
@@ -50,8 +56,7 @@ public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
 
         ai.Move(57.6f, () => FloodOfNaught(state), jitter: 2.5f, arrivalTime: 62.2f);
         ai.Move(63, () => ResolveElements(state.ElemRoles[0], state.ElemTrue[0]), arrivalTime: 70.5f);
-        ai.Move(72, () => ResolveGaze(state.Wave1, state.Mystery[3]), jitter: 0, arrivalTime: 76f);
-        ai.Move(78.5f, () => ResolveGazeLook(world, state.Mystery[3], state.Wave1True), jitter: 0);
+        ScheduleWave1Gaze(ai, state, world);
 
         // Stray Flames: bait the fire stacked in the middle (scenario locks each bait
         // at ~87.3s), then react to the resolved shape, which lands ~92.4s.
@@ -64,8 +69,7 @@ public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
 
         // Wave2 Death Shriek (~104.4s): a pure positioning+facing solve in the middle,
         // nothing else live. Position the pair, then nudge to set the gaze facing.
-        ai.Move(98f, () => ResolveGazeCentre(state.Wave2), jitter: 0, arrivalTime: 101.5f);
-        ai.Move(102.5f, () => ResolveGazeCentreLook(world, state.Wave2True), jitter: 0);
+        ScheduleWave2Gaze(ai, state, world);
 
         // Water bait (~109.98 lock) + last Mystery Magic (Mystery[4], ~115.6s): bait
         // Stray Spray stacked in the middle, then one final move that clears the water
@@ -109,6 +113,74 @@ public sealed class UmadP4KefkaSaysAi : IScenarioAi<UmadP4KefkaSaysState>
             member.MoveTo(member.Position + new Vector3(0.3f, 0f, 0f), speed: 0.4f);
         });
     }
+
+    private void ScheduleWave1Gaze(AiManager ai, UmadP4KefkaSaysState state, SimWorld world)
+    {
+        if (gazeLayout == GazeLayout.SupportsNorthDpsSouth)
+        {
+            ai.Move(72, () => SupportsNorthAlongThunderEdge(state.Wave1, state.Mystery[3], 0f), jitter: 0, arrivalTime: 76f);
+            ai.Move(78.5f, () => SupportsNorthAlongThunderEdge(state.Wave1, state.Mystery[3], GazeFacingStep(state.Wave1True)), jitter: 0);
+            return;
+        }
+        ai.Move(72, () => ResolveGaze(state.Wave1, state.Mystery[3]), jitter: 0, arrivalTime: 76f);
+        ai.Move(78.5f, () => ResolveGazeLook(world, state.Mystery[3], state.Wave1True), jitter: 0);
+    }
+
+    private void ScheduleWave2Gaze(AiManager ai, UmadP4KefkaSaysState state, SimWorld world)
+    {
+        if (gazeLayout == GazeLayout.SupportsNorthDpsSouth)
+        {
+            ai.Move(98f, () => SupportsNorthAroundBoss(state.Wave2, 0f), jitter: 0, arrivalTime: 101.5f);
+            ai.Move(102.5f, () => SupportsNorthAroundBoss(state.Wave2, GazeFacingStep(state.Wave2True)), jitter: 0);
+            return;
+        }
+        ai.Move(98f, () => ResolveGazeCentre(state.Wave2), jitter: 0, arrivalTime: 101.5f);
+        ai.Move(102.5f, () => ResolveGazeCentreLook(world, state.Wave2True), jitter: 0);
+    }
+
+    private const float ThunderEdgeInset = 1.25f;
+    private const float ThunderEdgeProbe = 2f;
+    private const float GazeHolderAlongEdge = 2.2f;
+    private static readonly float[] NonGazeAlongEdge = [7.5f, 8.7f, 9.9f];
+    private static readonly Vector2[] NorthNonGazeAroundBoss = [new(-1.3f, -7.5f), new(1.3f, -7.5f), new(0f, -9f)];
+    private const float FacingStep = 0.6f;
+
+    private static float GazeFacingStep(bool lookAway) => lookAway ? FacingStep : -FacingStep;
+
+    private static IAiMove SupportsNorthAlongThunderEdge(RoleList wave, MysteryCast thunder, float outwardStep)
+    {
+        var rot = LineBaseRotation * thunder.LightningOrientation;
+        var lane = new Vector2(MathF.Sin(rot), MathF.Cos(rot));
+        var north = lane.Y > 0f ? -lane : lane;
+        var across = new Vector2(north.Y, -north.X);
+        var safeSide = LineClearance(across * ThunderEdgeProbe, thunder) > LineClearance(-across * ThunderEdgeProbe, thunder) ? across : -across;
+        var edge = safeSide * ThunderEdgeInset;
+
+        var coords = new Vector2?[8];
+        coords[(int)wave[0]] = edge + north * (GazeHolderAlongEdge + outwardStep);
+        coords[(int)wave[4]] = edge - north * (GazeHolderAlongEdge + outwardStep);
+        for (var k = 0; k < NonGazeAlongEdge.Length; k++)
+        {
+            coords[(int)wave[1 + k]] = edge + north * (NonGazeAlongEdge[k] + outwardStep);
+            coords[(int)wave[5 + k]] = edge - north * (NonGazeAlongEdge[k] + outwardStep);
+        }
+        return AiMove.Create(coords).NaturalOrder();
+    }
+
+    private static IAiMove SupportsNorthAroundBoss(RoleList wave, float outwardStep)
+    {
+        var coords = new Vector2?[8];
+        coords[(int)wave[0]] = StepFromBoss(new Vector2(0f, -GazePairOffset), outwardStep);
+        coords[(int)wave[4]] = StepFromBoss(new Vector2(0f, GazePairOffset), outwardStep);
+        for (var k = 0; k < NorthNonGazeAroundBoss.Length; k++)
+        {
+            coords[(int)wave[1 + k]] = StepFromBoss(NorthNonGazeAroundBoss[k], outwardStep);
+            coords[(int)wave[5 + k]] = StepFromBoss(-NorthNonGazeAroundBoss[k], outwardStep);
+        }
+        return AiMove.Create(coords).NaturalOrder();
+    }
+
+    private static Vector2 StepFromBoss(Vector2 p, float outwardStep) => p + Vector2.Normalize(p) * outwardStep;
 
     // The two gaze sources (Wave1[0]/Wave1[4]) stack 0.5y apart and opposite, just off
     // centre toward Mystery[3]'s Thunder-safe lane (arena centre itself is on a line

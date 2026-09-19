@@ -82,8 +82,8 @@ public sealed record PeerBuildInfo(string Version, string Checksum)
 }
 
 // Full state, so a client that missed an update self-heals and a late joiner resolves the same
-// scenario/strat/waymark. ScenarioSettings is the display summary; ScenarioSettingsJson is the
-// same overrides for a peer to actually apply (see ScenarioSettingsSync).
+// scenario/strat/waymark and clock. ScenarioSettings is the display summary; ScenarioSettingsJson
+// is the same overrides for a peer to actually apply (see ScenarioSettingsSync).
 public sealed record LobbyStateMessage(
     Guid HostId,
     Dictionary<PartyRole, Guid> ClaimedBy,
@@ -95,7 +95,14 @@ public sealed record LobbyStateMessage(
     int SelectedWaymark,
     Dictionary<string, ushort> TankBusterPlan,
     List<string>? ScenarioSettings = null,
-    string? ScenarioSettingsJson = null) : MpMessage, IHostOnlyMessage;
+    string? ScenarioSettingsJson = null,
+    RunClockState? Clock = null) : MpMessage, IHostOnlyMessage;
+
+// The host's run clocks when the message left: its event clock, and its Ai's own clock when the
+// scenario runs one (IMultiplayerReplayable.ReplayClockSeconds). A peer starts its run from them
+// instead of from zero, which would leave it behind by the host's load time plus the travel time.
+// FrameSeconds is the host's average frame, part of the lead the peer takes on top.
+public sealed record RunClockState(float EventClock, float? ReplayClock, float FrameSeconds);
 
 public sealed record ClaimRoleMessage(Guid PeerId, PartyRole Role) : MpMessage;
 public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage;
@@ -104,8 +111,7 @@ public sealed record ReleaseRoleMessage(Guid PeerId) : MpMessage;
 // a fresh Hello included, until unbanned.
 public sealed record KickMessage(Guid PeerId, bool Banned = false) : MpMessage, IHostOnlyMessage;
 
-// No clock sync: host-authoritative resolution tolerates start skew.
-public sealed record StartMessage : MpMessage, IHostOnlyMessage;
+public sealed record StartMessage(RunClockState? Clock = null) : MpMessage, IHostOnlyMessage;
 
 // Sent before StartMessage; every claimed peer answers, so "can't start" reaches the host
 // instead of RunScenarioInternal silently no-op'ing.

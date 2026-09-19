@@ -265,8 +265,8 @@ public unsafe class MainWindow : Window, IDisposable
         ImGui.SameLine();
         DrawResetLeaveButtons();
 
-        var inInn = ZoneSession.IsInInn();
-        var envReady = inInn && !ZoneSession.IsPlayerBusy();
+        var blocked = ZoneSession.StartBlockedReason();
+        var envReady = blocked == null;
         var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
         if (_selectedScenario.SupportsSolo)
         {
@@ -277,9 +277,7 @@ public unsafe class MainWindow : Window, IDisposable
             {
                 ImGui.SetTooltip(mpBlocked
                     ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
-                    : !inInn
-                        ? "Scenarios can only be started from an inn."
-                        : "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.).");
+                    : $"Cannot start: {blocked}.");
             }
         }
 
@@ -352,14 +350,12 @@ public unsafe class MainWindow : Window, IDisposable
     internal void DrawSoloStartButton()
     {
         if (_selectedScenario == null) return;
-        var inInn = ZoneSession.IsInInn();
-        var busy = ZoneSession.IsPlayerBusy();
-        var envReady = inInn && !busy;
+        var blocked = ZoneSession.StartBlockedReason();
         var hasStrat = HasStartableStrat();
         // The solo path bypasses MultiplayerManager: a host would run the fight without a
         // StartMessage, a peer would start a second independent simulation.
         var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
-        var canStart = envReady && hasStrat && !mpBlocked;
+        var canStart = blocked == null && hasStrat && !mpBlocked;
         ImGui.BeginDisabled(!canStart);
         if (ImGui.Button("Start")) plugin.Game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
         ImGui.EndDisabled();
@@ -367,11 +363,9 @@ public unsafe class MainWindow : Window, IDisposable
         {
             ImGui.SetTooltip(mpBlocked
                 ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
-                : !inInn
-                    ? "Scenarios can only be started from an inn."
-                    : busy
-                        ? "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.)."
-                        : "No strat available for this region yet.");
+                : blocked != null
+                    ? $"Cannot start: {blocked}."
+                    : "No strat available for this region yet.");
         }
     }
 

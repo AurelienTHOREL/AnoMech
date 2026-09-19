@@ -114,6 +114,7 @@ public sealed class Plugin : IDalamudPlugin
             PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
             PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
             ClientState.TerritoryChanged += OnTerritoryChanged;
+            ClientState.Logout += OnLogout;
             DutyState.DutyStarted += OnDutyStarted;
             DutyState.DutyWiped += OnDutyWiped;
             DutyState.DutyCompleted += OnDutyCompleted;
@@ -163,6 +164,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
         ClientState.TerritoryChanged -= OnTerritoryChanged;
+        ClientState.Logout -= OnLogout;
         DutyState.DutyStarted -= OnDutyStarted;
         DutyState.DutyWiped -= OnDutyWiped;
         DutyState.DutyCompleted -= OnDutyCompleted;
@@ -201,6 +203,9 @@ public sealed class Plugin : IDalamudPlugin
         // full-precision delta the game ticks its own animations with.
         var fw = CSFramework.Instance();
         if (fw == null) return;
+        // First and on its own: the guard must run when Game.Tick is paused or throwing.
+        try { ZoneSession.TickGuard(); }
+        catch (Exception e) { Core.DiagnosticLog.Warn($"[Plugin] ZoneSession.TickGuard threw: {e}"); }
         // Both ticks reach code driven by whatever a relay sent; neither may take the frame
         // pump down.
         try { Game.Tick(fw->FrameDeltaTime); }
@@ -211,6 +216,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnTerritoryChanged(uint territory)
     {
+        ZoneSession.NoteTerritoryChanged(territory);
         var row = DataManager.GetExcelSheet<TerritoryType>()?.GetRowOrDefault(territory);
         var isInn = row?.TerritoryIntendedUse.RowId == 2; // TerritoryIntendedUse.Inn
         if (!isInn)
@@ -227,6 +233,8 @@ public sealed class Plugin : IDalamudPlugin
         if (Config.OpenSimMenuOnInn)
             MainWindow.IsOpen = true;
     }
+
+    private void OnLogout(int type, int code) => ZoneSession.NoteLogout(type, code);
 
     private void OnDutyStarted(IDutyStateEventArgs args)
         => LogManager.LogCombatStart(args.TerritoryType.RowId);
@@ -268,14 +276,9 @@ public sealed class Plugin : IDalamudPlugin
 
     private void StartSelectedScenario(bool solo)
     {
-        if (!ZoneSession.IsInInn())
+        if (ZoneSession.StartBlockedReason() is { } blocked)
         {
-            Log.Warning("Scenarios can only be started from an inn.");
-            return;
-        }
-        if (ZoneSession.IsPlayerBusy())
-        {
-            Log.Warning("Cannot start a scenario while you are busy (cutscene, NPC event, crafting, etc.).");
+            Log.Warning($"Cannot start a scenario: {blocked}.");
             return;
         }
         if (MainWindow.SelectedScenario is not { } scenario)

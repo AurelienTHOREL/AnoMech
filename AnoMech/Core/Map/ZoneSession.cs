@@ -26,8 +26,9 @@ namespace AnoMech.Core.Map;
 
 // Client-side zone loading and packet firewall. Ported from Hyperborea (Memory.cs
 // + Utils.cs). Must be in the Inn before calling Enter(); Leave() reloads the inn.
-// All public methods must be called from the framework thread.
-public sealed unsafe class ZoneSession : IDisposable
+// All public methods must be called from the framework thread. The start gate and the
+// stay's integrity watch are in ZoneSession.Guard.cs.
+public sealed unsafe partial class ZoneSession : IDisposable
 {
     private class SessionSave
     {
@@ -102,6 +103,7 @@ public sealed unsafe class ZoneSession : IDisposable
 
         Plugin.AddonLifecycle.RegisterListener(AddonEvent.PostSetup, "Social", OnSocialPostSetup);
 
+        Current = this;
         Plugin.Log.Information("[ZoneSession] Initialized.");
     }
 
@@ -114,9 +116,9 @@ public sealed unsafe class ZoneSession : IDisposable
         return row?.TerritoryIntendedUse.RowId == InnIntendedUse;
     }
 
-    // Any state in which the local player can't freely act. Used as a second
-    // gate before starting a scenario from an inn so we don't kick off mid-
-    // cutscene, mid-NPC-event, mid-craft, mid-zone, etc.
+    // Any state in which the local player can't freely act, or the server is about to act on
+    // (a cast, a queue, a pending world visit): a start there lands while the firewall hides
+    // the outcome.
     public static bool IsPlayerBusy()
     {
         var c = Plugin.Condition;
@@ -133,24 +135,69 @@ public sealed unsafe class ZoneSession : IDisposable
             || c[ConditionFlag.Crafting]
             || c[ConditionFlag.ExecutingCraftingAction]
             || c[ConditionFlag.PreparingToCraft]
+            || c[ConditionFlag.MeldingMateria]
             || c[ConditionFlag.Gathering]
             || c[ConditionFlag.ExecutingGatheringAction]
             || c[ConditionFlag.Fishing]
             || c[ConditionFlag.TradeOpen]
             || c[ConditionFlag.BetweenAreas]
+            || c[ConditionFlag.BetweenAreas51]
             || c[ConditionFlag.LoggingOut]
-            || c[ConditionFlag.WaitingForDutyFinder]
-            || c[ConditionFlag.InDutyQueue]
+            || c[ConditionFlag.SystemError]
+            || c[ConditionFlag.Casting]
+            || c[ConditionFlag.Casting87]
+            || c[ConditionFlag.Unconscious]
             || c[ConditionFlag.InCombat]
+            || c[ConditionFlag.BoundByDuty]
+            || c[ConditionFlag.BoundByDuty56]
+            || c[ConditionFlag.BoundByDuty95]
+            || c[ConditionFlag.WaitingForDutyFinder]
+            || c[ConditionFlag.WaitingForDuty]
+            || c[ConditionFlag.InDutyQueue]
+            || c[ConditionFlag.DutyRecorderPlayback]
+            || c[ConditionFlag.InDeepDungeon]
+            || c[ConditionFlag.ReadyingVisitOtherWorld]
+            || c[ConditionFlag.WaitingToVisitOtherWorld]
+            || c[ConditionFlag.RegisteringForRaceOrMatch]
+            || c[ConditionFlag.WaitingForRaceOrMatch]
+            || c[ConditionFlag.RegisteringForTripleTriadMatch]
+            || c[ConditionFlag.WaitingForTripleTriadMatch]
+            || c[ConditionFlag.WaitingForTripleTriadMatch83]
+            || c[ConditionFlag.ChocoboRacing]
+            || c[ConditionFlag.PlayingMiniGame]
+            || c[ConditionFlag.PlayingLordOfVerminion]
+            || c[ConditionFlag.ParticipatingInCustomMatch]
+            || c[ConditionFlag.Performing]
             || c[ConditionFlag.Mounted]
+            || c[ConditionFlag.Mounting]
+            || c[ConditionFlag.Mounting71]
+            || c[ConditionFlag.MountOrOrnamentTransition]
+            || c[ConditionFlag.MountImmobile]
+            || c[ConditionFlag.RidingPillion]
+            || c[ConditionFlag.InFlight]
+            || c[ConditionFlag.UsingChocoboTaxi]
+            || c[ConditionFlag.OperatingSiegeMachine]
+            || c[ConditionFlag.PilotingMech]
+            || c[ConditionFlag.CarryingObject]
+            || c[ConditionFlag.CarryingItem]
+            || c[ConditionFlag.BeingMoved]
+            || c[ConditionFlag.Swimming]
+            || c[ConditionFlag.Diving]
             || c[ConditionFlag.Jumping]
+            || c[ConditionFlag.Jumping61]
             || c[ConditionFlag.Occupied];
     }
 
-    // Load the target territory, teleport player to playerSpawn, enable firewall.
-    // Firewall is enabled before the zone load (matching Hyperborea's sequence).
-    public void Enter(uint territoryId, Vector3 playerSpawn, byte levelSync, ushort itemLevelSync)
+    // Load the target territory, teleport player to playerSpawn, enable firewall. Firewall is
+    // enabled before the zone load (matching Hyperborea's sequence). False when the start is
+    // refused or the firewall didn't arm; nothing is loaded then.
+    public bool Enter(uint territoryId, Vector3 playerSpawn, byte levelSync, ushort itemLevelSync)
     {
+        if (StartBlockedReason() is { } blocked)
+        {
+            AnoMech.Core.DiagnosticLog.Warn($"[ZoneGuard] Enter refused: {blocked}.");
+            return false;
+        }
         var localPlayer = Plugin.ObjectTable.LocalPlayer!;
 
         sessionSave.TerritoryId = Plugin.ClientState.TerritoryType;
@@ -164,9 +211,18 @@ public sealed unsafe class ZoneSession : IDisposable
         sessionSave.Attributes.Clear();
 
         EnableFirewall();
+        if (!FirewallArmed(out var why))
+        {
+            DisableFirewall();
+            AnoMech.Core.DiagnosticLog.Warn($"[ZoneGuard] Enter refused: {why}.");
+            return false;
+        }
+        CaptureInnState();
         LoadZoneInternal(territoryId, false, playerSpawn);
         IsActive = true;
+        ArmGuard(territoryId);
         Plugin.Log.Information($"[ZoneSession] Entered territory {territoryId}.");
+        return true;
     }
 
     // Immediately set the active weather. Must be called on the framework thread. weatherId is
@@ -351,6 +407,10 @@ public sealed unsafe class ZoneSession : IDisposable
     // Reload the saved inn territory and restore position; disable firewall.
     public void Revert(bool dispose)
     {
+        // A tripped stay never reaches the inn reload: the client would be shown a zone the
+        // server doesn't have it in.
+        if (tripReason is { } tripped) Die(tripped);
+
         // We need to wait before calling DisableFirewall(), so we'll set the Occupied condition to be sure the Player doesn't do anything in the meantime.
         var condition = Conditions.Instance();
         condition->Occupied = true;
@@ -378,6 +438,7 @@ public sealed unsafe class ZoneSession : IDisposable
 
         IsActive = false;
         Plugin.Log.Information("[ZoneSession] Reverted to inn.");
+        LogStaySummary();
 
         // If this is getting called on Dispose(), then these Tasks will not be properly executed, so we'll gate them to be safe
         if (!dispose)
@@ -385,13 +446,16 @@ public sealed unsafe class ZoneSession : IDisposable
             // If this isn't delayed, a Packet will be sent to the server!!!
             var savedPosition = sessionSave.Position;
             var savedRotation = sessionSave.Rotation;
+            var stay = stayId;
             ThreadingTask.Delay(1000).ContinueWith(_ => Plugin.Framework.Run(() =>
             {
                 // The Player could do something like jump, so to be extremely sure we are where we are supposed to, we set the Position and Rotation again.
                 SetLocalPlayerPosition(savedPosition, savedRotation);
                 condition->Occupied = false;
 
-                DisableFirewall();
+                // A later stay owns the firewall now (Enter refuses while this is pending, so
+                // only a bypass gets here).
+                if (stay == stayId) LiftFirewallOrDie("after the inn reload");
             }));
 
             // Resync the real party HUD once the inn reload has settled. A bare
@@ -406,7 +470,7 @@ public sealed unsafe class ZoneSession : IDisposable
             // This skips all safety delays, so if possible, don't disable the plugin while being in a Scenario
             SetLocalPlayerPosition(sessionSave.Position, sessionSave.Rotation);
             condition->Occupied = false;
-            DisableFirewall();
+            LiftFirewallOrDie("on plugin unload");
             Plugin.Framework.Run(OpenSocialForPartyResync);
         }
     }
@@ -450,7 +514,8 @@ public sealed unsafe class ZoneSession : IDisposable
 
     public void HoldSendFirewall(bool hold)
     {
-        if (IsActive || hold == sendHoldActive) return;
+        // guardArmed covers the second between a Revert and the lift, which the guard owns.
+        if (IsActive || guardArmed || hold == sendHoldActive) return;
         sendHoldActive = hold;
         if (hold) sendPacketHook.Enable();
         else sendPacketHook.Disable();
@@ -958,8 +1023,10 @@ public sealed unsafe class ZoneSession : IDisposable
         if (a2 == IntPtr.Zero) return defaultReturn;
         try
         {
-            if (*(ushort*)a2 == heartbeatOpcode)
+            var opcode = *(ushort*)a2;
+            if (opcode == heartbeatOpcode)
                 return sendPacketHook.Original(a1, a2, a3, a4);
+            heldOutbound[opcode] = heldOutbound.GetValueOrDefault(opcode) + 1;
         }
         catch (Exception e)
         {
@@ -989,8 +1056,10 @@ public sealed unsafe class ZoneSession : IDisposable
 #else
             const bool safeMode = true;
 #endif
-            if (!safeMode || Plugin.Config.ZoneDownOpcodes.Contains(*(ushort*)(a3 + 2)))
+            if (!safeMode || Plugin.Config.ZoneDownOpcodes.Contains(incomingOpcode))
                 receivePacketHook.Original(a1, a2, a3);
+            else
+                heldInbound++;
         }
         catch (Exception e)
         {
@@ -1036,9 +1105,12 @@ public sealed unsafe class ZoneSession : IDisposable
         }
         else
         {
+            // The 1s lift after a Revert may still be pending; its checks run here instead.
+            if (guardArmed) LiftFirewallOrDie("on plugin unload");
             DisableFirewall(); // To be sure the Hooks are disabled before calling Dispose
         }
 
+        if (Current == this) Current = null;
         sendPacketHook.Dispose();
         receivePacketHook.Dispose();
     }

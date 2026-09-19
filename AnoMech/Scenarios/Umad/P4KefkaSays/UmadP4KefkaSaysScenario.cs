@@ -31,7 +31,8 @@ public sealed class UmadP4KefkaSaysScenario : IMultiplayerReplayable
 
     public IReadOnlyList<IScenarioAi> AiStrats =>
     [
-        new UmadP4KefkaSaysAi(),
+        new UmadP4KefkaSaysAi(UmadP4KefkaSaysAi.GazeLayout.CentreLane),
+        new UmadP4KefkaSaysAi(UmadP4KefkaSaysAi.GazeLayout.SupportsNorthDpsSouth),
     ];
 
     private UmadP4KefkaSaysState state = null!;

@@ -39,7 +39,7 @@ public sealed partial class MultiplayerManager
     private void BroadcastRunEnded(bool returnedToInn, string? reason = null)
     {
         EndHostRunLocally();
-        _ = relay?.SendAsync(Session.ToMessage());
+        _ = relay?.SendAsync(LobbyMessage());
         DiagnosticLog.Info($"[Multiplayer] Run ended (ReturnedToInn={returnedToInn}) -- broadcasting EndMessage.");
         _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn, Reason: reason));
         if (reason != null) AnnounceRunEnded(reason);
@@ -118,6 +118,8 @@ public sealed partial class MultiplayerManager
 
     public void Tick(float deltaSeconds)
     {
+        if (deltaSeconds is > 0f and < MaxFrameSampleSeconds)
+            averageFrameSeconds += (deltaSeconds - averageFrameSeconds) * FrameSmoothing;
         SubscribeMapEventsOnce();
         DrainPendingMessages();
 
@@ -163,7 +165,7 @@ public sealed partial class MultiplayerManager
                     endResendTimer = 0f;
                     endResendsRemaining--;
                     DiagnosticLog.Info($"[Multiplayer] Re-broadcasting EndMessage (ReturnedToInn={returnedToInn}), {endResendsRemaining} retries left.");
-                    _ = relay?.SendAsync(Session.ToMessage());
+                    _ = relay?.SendAsync(LobbyMessage());
                     _ = relay?.SendAsync(new EndMessage(ReturnedToInn: returnedToInn, Reason: pendingEndResendReason));
                     if (endResendsRemaining <= 0) pendingEndResendReturnedToInn = null;
                 }
@@ -230,6 +232,7 @@ public sealed partial class MultiplayerManager
             if (debugShadowStateGeneric != null && deltaSeconds > 0f
                 && TryResolveScenario() is IMultiplayerReplayable replayable)
                 replayable.TickReplay(debugShadowStateGeneric, deltaSeconds);
+            SyncClocksToHost();
             SendSelfPose();
             SendSelfMitigationIfChanged();
         }

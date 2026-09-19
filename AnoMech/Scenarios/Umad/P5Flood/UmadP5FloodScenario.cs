@@ -238,6 +238,14 @@ public sealed class UmadP5FloodScenario : IMultiplayerReplayable
         shadowState.Timeline.Tick(deltaSeconds);
     }
 
+    public float? ReplayClockSeconds => (float)(timeline.Elapsed + (wallClock.Elapsed.TotalSeconds - lastWall));
+
+    public void AdvanceReplayClockTo(object shadowStateObj, float seconds)
+    {
+        if (shadowStateObj is UmadP5FloodState shadowState)
+            shadowState.Timeline.Advance(seconds - shadowState.Timeline.Elapsed);
+    }
+
     // pair1 = points[0]&points[2] (cross-paired outer/inner), pair2 = points[1]&points[3].
     // Reversed walks the march array backwards, which naturally starts pairing from the other end.
     private static ((Vector3, Vector3) pair1, (Vector3, Vector3) pair2) MarchPairs(Vector3[] points, bool reversed)

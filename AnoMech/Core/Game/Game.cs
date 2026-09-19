@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
@@ -68,6 +69,14 @@ public sealed class Game : IDisposable
 
     private IScenario? activeScenario;
     private float scenarioElapsed;
+    private long lastEventTick;
+    public long LastEventTick => lastEventTick;
+
+    // Events only advances once per frame, by that frame's whole delta; this is its value between
+    // frames, which a peer's clock is lined up against.
+    public float EventClockNow => Paused || lastEventTick == 0
+        ? Events.Elapsed
+        : Events.Elapsed + (float)Stopwatch.GetElapsedTime(lastEventTick).TotalSeconds * EventTimeScale;
     // The phase of the last run in the loaded zone, host and peer alike (activeScenario is
     // host-only and cleared by a Reset).
     private IPhase? lastPhase;
@@ -187,13 +196,14 @@ public sealed class Game : IDisposable
         var solo = selectedAi is null;
         var phase = scenario.Phase;
         var zone = phase.Zone;
-        // Hard gate: scenarios are only ever run from an inn. Everything
-        // downstream (CharacterManager registration, zone load, doppel spawn)
-        // assumes that invariant.
-        if (!ZoneSession.IsInInn())
+        // Hard gate: scenarios only ever run from an inn, and only from a state the server
+        // isn't about to act on. Everything downstream (CharacterManager registration, zone
+        // load, doppel spawn) assumes the inn; the deferred start may land in a state the click
+        // didn't see, and ZoneSession.Enter asks once more before the firewall goes up.
+        if (ZoneSession.StartBlockedReason() is { } blocked)
         {
-            Plugin.Log.Warning("Game: scenarios can only run from an inn; aborting.");
-            return "not in an inn";
+            Plugin.Log.Warning($"Game: refusing to start {scenario.Name} -- {blocked}.");
+            return blocked;
         }
 
         // Per-player settings the fight can't produce together. Empty for a peer and for solo,
@@ -226,10 +236,14 @@ public sealed class Game : IDisposable
         var freshLoad = !World.Map.IsZoneLoaded;
         if (!freshLoad && lastPhase != phase) World.Map.RestoreSuppressedArenaSlots();
 
+        if (!World.Map.TryLoad(
+                new TargetInstance(zone.TerritoryId, zone.Origin, zone.Origin + PlayerSpawnLocal, phase.Weather, phase.FogHold),
+                zone.Level, zone.ItemLevel))
+        {
+            Plugin.Log.Warning($"Game: {scenario.Name} did not enter its zone; aborting.");
+            return "the zone was not entered (see the log)";
+        }
         World.HideObject(ExitObjectBaseId);
-        World.Map.TryLoad(
-            new TargetInstance(zone.TerritoryId, zone.Origin, zone.Origin + PlayerSpawnLocal, phase.Weather, phase.FogHold),
-            zone.Level, zone.ItemLevel);
         lastPhase = phase;
         World.ScenarioOrigin = zone.Origin;
         World.Map.ArmColliderDrops(zone.ColliderRemovalPoints.Select(World.Coordinates.ToGlobal));
@@ -324,6 +338,7 @@ public sealed class Game : IDisposable
     public void Tick(float deltaSeconds)
     {
         if (Paused) return;
+        lastEventTick = Stopwatch.GetTimestamp();
         Events.Tick(deltaSeconds * EventTimeScale);
         World.Tick(deltaSeconds);
         // A peer's own tick would fight OnRolesSnapshotReceived's HP writes.

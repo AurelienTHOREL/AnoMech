@@ -55,6 +55,32 @@ internal static class DiagnosticLog
     public static void LogSnapshot(string label, string content)
         => Add($"=== {label} ==={Environment.NewLine}{content}{Environment.NewLine}=== end {label} ===");
 
+    // For a deliberate process kill (ZoneSession's guard): the message and the run's last lines
+    // are written synchronously to their own file, and the async writer is drained, since
+    // Environment.FailFast runs no finalizers. Returns that file's path, or null.
+    public static string? Fatal(string message)
+    {
+        Plugin.Log.Fatal(message);
+        ForcePersist = true;
+        Add(message);
+        string? notePath = null;
+        try
+        {
+            if (logDir != null)
+            {
+                notePath = Path.Combine(logDir, $"AnoMech-FATAL-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+                var header = $"# AnoMech build={PluginBuildInfo.Checksum} fatal at {DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+                File.WriteAllLines(notePath, Snapshot().TakeLast(400).Prepend(message).Prepend(header));
+            }
+        }
+        catch
+        {
+            // Best-effort: the Dalamud log has the message either way.
+        }
+        Shutdown();
+        return notePath;
+    }
+
     private static void Add(string message)
     {
         var line = $"{DateTime.Now:HH:mm:ss.fff} {message}";

@@ -13,6 +13,27 @@ public sealed class EventScheduler
     private readonly List<Entry> entries = new();
     private float elapsed;
 
+    public float Elapsed => elapsed;
+
+    // Moves the clock without firing; whatever falls due fires on the next Tick.
+    public void Advance(float seconds) => elapsed += MathF.Max(0f, seconds);
+
+    // Add offsets inside `schedule` count from t=0, not now: an Ai started late still means its
+    // times as run times. Entries already past fire on the next Tick.
+    public T FromRunStart<T>(Func<T> schedule)
+    {
+        var now = elapsed;
+        elapsed = 0f;
+        try
+        {
+            return schedule();
+        }
+        finally
+        {
+            elapsed = now;
+        }
+    }
+
     public void Add(float offset, Action action)
     {
         var time = elapsed + MathF.Max(0f, offset);

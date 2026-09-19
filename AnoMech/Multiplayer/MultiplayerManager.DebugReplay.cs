@@ -39,7 +39,7 @@ public sealed partial class MultiplayerManager
             return;
         }
         DiagnosticLog.Info($"[Multiplayer] Peer: starting debug-bot replay for {myRole}.");
-        var shadowState = replayable.StartReplay(msg, Session.SelectedAi, myRole, world);
+        var shadowState = world.Events.FromRunStart(() => replayable.StartReplay(msg, Session.SelectedAi, myRole, world));
         if (shadowState != null)
         {
             debugShadowStateGeneric = shadowState;
