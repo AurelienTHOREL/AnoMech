@@ -124,7 +124,7 @@ public sealed record SelfPoseMessage(Guid PeerId, float X, float Y, float Z, flo
 // SimCast rather than a sheet, which wouldn't match a scenario's synthetic helper actions. The
 // Seq counters are the edge triggers: an instant cast never sets IsCasting. Targets resolve by
 // NetId/role since a GameObjectId means nothing across clients.
-public sealed record EnemyStatusState(ushort StatusId, ushort Stacks, float RemainingTime);
+public sealed record EnemyStatusState(ushort StatusId, ushort Stacks, float RemainingTime, int Instance = 0);
 
 // One fire-and-forget SimCharacter.AddVfx since the last drain; the path is checked against
 // SimAssets on receipt. Persistent VFX are not carried: their removal has no replication path.

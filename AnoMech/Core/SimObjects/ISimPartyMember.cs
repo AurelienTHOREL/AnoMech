@@ -58,6 +58,10 @@ public interface ISimPartyMember : ISimObject, IPositioned
 // ISimPartyMember concept for party members and to plain presence otherwise.
 public static class SimCharacterDeathExtensions
 {
+    // Public so SimAssets harvests them: the KO pose rides on RoleState to peers.
+    public const ushort KoTimelineId = 72;
+    public const ushort KoLoopTimelineId = 73;
+
     // A party member is alive while not KO'd; any other character is alive while
     // present. Null is not alive.
     public static bool IsAlive(this SimCharacter? c)
@@ -79,7 +83,7 @@ public static class SimCharacterDeathExtensions
 
         public void PlayKoActionTimeline()
         {
-            c.PlayActionTimeline(72, 73);
+            c.PlayActionTimeline(KoTimelineId, KoLoopTimelineId);
         }
     }
 }

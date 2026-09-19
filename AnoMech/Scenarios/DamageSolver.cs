@@ -152,7 +152,7 @@ public class DamageSolver
                 return true;
             }
             var role = ((ISimPartyMember)target).Role;
-            if (TankMitigation.ApplyTankBusterDamage(party, role, tankBusterRawDamage, tankBusterSource)) return false;
+            if (TankMitigation.ApplyTankBusterDamage(party, role, tankBusterRawDamage, tankBusterSource, standInPartyMitigation: true)) return false;
             if (killTarget) target.Die($"Died to {ActionLookup.Name(actionId)} (tank buster, not enough mitigation)");
             return true;
         }

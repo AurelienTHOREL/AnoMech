@@ -1,3 +1,4 @@
+using AnoMech.Network;
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Linq;
@@ -12,9 +13,10 @@ using System.Threading.Channels;
 
 namespace AnoMech.Relay;
 
-// Dumb session-scoped broadcast relay. Knows nothing about AnoMech's message protocol --
-// forwards whatever frame one socket sends, verbatim and with its original type, to every
-// other socket in the same session code. All app-level meaning lives in the plugin.
+// Session-scoped relay. Authenticates each connection's identity, tags every forwarded frame
+// with it, routes peer traffic only to the host, and enforces the host's kicks and bans. Message
+// bodies pass through unread and are never decompressed; all app-level meaning lives in the
+// plugin, which also does every check on message content.
 //
 // Exists because a Dalamud client is firewalled off from FFXIV's own server traffic during
 // a scenario (see ZoneSession), and most players sit behind NAT, so direct P2P isn't viable.
@@ -113,10 +115,10 @@ internal static class Program
     private static string ClientIpHeader = "X-Forwarded-For";
 
     // Sent once right after a socket joins so a client can detect a narrower relay before
-    // relying on a behavior it doesn't have. Not an MpMessage -- the relay stays
-    // protocol-agnostic.
-    private const int RelayVersion = 1;
-    private static readonly string[] RelayCapabilities = ["binaryCompression", "senderIdentity"];
+    // relying on a behavior it doesn't have. Not an MpMessage: the relay reads no message
+    // bodies beyond the host's relayControl frames.
+    private const int RelayVersion = RelayWire.Version;
+    private static readonly string[] RelayCapabilities = ["binaryCompression", "authenticatedIdentity", "roomModeration"];
     private static readonly string RelayCapabilitiesJson = string.Join(",", RelayCapabilities.Select(c => $"\"{c}\""));
 
     // The relay owns the room namespace, so it's the only party that can guarantee no
@@ -141,9 +143,15 @@ internal static class Program
 
     // ---- Live state ---------------------------------------------------------------------
 
-    private sealed class PeerConn(WebSocket socket, uint id, IPAddress ip)
+    private sealed class PeerConn(WebSocket socket, uint id, IPAddress ip, Guid peerId)
     {
         public readonly WebSocket Socket = socket;
+        public readonly Guid PeerId = peerId;
+        // A WebSocket allows one send at a time, and a broadcast, a greeting and a close can all
+        // target the same socket at once.
+        public readonly SemaphoreSlim SendGate = new(1, 1);
+        // Set once the greeting is out, so no room traffic can arrive ahead of it.
+        public bool Ready;
         public readonly uint Id = id;
         public readonly IPAddress Ip = ip;
         public readonly DateTime JoinedUtc = DateTime.UtcNow;
@@ -163,10 +171,12 @@ internal static class Program
         // ever serialize against one another. See TryJoin/Leave for why Sessions removal also
         // has to happen while holding this lock, not the table's own (lock-free) operations.
         public readonly object Lock = new();
-        // Whoever created the room, tagged onto every broadcast from them (see
-        // BroadcastAsync) so a receiving client can tell a real host message from a joined
-        // peer forging one.
-        public WebSocket? HostSocket;
+        // Whoever created the room, by authenticated identity rather than socket, so a host
+        // that reconnects is the host again. Tagged onto every broadcast from them (see
+        // BroadcastAsync) so a receiving client can tell a real host message from a forgery.
+        public Guid HostPeerId;
+        // Null address: banned while not connected. Filled in the next time that identity tries.
+        public readonly Dictionary<Guid, IPAddress?> Bans = new();
         public DateTime LastActivityUtc = DateTime.UtcNow;
         public readonly DateTime CreatedUtc = DateTime.UtcNow;
     }
@@ -206,7 +216,7 @@ internal static class Program
     private static long rejectedOrigin, rejectedIpCap, rejectedJoinLockout, rejectedRelayFull,
         rejectedSessionFull, rejectedSessionNotFound, rejectedBadToken, rejectedHandshakeTimeout,
         rejectedMessageTooLarge, rejectedMessageTimeout, rejectedMessageRate, rejectedByteRate,
-        rejectedUnencrypted, rejectedTooManyFragments, rejectedBanned, rejectedPaused;
+        rejectedUnencrypted, rejectedTooManyFragments, rejectedBanned, rejectedPaused, rejectedBadProtocol;
 
     private static void CountRejection(ref long counter)
     {
@@ -391,10 +401,18 @@ internal static class Program
 
     private static bool TryParseNetwork(string cidr, out IPNetwork network)
     {
-        if (IPNetwork.TryParse(cidr, out network)) return true;
+        if (IPNetwork.TryParse(cidr, out network))
+        {
+            // Stored in the form NormalizeIp gives the addresses it is matched against.
+            if (!network.BaseAddress.IsIPv4MappedToIPv6) return true;
+            if (network.PrefixLength < 96) return false;
+            network = new IPNetwork(network.BaseAddress.MapToIPv4(), network.PrefixLength - 96);
+            return true;
+        }
         // A bare address is the common case for a local proxy; treat it as a single host.
         if (IPAddress.TryParse(cidr, out var single))
         {
+            single = NormalizeIp(single);
             network = new IPNetwork(single, single.AddressFamily == AddressFamily.InterNetworkV6 ? 128 : 32);
             return true;
         }
@@ -403,7 +421,11 @@ internal static class Program
 
     // ---- Client identity ----------------------------------------------------------------
 
-    private static bool IsTrustedProxy(IPAddress ip) => TrustedProxies.Any(n => n.Contains(ip));
+    // A dual-stack listener reports IPv4 clients as ::ffff:a.b.c.d, which AbuseKey's /64 would
+    // otherwise lump into one bucket shared by every IPv4 client.
+    private static IPAddress NormalizeIp(IPAddress ip) => ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip;
+
+    private static bool IsTrustedProxy(IPAddress ip) => TrustedProxies.Any(n => n.Contains(NormalizeIp(ip)));
 
     // The address every abuse control is keyed on. Behind a reverse proxy the transport
     // address is the proxy's, which would collapse every per-IP cap and lockout into one
@@ -412,14 +434,14 @@ internal static class Program
     // observed directly; anything further left was written by the client and is forgeable.
     private static IPAddress ResolveClientIp(HttpListenerContext ctx)
     {
-        var transport = ctx.Request.RemoteEndPoint?.Address ?? IPAddress.None;
+        var transport = NormalizeIp(ctx.Request.RemoteEndPoint?.Address ?? IPAddress.None);
         if (!IsTrustedProxy(transport)) return transport;
         var header = ctx.Request.Headers[ClientIpHeader];
         if (string.IsNullOrEmpty(header)) return transport;
         var parts = header.Split(',');
         for (var i = parts.Length - 1; i >= 0; i--)
             if (TryParseForwardedAddress(parts[i], out var candidate) && !IsTrustedProxy(candidate))
-                return candidate;
+                return NormalizeIp(candidate);
         return transport;
     }
 
@@ -438,6 +460,7 @@ internal static class Program
     // standard VPS allocation) sidestep every cap by rotating the low bits.
     private static IPAddress AbuseKey(IPAddress ip)
     {
+        ip = NormalizeIp(ip);
         if (ip.AddressFamily != AddressFamily.InterNetworkV6) return ip;
         var bytes = ip.GetAddressBytes();
         Array.Clear(bytes, 8, 8);
@@ -450,7 +473,7 @@ internal static class Program
     // request reached us from a proxy we were configured to trust.
     private static bool IsRequestEncrypted(HttpListenerContext ctx)
     {
-        var transport = ctx.Request.RemoteEndPoint?.Address ?? IPAddress.None;
+        var transport = NormalizeIp(ctx.Request.RemoteEndPoint?.Address ?? IPAddress.None);
         var forwardedProto = ctx.Request.Headers["X-Forwarded-Proto"];
         // A loopback request that wasn't forwarded never left the machine, so there is nothing
         // for TLS to protect -- this is what lets the admin CLI reach a local relay. An
@@ -554,6 +577,15 @@ internal static class Program
             return;
         }
 
+        if (AuthenticatePeer(ctx.Request.Headers["X-AnoMech-Protocol"], ctx.Request.Headers["X-AnoMech-Peer-Secret"]) is not { } authenticatedPeerId)
+        {
+            // File-only like other per-request refusals: anything can send a bare upgrade request.
+            CountRejection(ref rejectedBadProtocol, "missing or wrong protocol version or peer credential; the plugin and relay need to be the same version", ip, sessionTag);
+            ctx.Response.StatusCode = 400;
+            ctx.Response.Close();
+            return;
+        }
+
         if (!TryReserveConnectionSlot(key))
         {
             CountRejection(ref rejectedIpCap, "ip connection cap", ip, sessionTag);
@@ -584,7 +616,7 @@ internal static class Program
         }
 
         Interlocked.Increment(ref totalConnectionsAccepted);
-        var peer = new PeerConn(socket, (uint)Interlocked.Increment(ref nextConnectionId), ip);
+        var peer = new PeerConn(socket, (uint)Interlocked.Increment(ref nextConnectionId), ip, authenticatedPeerId);
 
         // The slot is released here and nowhere else, so no path between "reserved" and
         // "socket finished" can leak it -- including the rejection closes below, which each
@@ -606,15 +638,15 @@ internal static class Program
                 sessionCode = joinCode!;
                 if (!TryJoin(sessionCode, peer, out var reason))
                 {
-                    // "session full" is a real code, just a full room -- doesn't count as a
-                    // guessing signal the way "not found" does, so it alone shouldn't burn
-                    // toward the lockout the way repeated wrong guesses should.
-                    if (reason == "session full") CountRejection(ref rejectedSessionFull, reason, ip, sessionTag);
-                    else
+                    // Only "not found" is a guessing signal. A full room or a room ban both mean
+                    // the code was right, and charging those toward the lockout would lock a
+                    // whole household out of the relay over a banned player's retries.
+                    if (reason == "session not found")
                     {
                         CountRejection(ref rejectedSessionNotFound, reason, ip, sessionTag);
                         RecordFailedAuth(FailedJoinsByIp, JoinLockoutUntilByIp, key, "join");
                     }
+                    else CountRejection(ref reason == "banned from room" ? ref rejectedBanned : ref rejectedSessionFull, reason, ip, sessionTag);
                     await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, reason);
                     return;
                 }
@@ -634,6 +666,7 @@ internal static class Program
         }
         finally
         {
+            socket.Dispose();
             ReleaseConnectionSlot(key);
         }
     }
@@ -644,7 +677,14 @@ internal static class Program
         try
         {
             RelayLog.Info($"[{sessionCode}] {(isHostRequest ? "session created" : "peer joined")} as #{peer.Id} from {peer.Ip} ({CountPeers(sessionCode)} connected)");
-            await SendGreetingAsync(socket, isHostRequest ? sessionCode : null);
+            await SendGreetingAsync(peer, isHostRequest ? sessionCode : null);
+            if (!Sessions.TryGetValue(sessionCode, out var joinedRoom)) return;
+            lock (joinedRoom.Lock)
+            {
+                if (!Sessions.TryGetValue(sessionCode, out var live) || !ReferenceEquals(live, joinedRoom)
+                    || !joinedRoom.Peers.Contains(peer) || socket.State != WebSocketState.Open) return;
+                peer.Ready = true;
+            }
 
             // A large message (e.g. WorldSnapshotMessage) can arrive split across several
             // frames; buffer until EndOfMessage before forwarding, or fragments get broadcast
@@ -673,7 +713,7 @@ internal static class Program
                         if (fragmentCount == 0) messageCts.CancelAfter(MessageAssemblyTimeout);
                         if (result.MessageType == WebSocketMessageType.Close)
                         {
-                            await CloseQuietlyAsync(socket, WebSocketCloseStatus.NormalClosure, null);
+                            await ClosePeerAsync(peer, WebSocketCloseStatus.NormalClosure, null, linger: false);
                             return;
                         }
                         messageBuffer.Write(readBuffer, 0, result.Count);
@@ -697,7 +737,9 @@ internal static class Program
                         }
                     } while (!result.EndOfMessage);
                 }
-                catch (OperationCanceledException)
+                // Only our own deadline is a slow message: an abort from elsewhere (a kick, a ban,
+                // or the same identity reconnecting) cancels the receive too.
+                catch (OperationCanceledException) when (messageCts.IsCancellationRequested)
                 {
                     CountRejection(ref rejectedMessageTimeout);
                     RelayLog.Warn($"[{sessionCode}] Message from {peer.Ip} took over {MessageAssemblyTimeout.TotalSeconds:F0}s to arrive -- aborting.");
@@ -740,6 +782,13 @@ internal static class Program
                 }
                 WarnIfNearLimit(peer, sessionCode, recentMessageTimes.Count, recentByteSum);
 
+                // The one body the relay reads: a small, uncompressed control frame, obeyed only
+                // from the room's host. Everything else is forwarded exactly as sent.
+                if (result.MessageType == WebSocketMessageType.Text && RelayWire.IsControl(messageBytes))
+                {
+                    Moderate(sessionCode, peer, messageBytes);
+                    continue;
+                }
                 var reachedPeers = await BroadcastAsync(sessionCode, peer, messageBytes, result.MessageType);
                 // File-only (see RelayLog.Detail) -- this is the highest-volume event the relay
                 // sees, and console-echoing it would drown out everything else. Never the
@@ -865,6 +914,11 @@ internal static class Program
     // Leave() can retire (empty + remove) this exact room between the lookup and acquiring its
     // lock; the re-check inside the lock catches that race and retries against whatever's
     // actually current instead of joining a room that's already been thrown away.
+    // The connection's identity is derived from a secret only the client holds, so a public id
+    // seen in room traffic can't be used to act as someone else.
+    private static Guid? AuthenticatePeer(string? protocolHeader, string? secretHeader)
+        => protocolHeader == RelayVersion.ToString() && RelayWire.IsValidSecret(secretHeader) ? RelayWire.PeerId(secretHeader!) : null;
+
     private static bool TryJoin(string sessionCode, PeerConn peer, out string reason)
     {
         while (true)
@@ -874,20 +928,67 @@ internal static class Program
                 reason = "session not found";
                 return false;
             }
+            PeerConn? replaced = null;
+            List<PeerConn>? evicted = null;
+            PeerConn? host = null;
+            var banned = false;
             lock (room.Lock)
             {
                 if (!Sessions.TryGetValue(sessionCode, out var current) || !ReferenceEquals(current, room))
                     continue; // retired (or replaced) concurrently -- retry against the live one
-                if (room.Peers.Count >= MaxPeersPerSession)
+                // The host is exempt so banning someone on its own network can't lock it out.
+                if (peer.PeerId != room.HostPeerId
+                    && (room.Bans.ContainsKey(peer.PeerId) || room.Bans.Values.Contains(AbuseKey(peer.Ip))))
                 {
-                    reason = "session full";
-                    return false;
+                    banned = true;
+                    // A ban made while this identity was disconnected learns its address now, and
+                    // clears that address the way a ban on a connected player would have.
+                    if (room.Bans.TryGetValue(peer.PeerId, out var bannedAddress) && bannedAddress is null)
+                    {
+                        var address = AbuseKey(peer.Ip);
+                        room.Bans[peer.PeerId] = address;
+                        evicted = room.Peers.Where(p => p.PeerId != room.HostPeerId && AbuseKey(p.Ip).Equals(address)).ToList();
+                        foreach (var other in evicted)
+                        {
+                            other.Ready = false;
+                            room.Peers.Remove(other);
+                        }
+                        host = room.Peers.FirstOrDefault(p => p.PeerId == room.HostPeerId);
+                    }
                 }
-                room.Peers.Add(peer);
-                room.LastActivityUtc = DateTime.UtcNow;
-                reason = "";
-                return true;
+                else
+                {
+                    // One connection per identity: a reconnect replaces a connection that hasn't
+                    // noticed it's dead yet, the host's included.
+                    replaced = room.Peers.FirstOrDefault(p => p.PeerId == peer.PeerId);
+                    if (room.Peers.Count - (replaced == null ? 0 : 1) >= MaxPeersPerSession)
+                    {
+                        reason = "session full";
+                        return false;
+                    }
+                    if (replaced != null)
+                    {
+                        replaced.Ready = false;
+                        room.Peers.Remove(replaced);
+                    }
+                    room.Peers.Add(peer);
+                    room.LastActivityUtc = DateTime.UtcNow;
+                }
             }
+            if (banned)
+            {
+                if (evicted is { Count: > 0 })
+                {
+                    foreach (var other in evicted)
+                        _ = ClosePeerAsync(other, WebSocketCloseStatus.PolicyViolation, "banned from room");
+                    if (host != null) _ = SendNoticeAsync(host, evicted.Select(p => p.PeerId).Distinct().ToArray());
+                }
+                reason = "banned from room";
+                return false;
+            }
+            replaced?.Socket.Abort();
+            reason = "";
+            return true;
         }
     }
 
@@ -902,7 +1003,7 @@ internal static class Program
             sessionCode = "";
             return false;
         }
-        var room = new Room { HostSocket = host.Socket };
+        var room = new Room { HostPeerId = host.PeerId };
         room.Peers.Add(host);
         string code;
         do { code = GenerateCode(); } while (!Sessions.TryAdd(code, room));
@@ -929,6 +1030,7 @@ internal static class Program
         // to a room in the instant between it going empty and being removed from the table.
         lock (room.Lock)
         {
+            peer.Ready = false;
             room.Peers.Remove(peer);
             if (room.Peers.Count == 0) Sessions.TryRemove(new KeyValuePair<string, Room>(sessionCode, room));
         }
@@ -940,20 +1042,69 @@ internal static class Program
         lock (room.Lock) return room.Peers.Count;
     }
 
-    private static async Task SendGreetingAsync(WebSocket socket, string? assignedSessionCode)
+    // peerId tells the client which identity the relay derived from its secret.
+    private static async Task SendGreetingAsync(PeerConn peer, string? assignedSessionCode)
     {
-        var json = assignedSessionCode is null
-            ? $$"""{"relayVersion":{{RelayVersion}},"capabilities":[{{RelayCapabilitiesJson}}]}"""
-            : $$"""{"relayVersion":{{RelayVersion}},"capabilities":[{{RelayCapabilitiesJson}}],"sessionCode":"{{assignedSessionCode}}"}""";
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            relayVersion = RelayVersion, capabilities = RelayCapabilities,
+            sessionCode = assignedSessionCode, peerId = peer.PeerId,
+        });
+        using var timeout = new CancellationTokenSource(SendTimeout);
+        await SendOneAsync(peer, bytes, WebSocketMessageType.Text, timeout.Token);
+    }
+
+    private const int MaxRoomBans = 1024;
+
+    // A malformed command is ignored rather than closing the sender: the sender is the host.
+    private static void Moderate(string sessionCode, PeerConn sender, byte[] message)
+    {
+        string? operation;
+        var id = Guid.Empty;
         try
         {
-            await socket.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
+            using var json = JsonDocument.Parse(message);
+            if (!json.RootElement.TryGetProperty("Operation", out var action) || action.ValueKind != JsonValueKind.String
+                || !json.RootElement.TryGetProperty("PeerId", out var identity) || identity.ValueKind != JsonValueKind.String
+                || !identity.TryGetGuid(out id)) return;
+            operation = action.GetString();
         }
-        catch (WebSocketException)
+        catch (Exception e) when (e is JsonException or InvalidOperationException) { return; }
+        if (!Sessions.TryGetValue(sessionCode, out var room)) return;
+        List<PeerConn> removed;
+        lock (room.Lock)
         {
-            // Socket died before we could greet it -- its own receive loop will
-            // fault and clean up via Leave() the normal way.
+            if (!sender.Ready || !room.Peers.Contains(sender) || sender.PeerId != room.HostPeerId) return;
+            if (operation == "unban") { room.Bans.Remove(id); return; }
+            if (operation is not ("kick" or "ban") || id == room.HostPeerId) return;
+            var target = room.Peers.FirstOrDefault(p => p.PeerId == id);
+            // Recorded even when they aren't connected: a ban issued between their reconnects
+            // still has to stop the next one. A full ban list still kicks.
+            if (operation == "ban" && (room.Bans.ContainsKey(id) || room.Bans.Count < MaxRoomBans))
+                room.Bans[id] = target is null ? room.Bans.GetValueOrDefault(id) : AbuseKey(target.Ip);
+            if (target == null) return;
+            removed = room.Peers.Where(p => ReferenceEquals(p, target)
+                || (operation == "ban" && p.PeerId != room.HostPeerId && AbuseKey(p.Ip).Equals(AbuseKey(target.Ip)))).ToList();
+            foreach (var peer in removed)
+            {
+                peer.Ready = false;
+                room.Peers.Remove(peer);
+            }
         }
+        RelayLog.Info($"[{sessionCode}] host {operation} of {id}: {removed.Count} connection(s) closed.");
+        foreach (var peer in removed)
+            _ = ClosePeerAsync(peer, WebSocketCloseStatus.PolicyViolation, operation == "ban" ? "banned from room" : "kicked from room");
+        // The host removed only the id it named. Anyone else the ban took with them leaves
+        // without a word of their own, so without this they'd stay seated in its roster.
+        var others = removed.Where(p => p.PeerId != id).Select(p => p.PeerId).Distinct().ToArray();
+        if (others.Length > 0) _ = SendNoticeAsync(sender, others);
+    }
+
+    private static async Task SendNoticeAsync(PeerConn host, Guid[] removed)
+    {
+        var body = JsonSerializer.SerializeToUtf8Bytes(new { t = RelayWire.NoticeType, Removed = removed });
+        using var timeout = new CancellationTokenSource(SendTimeout);
+        await SendOneAsync(host, RelayWire.Envelope(false, 0, Guid.Empty, false, body), WebSocketMessageType.Binary, timeout.Token);
     }
 
     // ---- Public / admin HTTP ---------------------------------------------------------------
@@ -1045,7 +1196,8 @@ internal static class Program
     internal sealed record RejectionCounts(
         long Origin, long IpCap, long JoinLockout, long RelayFull, long SessionFull,
         long SessionNotFound, long BadToken, long HandshakeTimeout, long MessageTooLarge, long MessageTimeout,
-        long MessageRate, long ByteRate, long Unencrypted, long TooManyFragments, long Banned, long Paused);
+        long MessageRate, long ByteRate, long Unencrypted, long TooManyFragments, long Banned, long Paused,
+        long BadProtocol);
 
     internal sealed record LimitSettings(
         int MaxPeersPerSession, int MaxTotalSessions, long MaxMessageBytes, int MaxConnectionsPerIp,
@@ -1094,7 +1246,7 @@ internal static class Program
                 Interlocked.Read(ref rejectedBadToken), Interlocked.Read(ref rejectedHandshakeTimeout), Interlocked.Read(ref rejectedMessageTooLarge),
                 Interlocked.Read(ref rejectedMessageTimeout), Interlocked.Read(ref rejectedMessageRate), Interlocked.Read(ref rejectedByteRate),
                 Interlocked.Read(ref rejectedUnencrypted), Interlocked.Read(ref rejectedTooManyFragments),
-                Interlocked.Read(ref rejectedBanned), Interlocked.Read(ref rejectedPaused)),
+                Interlocked.Read(ref rejectedBanned), Interlocked.Read(ref rejectedPaused), Interlocked.Read(ref rejectedBadProtocol)),
             Interlocked.Read(ref recentRejections),
             Interlocked.Read(ref peakMessagesPerSecond), Interlocked.Read(ref peakBytesPerSecond),
             Interlocked.Read(ref nearLimitWarnings), BuildLimits(),
@@ -1111,7 +1263,7 @@ internal static class Program
             {
                 list.Add(new SessionInfo(code, (now - room.CreatedUtc).TotalSeconds, (now - room.LastActivityUtc).TotalSeconds,
                     room.Peers.Select(peer => new PeerInfo(peer.Id, peer.Ip.ToString(),
-                        ReferenceEquals(peer.Socket, room.HostSocket), (now - peer.JoinedUtc).TotalSeconds,
+                        peer.PeerId == room.HostPeerId, (now - peer.JoinedUtc).TotalSeconds,
                         peer.MessagesIn, peer.BytesIn, peer.PeakMessagesPerSecond, peer.PeakBytesPerSecond)).ToList()));
             }
         }
@@ -1328,19 +1480,20 @@ internal static class Program
         // same time never contend with each other here, only two sends to the same session would.
         lock (room.Lock)
         {
+            if (!Sessions.TryGetValue(sessionCode, out var current) || !ReferenceEquals(current, room)) return 0;
+            if (!sender.Ready || !room.Peers.Contains(sender)) return 0;
             room.LastActivityUtc = DateTime.UtcNow;
-            isFromHost = ReferenceEquals(sender.Socket, room.HostSocket);
-            targets = room.Peers.Where(peer => !ReferenceEquals(peer, sender) && peer.Socket.State == WebSocketState.Open).ToList();
+            isFromHost = sender.PeerId == room.HostPeerId;
+            // A peer's traffic goes to the host alone; only the host speaks to everyone.
+            targets = room.Peers.Where(peer => !ReferenceEquals(peer, sender) && peer.Ready && peer.Socket.State == WebSocketState.Open
+                && (isFromHost || peer.PeerId == room.HostPeerId)).ToList();
         }
 
-        // Prefix identifying the ORIGINAL sender: a host/not-host byte so a client can tell a
-        // genuine host broadcast from a joined peer forging one, then the relay-assigned
-        // connection id so it can bind a claimed PeerId to one connection. The id is assigned,
-        // never claimed, which is what makes it unforgeable. Built once, not per target.
-        var tagged = new byte[bytes.Length + 5];
-        tagged[0] = (byte)(isFromHost ? 1 : 0);
-        BitConverter.TryWriteBytes(tagged.AsSpan(1, 4), sender.Id);
-        Buffer.BlockCopy(bytes, 0, tagged, 5, bytes.Length);
+        // Prefix identifying the ORIGINAL sender (see RelayWire.Envelope): host flag, the
+        // relay-assigned connection id, the authenticated identity, and whether the body is
+        // compressed. All of it is written here, never taken from the client, which is what makes
+        // it unforgeable. Identity bytes need not be UTF-8, so the frame is always binary.
+        var tagged = RelayWire.Envelope(isFromHost, sender.Id, sender.PeerId, type == WebSocketMessageType.Binary, bytes);
 
         Interlocked.Increment(ref totalMessagesBroadcast);
         Interlocked.Add(ref totalBytesBroadcast, tagged.Length * (long)targets.Count);
@@ -1352,7 +1505,7 @@ internal static class Program
         // hundreds of sessions this adds up fast otherwise (see README's Security notes).
         using var cts = new CancellationTokenSource(SendTimeout);
         // Parallel, not sequential -- one slow peer must not delay delivery to everyone else.
-        await Task.WhenAll(targets.Select(target => SendOneAsync(target, tagged, type, cts.Token)));
+        await Task.WhenAll(targets.Select(target => SendOneAsync(target, tagged, WebSocketMessageType.Binary, cts.Token)));
         return targets.Count;
     }
 
@@ -1364,7 +1517,9 @@ internal static class Program
     {
         try
         {
-            await target.Socket.SendAsync(bytes, type, endOfMessage: true, timeout);
+            await target.SendGate.WaitAsync(timeout);
+            try { await target.Socket.SendAsync(bytes, type, endOfMessage: true, timeout); }
+            finally { target.SendGate.Release(); }
         }
         catch (OperationCanceledException)
         {
@@ -1384,6 +1539,23 @@ internal static class Program
     // CloseAsync waits for the peer's own close frame, which a hostile or wedged client is
     // free never to send. Every close in this process goes through here so none of them can
     // block on that.
+    // A close is a send too, so it waits its turn behind any broadcast to the same socket. A
+    // close the relay starts (kick, ban) lingers so the client can read why before the abort;
+    // answering the client's own close has nothing left to wait for.
+    private static async Task ClosePeerAsync(PeerConn peer, WebSocketCloseStatus status, string? description, bool linger = true)
+    {
+        using var timeout = new CancellationTokenSource(CloseTimeout);
+        try
+        {
+            await peer.SendGate.WaitAsync(timeout.Token);
+            try { await peer.Socket.CloseOutputAsync(status, description, timeout.Token); }
+            finally { peer.SendGate.Release(); }
+            if (linger) await Task.Delay(CloseTimeout);
+        }
+        catch (Exception) { }
+        finally { peer.Socket.Abort(); }
+    }
+
     private static async Task CloseQuietlyAsync(WebSocket socket, WebSocketCloseStatus status, string? description)
     {
         try
@@ -1423,7 +1595,14 @@ internal static class AdminConsole
             return;
         }
 
-        http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        // The admin token goes out on every request, so it must not leave in the clear or be
+        // redirected to another server.
+        if (!IsSafeAdminUri(host))
+        {
+            Console.Error.WriteLine("Admin connections require HTTPS, except HTTP on loopback.");
+            return;
+        }
+        http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(5) };
         http.DefaultRequestHeaders.Add("X-AnoMech-Admin-Token", adminToken);
 
         var showSessions = false;
@@ -1457,6 +1636,16 @@ internal static class AdminConsole
                 break;
             }
         }
+    }
+
+    internal static bool IsSafeAdminUri(string value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.UserInfo.Length != 0
+            || uri.Query.Length != 0 || uri.Fragment.Length != 0) return false;
+        return uri.Scheme == "https" || (uri.Scheme == "http" &&
+            (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+             || (IPAddress.TryParse(uri.Host.Trim('[', ']'), out var ip)
+                 && IPAddress.IsLoopback(ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip))));
     }
 
     private static string? ValueOf(string[] args, string name)
@@ -1547,7 +1736,7 @@ internal static class AdminConsole
                           $"relayFull {s.Rejections.RelayFull}   sessionFull {s.Rejections.SessionFull}   notFound {s.Rejections.SessionNotFound}");
         Console.WriteLine($"  badToken {s.Rejections.BadToken}   handshake {s.Rejections.HandshakeTimeout}   tooLarge {s.Rejections.MessageTooLarge}   " +
                           $"msgTimeout {s.Rejections.MessageTimeout}   msgRate {s.Rejections.MessageRate}   byteRate {s.Rejections.ByteRate}");
-        Console.WriteLine($"  unencrypted {s.Rejections.Unencrypted}   fragments {s.Rejections.TooManyFragments}   banned {s.Rejections.Banned}   paused {s.Rejections.Paused}");
+        Console.WriteLine($"  unencrypted {s.Rejections.Unencrypted}   fragments {s.Rejections.TooManyFragments}   banned {s.Rejections.Banned}   paused {s.Rejections.Paused}   protocol {s.Rejections.BadProtocol}");
         Console.WriteLine($"  last ~2s: {s.RecentRejections}{(s.RecentRejections >= 50 ? "   [ELEVATED -- possible abuse]" : "")}");
         Console.WriteLine();
         Console.WriteLine($"Memory {s.MemoryBytes / 1024 / 1024:N0} MB   GC {s.Gen0Collections}/{s.Gen1Collections}/{s.Gen2Collections}");

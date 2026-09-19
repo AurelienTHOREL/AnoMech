@@ -89,13 +89,7 @@ public sealed class RunningSimWindow : Window
             var where = mp.Session.ClaimedBy.ContainsValue(id) ? SettingsGrid.RoleLabel(seat.Key) : "no role";
             ImGui.TextUnformatted($"{mp.Session.NameOf(id)} ({where})");
             ImGui.SameLine(200);
-            if (ImGui.SmallButton("Kick")) mp.KickPeer(id);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip($"Remove {mp.Session.NameOf(id)} from the session; mid-fight it ends the run for everyone.");
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Ban")) mp.BanPeer(id);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip($"Remove {mp.Session.NameOf(id)} and keep them out until you unban them in the Multiplayer window.");
+            MultiplayerWindow.DrawKickBanButtons(mp, id);
             ImGui.PopID();
         }
     }

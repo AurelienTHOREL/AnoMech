@@ -1,8 +1,9 @@
 # AnoMech.Relay
 
 A small WebSocket relay for AnoMech's multiplayer mode. It forwards frames between
-clients in the same session code (`/session/<code>`) — it doesn't understand AnoMech's
-message format at all. Dalamud clients can't reach each other directly (NAT, and
+clients in the same session code (`/session/<code>`), tagging each with its sender's
+authenticated identity. It never decompresses or reads the messages it forwards; the
+plugin checks every message it receives. Dalamud clients can't reach each other directly (NAT, and
 AnoMech firewalls off FFXIV's own server traffic during a scenario), so this process
 exists just to get them talking.
 
@@ -27,6 +28,8 @@ service](#running-it-as-a-public-service) and [Security notes](#security-notes).
 - [Security notes](#security-notes)
 - [Troubleshooting](#troubleshooting)
 - [Configuring the plugin](#configuring-the-plugin)
+- [Wire protocol](#wire-protocol)
+- [Regression checks](#regression-checks)
 
 ---
 
@@ -388,9 +391,12 @@ Bans and limit changes live in memory only — they reset when the relay restart
   for anyone to connect at all; see [Running it as a public
   service](#running-it-as-a-public-service), including the TLS enforcement that comes
   with it. Trust is scoped to one session, not the whole relay: anyone who has that
-  session's code is trusted for the duration of that session, nothing more — the host
-  still can't kick a peer once they've joined it, and nothing about one session
-  carries over to another.
+  session's code can join it, and nothing about one session carries over to another.
+  The host's kick and ban are carried out by the relay itself, which closes the
+  connection. A ban also covers the player's address (IPv6 by /64) for the rest of the
+  session, including other connections already using it, so players sharing a network
+  are removed together; the host is told who they were. Banning a player who happens to
+  be disconnected still keeps them out.
 - **Session-code guessing**: codes are drawn from a cryptographically random
   generator (not a predictable PRNG), so a stranger who's observed some issued codes
   can't predict a future one. Repeated failed joins from one address get locked out
@@ -410,13 +416,20 @@ Bans and limit changes live in memory only — they reset when the relay restart
   share one address more often than in a friend-only deployment (mobile carriers,
   corporate NAT). `--max-connections-per-ip` defaults with slack for this, but if you
   see real users getting capped, raise it rather than assume it's abuse.
-- **Message impersonation**: every forwarded message is tagged with the relay-assigned
-  connection it came from, plus whether that connection is the room's host. A peer who
-  joins a session therefore can't forge a host-authoritative message (world state, run
-  start/end, ...), and can't send a peer message carrying somebody else's identity to
-  steal their role or force a reset — the plugin drops both. Best-effort: needs both the
-  relay and the plugin build to be reasonably current (see `RelayVersion`/capabilities
-  in `Program.cs`).
+- **Message impersonation**: each plugin install keeps a private random secret and gives
+  every relay address its own credential derived from it, so one relay can't replay what
+  it saw on another. The relay derives the player's public id from that credential and
+  tags every forwarded message with that id, the connection number, and whether it's the
+  room's host, so neither the id nor host status can be claimed by anyone else. A peer therefore can't forge a host message (world state, run
+  start/end, ...) or send one under somebody else's id to steal their role; the plugin
+  drops both. A host that reconnects is recognized by the same credential and is the
+  host again. Peer messages go only to the host.
+- **Bounded parsing (in the plugin)**: the relay forwards message bodies untouched. The
+  receiving plugin caps decompression (8 MiB from the host, 64 KiB from a peer), checks
+  that a peer's message is a peer type naming its real sender before reading it, and
+  holds each peer to its own rate. A message that fails is dropped on its own; the connection stays up.
+- **Redirects**: the plugin never follows a redirect when connecting, so a relay can't
+  pass the credential or the relay password on to another server.
 - **It cannot be used to attack a third party.** It's TCP (WebSocket), not the
   connectionless UDP protocols IP-spoofing reflection/amplification attacks need — you
   can't fake a TCP source address without completing the handshake back to that faked
@@ -466,4 +479,39 @@ explicit `ws://`/`wss://` also works. Remembered across sessions once set.
 If the relay you typed requires `--token`, a **Relay password** field appears
 automatically underneath (the plugin asks the relay's plain `/info` endpoint whether
 one is needed before showing it) — also remembered across sessions. A relay with no
-token set never shows the field at all.
+token set never shows the field at all. The saved password is tied to the relay it was
+entered for and is never sent to any other address, nor over `ws://`.
+
+## Wire protocol
+
+Update the relay and the plugin together; older builds of either are refused.
+Connections send `X-AnoMech-Protocol: 1` and a 64-character hexadecimal
+`X-AnoMech-Peer-Secret`. Treat the latter as a credential and keep it out of proxy
+logs. The public peer id is the first 16 bytes of its SHA-256 digest, read as a .NET
+GUID. The relay's greeting is JSON with `relayVersion`, `capabilities`
+(`binaryCompression`, `authenticatedIdentity`, `roomModeration`), the `peerId` it
+derived, and, for `/host`, the `sessionCode`.
+
+Clients send JSON as text frames, or Brotli-compressed JSON as binary frames. Every
+frame the relay forwards is binary: host flag (1 byte), connection id (4 bytes, little
+endian), sender id (16 bytes, .NET GUID layout), compression flag (1 byte), then the
+body exactly as it was sent. A frame with connection id 0 and an empty sender is a
+notice from the relay itself.
+
+The host kicks, bans and unbans with an uncompressed text frame of at most 1 KiB whose
+first property is `t`: `{ "t": "relayControl", "Operation": "kick|ban|unban", "PeerId":
+"..." }`. The relay acts on it instead of forwarding it, and ignores one from anyone but
+the host. When a ban removes other connections on the same address, the relay tells the
+host with `{ "t": "relayNotice", "Removed": [ ... ] }`.
+
+## Regression checks
+
+From the repository root, with a .NET 8 runtime:
+
+```
+dotnet run --project tests/SecurityTests/SecurityTests.csproj -c Release
+```
+
+They run the real relay room, routing, moderation and client code over loopback
+WebSockets, using a small stand-in for the HTTP upgrade so they don't need Windows
+HTTP.sys permissions.

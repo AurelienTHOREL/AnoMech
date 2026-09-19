@@ -17,14 +17,19 @@ public interface IPhase
 
     // Optional phase-wide setup, between zone and scenario Run. Default no-op.
     void Run(SimWorld world) { }
+
+    // Phase-wide client-side setup, run on host and peer alike (see IZone.RunClientSetup).
+    // Default no-op.
+    void RunClientSetup(SimWorld world) { }
 }
 
 // Default phase. Pass Init to attach custom phase-wide setup.
 public sealed class Phase : IPhase
 {
     private readonly Action<SimWorld>? init;
+    private readonly Action<SimWorld>? clientSetup;
 
-    public Phase(IZone zone, string name, byte? weather, ushort bgm, Action<SimWorld>? init = null, float? fogHold = null)
+    public Phase(IZone zone, string name, byte? weather, ushort bgm, Action<SimWorld>? init = null, float? fogHold = null, Action<SimWorld>? clientSetup = null)
     {
         Zone = zone;
         Name = name;
@@ -32,6 +37,7 @@ public sealed class Phase : IPhase
         Bgm = bgm;
         FogHold = fogHold;
         this.init = init;
+        this.clientSetup = clientSetup;
     }
 
     public IZone Zone { get; }
@@ -41,4 +47,5 @@ public sealed class Phase : IPhase
     public float? FogHold { get; }
 
     public void Run(SimWorld world) => init?.Invoke(world);
+    public void RunClientSetup(SimWorld world) => clientSetup?.Invoke(world);
 }

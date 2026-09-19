@@ -9,4 +9,7 @@
     <RootNamespace>AnoMech.Relay</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Compile Include="../../Shared/RelayWire.cs" Link="RelayWire.cs" />
+  </ItemGroup>
 </Project>

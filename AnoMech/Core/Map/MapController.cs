@@ -125,6 +125,7 @@ public sealed class MapController : IDisposable
         pendingEffects.Clear();
         pendingDirectorUpdates.Clear();
         suppressedArenaSlots.Clear();
+        effects.ForgetSuppressions();
     }
 
     // Per-frame poll. Called from SimWorld.Tick.
@@ -277,8 +278,8 @@ public sealed class MapController : IDisposable
 
     // Hard-deactivate one arena scenery slot (SharedGroup, geometry, VFX and sound): AddEffect's
     // hide flag leaves the SGB's Sound children playing. Retried until the slot's SGB has
-    // streamed in. Local-only: a phase's InitArena runs per client, and leaving the sim reloads
-    // the territory.
+    // streamed in. Local-only: callers run on every client (IPhase.RunClientSetup), and leaving
+    // the sim reloads the territory.
     private const uint SuppressSentinel = 0xFFFFFFFFu;
     private readonly HashSet<byte> suppressedArenaSlots = new();
 
@@ -288,6 +289,16 @@ public sealed class MapController : IDisposable
         suppressedArenaSlots.Add(index); // Tick re-silences its Sound children every frame
         if (!effects.SuppressSlot(index) && TryReserveRetrySlot(pendingEffects.Count, "SuppressSlot"))
             pendingEffects.Add(new PendingMapEffect { PacketFlags = SuppressSentinel, Index = index, FramesLeft = BarrierDropMaxFrames });
+    }
+
+    // A different phase starting in the loaded zone: suppression outlives a restart (only a
+    // territory reload undoes it), so the new phase would find those slots dark.
+    public void RestoreSuppressedArenaSlots()
+    {
+        pendingEffects.RemoveAll(p => p.PacketFlags == SuppressSentinel);
+        suppressedArenaSlots.Clear();
+        foreach (var slot in new List<byte>(effects.SuppressedSlots))
+            effects.RestoreSlot(slot);
     }
 
     // Replay a native DirectorUpdate event (instance progress / state sync); same retry and

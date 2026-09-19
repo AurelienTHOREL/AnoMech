@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AnoMech.Core.Native;
 using Dalamud.Hooking;
 using FFXIVClientStructs.FFXIV.Client.Game.Event;
@@ -87,11 +88,36 @@ internal sealed unsafe class MapEffects : IDisposable
         if (!IsIndexInRange((ContentDirector*)modulePtr, index)) return false;
         var item = ReadMapEffectItem((ContentDirector*)modulePtr, index);
         if (item.LayoutId == 0) return false;
+        if (!preSuppressionStates.ContainsKey(index)
+            && LayoutInstanceDiagnostics.CaptureActiveStates(item.LayoutId) is { } states)
+            preSuppressionStates[index] = states;
         var ok = LayoutInstanceDiagnostics.SetSharedGroupActive(item.LayoutId, active: false, recurseChildren: true);
         if (ok)
             AnoMech.Core.DiagnosticLog.Info($"[MapEffect] SuppressSlot index=0x{index:X} LayoutId=0x{item.LayoutId:X} -- SG + children set inactive.");
         return ok;
     }
+
+    // Each suppressed slot's tree as it was before its first SuppressSlot, for RestoreSlot.
+    private readonly Dictionary<byte, bool[]> preSuppressionStates = new();
+
+    internal IReadOnlyCollection<byte> SuppressedSlots => preSuppressionStates.Keys;
+
+    // Undoes SuppressSlot. Nothing to do for a slot never suppressed since the territory loaded.
+    internal void RestoreSlot(byte index)
+    {
+        if (!preSuppressionStates.Remove(index, out var states) || !Loaded) return;
+        var modulePtr = *(nint*)((nint)EventFramework.Instance() + 344);
+        if (modulePtr == 0 || !IsIndexInRange((ContentDirector*)modulePtr, index)) return;
+        var item = ReadMapEffectItem((ContentDirector*)modulePtr, index);
+        if (item.LayoutId == 0) return;
+        if (LayoutInstanceDiagnostics.RestoreActiveStates(item.LayoutId, states))
+            AnoMech.Core.DiagnosticLog.Info($"[MapEffect] RestoreSlot index=0x{index:X} LayoutId=0x{item.LayoutId:X} -- SG + children back as before suppression.");
+        else
+            AnoMech.Core.DiagnosticLog.Warn($"[MapEffect] RestoreSlot index=0x{index:X} LayoutId=0x{item.LayoutId:X} -- tree changed shape; only the SG re-enabled.");
+    }
+
+    // The territory reverted: its SharedGroups are gone.
+    internal void ForgetSuppressions() => preSuppressionStates.Clear();
 
     // Per-frame follow-up to SuppressSlot: the SGB's own update re-arms its Sound children, so
     // the ambient/voice loops creep back. Skips the native call unless one is active again.

@@ -38,7 +38,7 @@ public class MultiplayerWindow : Window, IDisposable
         SizeCondition = ImGuiCond.FirstUseEver;
         IsOpen = false;
         relayUrl = plugin.Configuration.RelayServerUrl;
-        relayToken = plugin.Configuration.RelayAccessToken;
+        relayToken = plugin.Configuration.TokenForRelay(relayUrl);
         // ObjectTable.LocalPlayer is main-thread-only and plugins are constructed off-thread,
         // so the name is prefilled in Draw().
     }
@@ -134,6 +134,9 @@ public class MultiplayerWindow : Window, IDisposable
         ImGui.SetNextItemWidth(300);
         if (ImGui.InputText("Relay URL##relayUrl", ref relayUrl, 256))
         {
+            // Shows the password saved for this relay, if any. Hidden rather than cleared while
+            // the address points elsewhere, so a typo doesn't lose it.
+            relayToken = plugin.Configuration.TokenForRelay(relayUrl);
             plugin.Configuration.RelayServerUrl = relayUrl;
             plugin.Configuration.Save();
         }
@@ -165,6 +168,7 @@ public class MultiplayerWindow : Window, IDisposable
             if (ImGui.InputText("Relay password##relayToken", ref relayToken, 128, ImGuiInputTextFlags.Password))
             {
                 plugin.Configuration.RelayAccessToken = relayToken;
+                plugin.Configuration.RelayTokenOrigin = Configuration.OriginOf(relayUrl);
                 plugin.Configuration.Save();
             }
         }
@@ -400,15 +404,42 @@ public class MultiplayerWindow : Window, IDisposable
         ImGui.EndPopup();
     }
 
-    private void DrawKickButton(Guid peerId)
+    private void DrawKickButton(Guid peerId) => DrawKickBanButtons(mp, peerId);
+
+    // Both sit a few pixels from Claim, and neither is something to do by accident, so each
+    // asks first. Shared with RunningSimWindow so the wording can't drift.
+    internal static void DrawKickBanButtons(MultiplayerManager mp, Guid peerId)
     {
-        if (ImGui.SmallButton("Kick")) mp.KickPeer(peerId);
+        ImGui.PushID(peerId.ToString());
+        var who = mp.Session.NameOf(peerId);
+
+        if (ImGui.SmallButton("Kick")) ImGui.OpenPopup("##confirmkick");
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip($"Remove {mp.Session.NameOf(peerId)} from the session; mid-fight it ends the run for everyone.");
+            ImGui.SetTooltip($"Remove {who} from the session; mid-fight it ends the run for everyone. Asks first.");
+        if (ImGui.BeginPopup("##confirmkick"))
+        {
+            ImGui.TextUnformatted($"Kick {who}?");
+            ImGui.TextDisabled("They can come back with the session code.");
+            if (ImGui.Button("Kick them")) { mp.KickPeer(peerId); ImGui.CloseCurrentPopup(); }
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel##kick")) ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+
         ImGui.SameLine();
-        if (ImGui.SmallButton("Ban")) mp.BanPeer(peerId);
+        if (ImGui.SmallButton("Ban")) ImGui.OpenPopup("##confirmban");
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip($"Remove {mp.Session.NameOf(peerId)} and keep them out of this session until you unban them (see the banned list below).");
+            ImGui.SetTooltip($"Remove {who} and keep them out of this session until you unban them. Asks first.");
+        if (ImGui.BeginPopup("##confirmban"))
+        {
+            ImGui.TextUnformatted($"Ban {who}?");
+            ImGui.TextDisabled("They stay out until you unban them in the Multiplayer window.");
+            if (ImGui.Button("Ban them")) { mp.BanPeer(peerId); ImGui.CloseCurrentPopup(); }
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel##ban")) ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
+        ImGui.PopID();
     }
 
     // A ban lasts the session.

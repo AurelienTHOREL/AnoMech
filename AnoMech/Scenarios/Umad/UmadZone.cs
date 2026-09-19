@@ -12,7 +12,7 @@ public sealed class UmadZone : IZone
     // load (EnvState+0xD8 / EnvSimulator+0x2F8); the real P1 keeps its red haze for the whole
     // phase, which the engine's own transition to 1800 cleared.
     public const float P1Haze = 1000f;
-    public static readonly Phase P1 = new(Instance, "P1", 77, 20292, InitP1Arena, fogHold: P1Haze);
+    public static readonly Phase P1 = new(Instance, "P1", 77, 20292, fogHold: P1Haze, clientSetup: InitP1Arena);
     public static readonly Phase P2 = new(Instance, "P2", 79, 20292);
     public static readonly Phase P3 = new(Instance, "P3", 174, 20293);
     public static readonly Phase P4 = new(Instance, "P4", 174, 20293);
@@ -36,8 +36,9 @@ public sealed class UmadZone : IZone
     public void RunClientSetup(SimWorld world) => UmadReplayData.Seed();
 
     // Slots 1-0x23 are the P4/P5 destroyed-world scenery (broken floor, rubble, dais), which a
-    // client-side zone load shows by default. AddEffect's hide is the replicated geometry hide;
-    // SuppressArenaSlot also kills the SGBs' Sound children (the out-of-place voice lines).
+    // client-side zone load shows by default. AddEffect hides the geometry; SuppressArenaSlot
+    // also deactivates the SGBs' VFX and Sound children (a red arena tint, out-of-place voice
+    // lines). Client setup rather than a host broadcast: suppression has no network path.
     // Three passes because a slot's SGB streams in asynchronously. Slot 0 (the platform) is
     // driven by the scenario's own catch-up sequence.
     private static void InitP1Arena(SimWorld world)
@@ -47,7 +48,7 @@ public sealed class UmadZone : IZone
             {
                 for (byte slot = 1; slot < 0x24; slot++)
                 {
-                    world.Map.AddEffect((0x0004U << 16) | 0x04, slot);
+                    world.Map.AddEffect((0x0004U << 16) | 0x04, slot, broadcast: false);
                     world.Map.SuppressArenaSlot(slot);
                 }
             });

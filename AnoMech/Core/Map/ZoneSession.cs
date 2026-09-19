@@ -177,15 +177,39 @@ public sealed unsafe class ZoneSession : IDisposable
     // render field the reload resets on its own. Do NOT reintroduce a WeatherManager write.
     public void SetWeather(byte weatherId, float transition = 0.5f)
     {
-        // Nothing may touch the environment outside a session: a stray write (ApplyWeather's
-        // delayed continuation after a Leave, a replayed SetWeatherMessage) would permanently
-        // alter the open-world sky.
+        // Nothing may touch the environment outside a session: a stray write (a replayed
+        // SetWeatherMessage after a Leave) would permanently alter the open-world sky.
         if (!IsActive) return;
+        desiredWeather = weatherId;
+        desiredTransition = transition;
         var env = EnvManager.Instance();
         if (env == null) return;
         env->ActiveWeather = weatherId;
         env->TransitionTime = transition;
+        weatherAppliedMs = Environment.TickCount64;
         StartWeatherDiagnostic(weatherId);
+    }
+
+    // The weather this session wants, re-applied by TickWeather when the zone load resets it:
+    // the engine zeroes ActiveWeather as the environment scene comes up, and a write on a fixed
+    // delay lost that race whenever the load ran long (a quick switch between territories).
+    private byte? desiredWeather;
+    private float desiredTransition;
+    private long? weatherAppliedMs;
+    private const long WeatherSettleMs = 3000;
+
+    private void ReassertWeather()
+    {
+        if (desiredWeather is not { } wanted) return;
+        var env = EnvManager.Instance();
+        if (env == null || env->EnvScene == null) return;
+        if (weatherAppliedMs is { } applied)
+        {
+            var settling = Environment.TickCount64 - applied < WeatherSettleMs;
+            if (env->ActiveWeather == wanted || (env->ActiveWeather != 0 && !settling)) return;
+            AnoMech.Core.DiagnosticLog.Info($"[ZoneSession] Weather {env->ActiveWeather} where {wanted} was set -- re-applying.");
+        }
+        SetWeather(wanted, desiredTransition);
     }
 
     // Read-only weather investigation: logs EnvManager/WeatherManager state at fixed checkpoints
@@ -225,6 +249,7 @@ public sealed unsafe class ZoneSession : IDisposable
     public void TickWeather()
     {
         if (!IsActive) return;
+        ReassertWeather();
         if (FogHold is { } hold)
         {
             var env = EnvManager.Instance();
@@ -315,9 +340,13 @@ public sealed unsafe class ZoneSession : IDisposable
             AnoMech.Core.DiagnosticLog.Info($"[ZoneSession] WeatherDiag +{checkpointMs,5}ms {label} changed vs t=0: {string.Join("; ", changes)}.");
     }
 
-    // Apply weather after a fresh zone load. Delayed 1 second so the engine finishes setup.
+    // Weather for a fresh zone load: written once the environment scene exists (ReassertWeather).
     public void ApplyWeather(byte weatherId)
-        => ThreadingTask.Delay(1000).ContinueWith(_ => Plugin.Framework.Run(() => SetWeather(weatherId)));
+    {
+        desiredWeather = weatherId;
+        desiredTransition = 0.5f;
+        weatherAppliedMs = null;
+    }
 
     // Reload the saved inn territory and restore position; disable firewall.
     public void Revert(bool dispose)
@@ -329,6 +358,8 @@ public sealed unsafe class ZoneSession : IDisposable
         weatherDiagStartMs = null; // stop the diagnostic before the inn's own weather loads
         envStateSnapshot = null;
         envSimulatorSnapshot = null;
+        desiredWeather = null;
+        weatherAppliedMs = null;
         FogHold = null; // stop re-asserting the fog hold before the inn's own value loads
 
         // The reload can throw; the firewall and the Occupied flag must be released regardless,

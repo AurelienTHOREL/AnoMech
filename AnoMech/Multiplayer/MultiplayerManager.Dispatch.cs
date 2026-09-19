@@ -12,6 +12,7 @@ using AnoMech.Core.Game.Geometry;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
+using AnoMech.Network;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using AnoMech.Scenarios;
 
@@ -23,11 +24,11 @@ public sealed partial class MultiplayerManager
 
     // Queued and drained in Tick rather than one Framework.Run per message: Dalamud's task
     // scheduler doesn't run pending tasks in insertion order, and wire order matters.
-    private readonly ConcurrentQueue<(MpMessage Message, bool IsFromHost, uint SenderId)> pendingMessages = new();
+    private readonly ConcurrentQueue<(MpMessage Message, bool IsFromHost, uint SenderId, Guid SenderPeerId)> pendingMessages = new();
     private int pendingMessageCount;
     private long droppedQueuedMessages;
 
-    private void OnMessageReceivedOffThread(MpMessage message, bool isFromHost, uint senderId)
+    private void OnMessageReceivedOffThread(MpMessage message, bool isFromHost, uint senderId, Guid senderPeerId)
     {
         if (Interlocked.Increment(ref pendingMessageCount) > NetGuard.MaxQueuedMessages)
         {
@@ -36,7 +37,7 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Warn($"[Multiplayer] Inbound queue is over {NetGuard.MaxQueuedMessages} deep -- dropping messages (total {Interlocked.Read(ref droppedQueuedMessages)}).");
             return;
         }
-        pendingMessages.Enqueue((message, isFromHost, senderId));
+        pendingMessages.Enqueue((message, isFromHost, senderId, senderPeerId));
     }
 
     // A snapshot directly followed by another of the same type is skipped: under a bad
@@ -50,7 +51,7 @@ public sealed partial class MultiplayerManager
             if ((entry.Message is WorldSnapshotMessage && pendingMessages.TryPeek(out var next) && next.Message is WorldSnapshotMessage)
                 || (entry.Message is RolesSnapshotMessage && pendingMessages.TryPeek(out var next2) && next2.Message is RolesSnapshotMessage))
                 continue;
-            Dispatch(entry.Message, entry.IsFromHost, entry.SenderId);
+            Dispatch(entry.Message, entry.IsFromHost, entry.SenderId, entry.SenderPeerId);
         }
     }
 
@@ -76,12 +77,20 @@ public sealed partial class MultiplayerManager
             BeginReconnect();
         });
 
-    private void Dispatch(MpMessage message, bool isFromHost, uint senderId)
+    // Others the relay removed alongside a ban (same address). They leave without a
+    // SessionEnded, so without this the host would keep them seated. Queued with the messages,
+    // so it lands after anything they sent before the ban and a late Hello can't re-seat them.
+    private sealed record RelayRemovedPeers(IReadOnlyList<Guid> Removed) : MpMessage;
+
+    private void OnPeersRemovedOffThread(RelayClient source, IReadOnlyList<Guid> removed)
+        => OnMessageReceivedOffThread(new RelayRemovedPeers(removed), false, 0, Guid.Empty);
+
+    private void Dispatch(MpMessage message, bool isFromHost, uint senderId, Guid senderPeerId)
     {
         // One bad message must not take down the tick.
         try
         {
-            DispatchCore(message, isFromHost, senderId);
+            DispatchCore(message, isFromHost, senderId, senderPeerId);
         }
         catch (Exception e)
         {
@@ -89,13 +98,12 @@ public sealed partial class MultiplayerManager
         }
     }
 
-    // Host-only: the relay connection each PeerId was first seen on. PeerIds are self-chosen;
-    // connection ids are relay-assigned and can't be forged.
+    // Host-only: the relay connection each peer was last heard on.
     private readonly Dictionary<Guid, uint> peerConnectionIds = new();
-    private readonly Dictionary<uint, long> connectionLastSeenMs = new();
 
-    // Above the 2s ping/pong cadence.
-    private const long ConnectionLivenessMs = 3000;
+    // How long after a peer registers a leave is treated as having crossed that rejoin. Sized
+    // for a network race, not for a player who joins and immediately leaves again.
+    private const long RejoinGraceMs = 2000;
 
     private static readonly Lumina.Excel.ExcelSheet<Lumina.Excel.Sheets.Weather> WeatherSheet =
         Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Weather>();
@@ -122,28 +130,19 @@ public sealed partial class MultiplayerManager
         _ => null,
     };
 
-    // The binding may move to a new connection (a reconnect) only once the old one has stopped
-    // sending. Liveness is per connection, so a forged message can't keep the real one alive.
-    private bool IsImpersonating(Guid peerId, uint senderId)
+    private void DispatchCore(MpMessage message, bool isFromHost, uint senderId, Guid senderPeerId)
     {
-        if (senderId == 0) return false; // relay doesn't attest identity
-        if (peerConnectionIds.TryGetValue(peerId, out var bound) && bound != senderId)
+        if (message is RelayRemovedPeers notice)
         {
-            if (Environment.TickCount64 - connectionLastSeenMs.GetValueOrDefault(bound) <= ConnectionLivenessMs)
+            if (!IsHost) return;
+            foreach (var peerId in notice.Removed)
             {
-                DiagnosticLog.Warn($"[Multiplayer] Dropped a message claiming to be {Session.NameOf(peerId)} ({peerId}) from connection #{senderId} -- that peer is live on #{bound}.");
-                return true;
+                if (!Session.Names.ContainsKey(peerId)) continue;
+                DiagnosticLog.Info($"[Multiplayer] Relay removed {Session.NameOf(peerId)} ({peerId}) along with a banned player on the same network.");
+                RemovePeer(peerId);
             }
-            DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(peerId)} reconnected on connection #{senderId} (was #{bound}).");
-            connectionLastSeenMs.Remove(bound);
+            return;
         }
-        peerConnectionIds[peerId] = senderId;
-        connectionLastSeenMs[senderId] = Environment.TickCount64;
-        return false;
-    }
-
-    private void DispatchCore(MpMessage message, bool isFromHost, uint senderId)
-    {
         if (message is IHostOnlyMessage && !isFromHost)
         {
             DiagnosticLog.Warn($"[Multiplayer] Dropped {message.GetType().Name} -- relay says it wasn't from the host.");
@@ -151,11 +150,24 @@ public sealed partial class MultiplayerManager
         }
         if (IsHost && ClaimedPeerId(message) is { } claimedId)
         {
-            if (IsImpersonating(claimedId, senderId)) return;
+            // The relay stamps each message with the identity it derived from the sender's
+            // secret, and RelayWire.Validate already refused a mismatch; checked again here.
+            if (claimedId != senderPeerId)
+            {
+                DiagnosticLog.Warn($"[Multiplayer] Dropped {message.GetType().Name} claiming to be {Session.NameOf(claimedId)} ({claimedId}) from {senderPeerId}.");
+                return;
+            }
+            if (peerConnectionIds.TryGetValue(claimedId, out var bound) && bound != senderId)
+                DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(claimedId)} reconnected on connection #{senderId} (was #{bound}).");
+            peerConnectionIds[claimedId] = senderId;
             if (bannedPeers.ContainsKey(claimedId))
             {
-                // Repeat the kick for a banned client that rejoins or never got it.
-                if (message is HelloMessage) _ = relay?.SendAsync(new KickMessage(claimedId, Banned: true));
+                // Repeat the kick and the relay ban for a banned client that rejoins or never got it.
+                if (message is HelloMessage)
+                {
+                    _ = relay?.SendAsync(new KickMessage(claimedId, Banned: true));
+                    _ = relay?.ModerateAsync("ban", claimedId);
+                }
                 return;
             }
         }
@@ -181,6 +193,7 @@ public sealed partial class MultiplayerManager
                     break;
                 }
                 peerLastSeenMs[hello.PeerId] = Environment.TickCount64;
+                peerLastHelloMs[hello.PeerId] = Environment.TickCount64;
                 var build = new PeerBuildInfo(NetGuard.Clean(hello.Version), NetGuard.Clean(hello.Checksum));
                 Session.Names[hello.PeerId] = NetGuard.Clean(hello.DisplayName);
                 Session.Builds[hello.PeerId] = build;
@@ -359,8 +372,19 @@ public sealed partial class MultiplayerManager
                 break;
             }
             case SessionEndedMessage ended when IsHost:
+            {
+                // A leave sent on the way out can still be in flight when the same peer comes
+                // back. Right after a Hello it is held until the peer's silence confirms it.
+                var sinceHello = Environment.TickCount64 - peerLastHelloMs.GetValueOrDefault(ended.PeerId, long.MinValue / 2);
+                if (sinceHello < RejoinGraceMs)
+                {
+                    DiagnosticLog.Info($"[Multiplayer] Holding a leave from {Session.NameOf(ended.PeerId)} -- they registered {sinceHello}ms ago, so it may have crossed their rejoin.");
+                    deferredLeaveMs[ended.PeerId] = Environment.TickCount64;
+                    break;
+                }
                 RemovePeer(ended.PeerId);
                 break;
+            }
             // Everyone else learns of it from the lobby state broadcast alongside.
             case KickMessage kick when !IsHost && kick.PeerId == MyPeerId:
                 DiagnosticLog.Info($"[Multiplayer] {(kick.Banned ? "Banned" : "Removed")} from the session by the host.");

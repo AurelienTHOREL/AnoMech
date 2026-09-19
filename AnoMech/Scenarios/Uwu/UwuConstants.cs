@@ -98,6 +98,12 @@ public class UwuConstants
         public const ushort InfernalFetters = 9;
     }
 
+    public class EObjId
+    {
+        public const uint Arena = 2007457;
+        public const uint ArenaLayoutId = 7538913;
+    }
+
     public class Geometry
     {
         public const float ArenaRadius = 19.4f;

@@ -69,6 +69,69 @@ internal static unsafe class LayoutInstanceDiagnostics
         return true;
     }
 
+    // IsActive of a SharedGroup and its children in SetActiveRecursive's order: what a
+    // recursive SetSharedGroupActive overwrites, since the children don't all share one state.
+    public static bool[]? CaptureActiveStates(uint layoutId)
+    {
+        var world = LayoutWorld.Instance();
+        if (world == null) return null;
+        var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
+        if (instance == null) return null;
+        var states = new List<bool>();
+        CaptureRecursive(instance, 3, states);
+        return states.ToArray();
+    }
+
+    // Writes CaptureActiveStates' result back. A tree that changed shape since only gets its
+    // SharedGroup re-enabled, and returns false.
+    public static bool RestoreActiveStates(uint layoutId, bool[] states)
+    {
+        var world = LayoutWorld.Instance();
+        if (world == null) return false;
+        var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
+        if (instance == null) return false;
+        var current = new List<bool>(states.Length);
+        CaptureRecursive(instance, 3, current);
+        if (current.Count != states.Length)
+        {
+            instance->SetActive(true);
+            return false;
+        }
+        var next = 0;
+        RestoreRecursive(instance, 3, states, ref next);
+        return true;
+    }
+
+    private static void CaptureRecursive(ILayoutInstance* inst, int depth, List<bool> states)
+    {
+        if (inst == null) return;
+        states.Add(inst->IsActive);
+        if (depth <= 0 || inst->Id.Type != InstanceType.SharedGroup) return;
+        var sg = (SharedGroupLayoutInstance*)inst;
+        var count = sg->Instances.Instances.Count;
+        for (var i = 0; i < count && i < 16; i++)
+        {
+            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
+            if (child != null && child->Instance != null)
+                CaptureRecursive(child->Instance, depth - 1, states);
+        }
+    }
+
+    private static void RestoreRecursive(ILayoutInstance* inst, int depth, bool[] states, ref int next)
+    {
+        if (inst == null) return;
+        inst->SetActive(states[next++]);
+        if (depth <= 0 || inst->Id.Type != InstanceType.SharedGroup) return;
+        var sg = (SharedGroupLayoutInstance*)inst;
+        var count = sg->Instances.Instances.Count;
+        for (var i = 0; i < count && i < 16; i++)
+        {
+            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
+            if (child != null && child->Instance != null)
+                RestoreRecursive(child->Instance, depth - 1, states, ref next);
+        }
+    }
+
     // True if either table the engine keeps for a spawn packet's LayoutId has an instance --
     // EObj spawn packets refer to EventObject placements, MapEffect slots to SharedGroups.
     public static bool Exists(uint layoutId)

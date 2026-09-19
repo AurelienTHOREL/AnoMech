@@ -68,6 +68,9 @@ public sealed class Game : IDisposable
 
     private IScenario? activeScenario;
     private float scenarioElapsed;
+    // The phase of the last run in the loaded zone, host and peer alike (activeScenario is
+    // host-only and cleared by a Reset).
+    private IPhase? lastPhase;
     private bool firstDeathScheduled;
     private bool firstFreezeScheduled;
     private readonly OpcodeUpdater opcodeUpdater;
@@ -132,21 +135,35 @@ public sealed class Game : IDisposable
     // selectedWaymark: index into the scenario's WaymarkPresets; ignored when it has none.
     public void RunScenario(IScenario scenario, PartyRole? roleOverride = null, int? selectedAi = 0, int selectedWaymark = 0)
     {
-        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, null, null, isPeer: false));
+        Plugin.Framework.Run(() => { RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, null, null, isPeer: false); });
     }
 
     // Multiplayer host: RunScenario with `networkRoles` spawned as SimNetworkPuppet, named
-    // after their players (`networkNames`).
-    public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames)
+    // after their players (`networkNames`). `resolved` runs in the same callback, with why the
+    // start was refused, or null once the run is up.
+    public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Action<string?> resolved)
     {
-        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false));
+        Plugin.Framework.Run(() =>
+        {
+            string? refusal;
+            try
+            {
+                refusal = RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false);
+            }
+            catch (Exception e)
+            {
+                resolved($"the scenario threw {e.GetType().Name} while loading");
+                throw;
+            }
+            resolved(refusal);
+        });
     }
 
     // Multiplayer peer: same zone/party/waymarks, but never zone/phase/scenario.Run; every
     // other slot is a puppet driven by the host's snapshots.
     public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames)
     {
-        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true));
+        Plugin.Framework.Run(() => { RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true); });
     }
 
     // Raised when Kill actually takes a slot down; the host broadcasts RoleKilled from it. A
@@ -162,7 +179,8 @@ public sealed class Game : IDisposable
         return presets[0].Markers;
     }
 
-    private void RunScenarioInternal(IScenario scenario, PartyRole? roleOverride, int? selectedAi, int selectedWaymark, IReadOnlySet<PartyRole>? networkRoles, IReadOnlyDictionary<PartyRole, string>? networkNames, bool isPeer)
+    // Null once the run is up, else why it was refused.
+    private string? RunScenarioInternal(IScenario scenario, PartyRole? roleOverride, int? selectedAi, int selectedWaymark, IReadOnlySet<PartyRole>? networkRoles, IReadOnlyDictionary<PartyRole, string>? networkNames, bool isPeer)
     {
         var solo = selectedAi is null;
         var phase = scenario.Phase;
@@ -173,7 +191,7 @@ public sealed class Game : IDisposable
         if (!ZoneSession.IsInInn())
         {
             Plugin.Log.Warning("Game: scenarios can only run from an inn; aborting.");
-            return;
+            return "not in an inn";
         }
 
         // Per-player settings the fight can't produce together. Empty for a peer and for solo,
@@ -183,7 +201,7 @@ public sealed class Game : IDisposable
         {
             foreach (var conflict in conflicts)
                 Plugin.Log.Warning($"Game: refusing to start {scenario.Name} -- {conflict}");
-            return;
+            return "impossible scenario settings";
         }
 
         ResetInternal();
@@ -192,7 +210,7 @@ public sealed class Game : IDisposable
         if (player == null)
         {
             Plugin.Log.Warning("Game: no local player; aborting scenario start");
-            return;
+            return "no local player";
         }
 
 #if DEBUG
@@ -204,17 +222,20 @@ public sealed class Game : IDisposable
         // Captured before TryLoad: false only on the first start from the inn (a true
         // zone entry), true for any restart/switch within the already-loaded zone.
         var freshLoad = !World.Map.IsZoneLoaded;
+        if (!freshLoad && lastPhase != phase) World.Map.RestoreSuppressedArenaSlots();
 
         World.HideObject(ExitObjectBaseId);
         World.Map.TryLoad(
             new TargetInstance(zone.TerritoryId, zone.Origin, zone.Origin + PlayerSpawnLocal, phase.Weather, phase.FogHold),
             zone.Level, zone.ItemLevel);
+        lastPhase = phase;
         World.ScenarioOrigin = zone.Origin;
         World.Map.ArmColliderDrops(zone.ColliderRemovalPoints.Select(World.Coordinates.ToGlobal));
         World.PlaceWaymarks(ResolveWaymarks(zone, selectedWaymark));
         World.CreateParty(player.ClassJob.RowId, scenario.TankMaxHealth, roleOverride, solo, networkRoles, networkNames);
         // Client-asset setup a peer needs too (see IZone.RunClientSetup).
         zone.RunClientSetup(World);
+        phase.RunClientSetup(World);
         // A peer runs no scenario logic; zone.Run also creates the arena boundary the
         // out-of-arena check below reads, so that check no-ops for a peer too.
         if (!isPeer)
@@ -261,6 +282,7 @@ public sealed class Game : IDisposable
             // networkRoles null, not solo: a peer passes selectedAi null too.
             Message = new SeStringBuilder().AddText($"[AnoMech] Starting: {FullName(scenario)}{(networkRoles is null ? " (Solo)" : "")}").Build(),
         });
+        return null;
     }
 
     // Sprint goes on cooldown when the player presses it inside a scenario

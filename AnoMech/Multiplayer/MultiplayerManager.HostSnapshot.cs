@@ -119,10 +119,16 @@ public sealed partial class MultiplayerManager
                 SimAssets.WarnIfUnknown(SimAssetKind.Timeline, hostTimelineId, "enemy timeline");
             foreach (var hostLockon in newLockonVfxIds)
                 SimAssets.WarnIfUnknown(SimAssetKind.Lockon, hostLockon, "enemy lockon");
+            if (enemy.TimelineHoldState != TimelineHoldKind.None)
+                SimAssets.WarnIfUnknown(SimAssetKind.Timeline, enemy.TimelineHoldId, "enemy timeline hold");
+            if (enemy.DirectTimelineSeq > 0)
+                SimAssets.WarnIfUnknown(SimAssetKind.Timeline, enemy.DirectTimelineId, "enemy direct timeline");
+            foreach (var path in enemy.ActivePersistentVfxPaths)
+                SimAssets.WarnIfUnknownPath(path, "enemy persistent VFX");
             enemies.Add(new EnemyState(
                 netId, enemy.BNpcBaseId, cfg.NameId, cfg.Level, enemy.Targetable, enemy.EnemyListMode,
                 cfg.ModelCharaId, cfg.Scale, cfg.HitboxRadius, cfg.InitialModeAttributeFlags, enemy.Visible, modelState,
-                statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList(),
+                enemy.ActiveStatuses.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime, s.Instance)).ToList(),
                 enemy.AnimationTimelineId, enemy.AnimationTimelineSeq, newLockonVfxIds,
                 enemy.AnimationState?.Arg2, enemy.AnimationState?.Arg3, enemy.AnimationStateSeq,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
@@ -187,6 +193,7 @@ public sealed partial class MultiplayerManager
             var eoConfig = eo.SpawnConfig;
             var eventId = eoConfig is null ? 0u : (uint)eoConfig.EventId;
             SimAssets.WarnIfUnknown(SimAssetKind.EventId, eventId, "event object EventId");
+            SimAssets.WarnIfUnknown(SimAssetKind.Layout, eo.LayoutId, "event object LayoutId");
             eventObjects.Add(new EventObjectState(
                 netId, eo.EObjRowId, eo.VisibleState, eo.CurrentState,
                 eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation, eo.LayoutId,
@@ -236,7 +243,7 @@ public sealed partial class MultiplayerManager
                 if (newLockonVfxIds.Count > 0)
                     DiagnosticLog.Info($"[Multiplayer] Host: role {role} NewLockonVfxIds -> [{string.Join(",", newLockonVfxIds)}].");
                 newVfx = DrainVfx(member, $"role {role}");
-                statuses = statusSnapshot.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime)).ToList();
+                statuses = member.ActiveStatuses.Select(s => new EnemyStatusState(s.StatusId, s.Stacks, s.RemainingTime, s.Instance)).ToList();
                 var bc = member.BattleCharaPtr;
                 if (bc != null)
                 {
@@ -251,7 +258,12 @@ public sealed partial class MultiplayerManager
                     hostRoleLastLoggedAnimationTimeline[role] = member.AnimationTimelineSeq;
                     DiagnosticLog.Info($"[Multiplayer] Host: role {role} AnimationTimelineId -> {roleTimelineId} (loop {member.AnimationTimelineLoopId}, seq {member.AnimationTimelineSeq}).");
                     if (roleTimelineId != 0) SimAssets.WarnIfUnknown(SimAssetKind.Timeline, roleTimelineId, "role timeline");
+                    SimAssets.WarnIfUnknown(SimAssetKind.Timeline, member.AnimationTimelineLoopId, "role loop timeline");
                 }
+                foreach (var lockon in newLockonVfxIds)
+                    SimAssets.WarnIfUnknown(SimAssetKind.Lockon, lockon, "role lockon");
+                foreach (var path in member.ActivePersistentVfxPaths)
+                    SimAssets.WarnIfUnknownPath(path, "role persistent VFX");
             }
             else
             {
@@ -293,9 +305,12 @@ public sealed partial class MultiplayerManager
         => _ = relay?.SendAsync(new RoleKilledMessage(role, cause));
 
     private void OnOmenSpawnedHost(string path, Placement placement, Vector3 scale, float durationSeconds)
-        => _ = relay?.SendAsync(new SpawnOmenMessage(
+    {
+        SimAssets.WarnIfUnknownPath(path, "omen");
+        _ = relay?.SendAsync(new SpawnOmenMessage(
             path, placement.Position.X, placement.Position.Y, placement.Position.Z, placement.Rotation,
             scale.X, scale.Y, scale.Z, durationSeconds));
+    }
 
     // The host reads its own bookkeeping; a peer reads what the host relayed (PeerStatusMessage).
     public bool IsPeerStale(Guid peerId) => IsHost

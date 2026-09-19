@@ -167,8 +167,11 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) ModelState -> 0x{e.ModelState:X2}.");
                 enemy.SetModelState(e.ModelState);
             }
-            var currentStatuses = enemy.ActiveStatusSnapshot;
             var enemyStatuses = NetGuard.Cap(e.Statuses, NetGuard.MaxStatusesPerEntity);
+            if (!peerEnemyStatusInstances.TryGetValue(e.NetId, out var enemyInstances))
+                peerEnemyStatusInstances[e.NetId] = enemyInstances = new Dictionary<ushort, int>();
+            DropRecreatedStatuses(enemy, enemyStatuses, enemyInstances, _ => true, $"enemy NetId {e.NetId}");
+            var currentStatuses = enemy.ActiveStatusSnapshot;
             foreach (var target in enemyStatuses)
             {
                 if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
@@ -390,9 +393,36 @@ public sealed partial class MultiplayerManager
         }
     }
 
+    // A status the host dropped and re-added arrives as a new instance of the same id. Refreshed
+    // in place it would skip the engine's gain path, which is what applies a param-driven look
+    // (Kefka's trance aura), so it is dropped here for the reconcile to add back. Ids the host
+    // holds more than once are left to the plain reconcile.
+    private static void DropRecreatedStatuses(SimCharacter character, IReadOnlyList<EnemyStatusState> targets,
+        Dictionary<ushort, int> instances, Func<ushort, bool> mayDrop, string who)
+    {
+        foreach (var target in targets)
+        {
+            if (targets.Count(s => s.StatusId == target.StatusId) != 1)
+            {
+                instances.Remove(target.StatusId);
+                continue;
+            }
+            if (instances.TryGetValue(target.StatusId, out var seen) && seen != target.Instance
+                && mayDrop(target.StatusId) && character.HasStatus(target.StatusId))
+            {
+                DiagnosticLog.Info($"[Multiplayer] Peer: {who} status {target.StatusId} was re-added by the host -- re-adding it here.");
+                character.RemoveStatus(target.StatusId);
+            }
+            instances[target.StatusId] = target.Instance;
+        }
+        foreach (var id in instances.Keys.Where(id => targets.All(s => s.StatusId != id)).ToList())
+            instances.Remove(id);
+    }
+
     private void ForgetPeerEnemy(int netId)
     {
         peerEnemies.Remove(netId);
+        peerEnemyStatusInstances.Remove(netId);
         peerEnemyModelState.Remove(netId);
         peerEnemyLastLoggedStatuses.Remove(netId);
         peerEnemyAnimationTimeline.Remove(netId);
@@ -520,10 +550,13 @@ public sealed partial class MultiplayerManager
                     bc->Health = currentHp;
                 }
             }
-            var currentStatuses = member.ActiveStatusSnapshot;
             var roleStatuses = NetGuard.Cap(r.Statuses, NetGuard.MaxStatusesPerEntity);
             if (!peerRoleReconciledStatusIds.TryGetValue(r.Role, out var reconciledIds))
                 peerRoleReconciledStatusIds[r.Role] = reconciledIds = new HashSet<ushort>();
+            if (!peerRoleStatusInstances.TryGetValue(r.Role, out var roleInstances))
+                peerRoleStatusInstances[r.Role] = roleInstances = new Dictionary<ushort, int>();
+            DropRecreatedStatuses(member, roleStatuses, roleInstances, reconciledIds.Contains, $"role {r.Role}");
+            var currentStatuses = member.ActiveStatusSnapshot;
             foreach (var target in roleStatuses)
             {
                 // Tracked even when unchanged, so the removal loop still knows it is host-managed.

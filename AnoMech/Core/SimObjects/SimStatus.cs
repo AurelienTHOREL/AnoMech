@@ -16,6 +16,11 @@ public sealed unsafe class SimStatus : ISimObject
     public bool IsActive { get; private set; }
     public ushort Stacks { get; private set; }
 
+    // Distinguishes a re-added status from one refreshed in place: only the add goes through
+    // the engine's gain path, which is what applies a param-driven look.
+    private static int nextInstance;
+    public int Instance { get; } = ++nextInstance;
+
     // 0 = permanent until removed, so a peer replicating it gets the same behaviour.
     public float RemainingTime => duration > 0f ? Math.Max(0f, duration - elapsed) : 0f;
 

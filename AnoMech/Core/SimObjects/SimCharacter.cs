@@ -256,6 +256,8 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     public IReadOnlyList<(ushort StatusId, ushort Stacks, float RemainingTime)> ActiveStatusSnapshot =>
         statusList.Where(s => s.IsActive).Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList();
 
+    public IReadOnlyList<SimStatus> ActiveStatuses => statusList.Where(s => s.IsActive).ToList();
+
 
     // -------------------------
     // Other Subsystem

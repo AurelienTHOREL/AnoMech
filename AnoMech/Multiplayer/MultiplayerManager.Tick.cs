@@ -98,6 +98,24 @@ public sealed partial class MultiplayerManager
         };
     }
 
+    // A peer heard from after its held leave came back (pongs arrive every ping); one that
+    // stays silent for the stale timeout really left.
+    private void ConfirmDeferredLeaves()
+    {
+        var now = Environment.TickCount64;
+        foreach (var (peerId, heldAt) in deferredLeaveMs.ToList())
+        {
+            if (peerLastSeenMs.GetValueOrDefault(peerId, long.MinValue) > heldAt)
+            {
+                deferredLeaveMs.Remove(peerId);
+                continue;
+            }
+            if (now - heldAt < PeerStaleTimeoutMs) continue;
+            DiagnosticLog.Info($"[Multiplayer] {Session.NameOf(peerId)} stayed silent after their held leave -- removing them.");
+            RemovePeer(peerId);
+        }
+    }
+
     public void Tick(float deltaSeconds)
     {
         SubscribeMapEventsOnce();
@@ -150,6 +168,8 @@ public sealed partial class MultiplayerManager
                     if (endResendsRemaining <= 0) pendingEndResendReturnedToInn = null;
                 }
             }
+
+            if (deferredLeaveMs.Count > 0) ConfirmDeferredLeaves();
         }
         else if (IsSessionNotFound)
         {
