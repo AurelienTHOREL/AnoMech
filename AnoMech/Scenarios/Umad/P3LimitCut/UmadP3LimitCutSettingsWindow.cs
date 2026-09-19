@@ -35,31 +35,31 @@ public sealed class UmadP3LimitCutSettingsWindow
         {
             SettingsGrid.Row("First clone:");
             var spot = (Overrides.StartSpot ?? -1) + 1;
-            ImGui.SetNextItemWidth(140);
+            SettingsGrid.ItemWidth(140);
             if (ImGui.Combo("##lcstartspot", ref spot, SpotLabels, SpotLabels.Length))
                 Overrides.StartSpot = spot == 0 ? null : spot - 1;
 
             SettingsGrid.Row("Clone order:");
             var order = Overrides.Clockwise switch { true => 1, false => 2, null => 0 };
-            ImGui.SetNextItemWidth(160);
+            SettingsGrid.ItemWidth(160);
             if (ImGui.Combo("##lcorder", ref order, OrderLabels, OrderLabels.Length))
                 Overrides.Clockwise = order switch { 1 => true, 2 => false, _ => null };
 
             SettingsGrid.Row("Bosses held at:");
             var boss = Overrides.BossSpot is { } b ? Array.IndexOf(BossSpotValues, b) + 1 : 0;
-            ImGui.SetNextItemWidth(140);
+            SettingsGrid.ItemWidth(140);
             if (ImGui.Combo("##lcbossspot", ref boss, BossSpotLabels, BossSpotLabels.Length))
                 Overrides.BossSpot = boss == 0 ? null : BossSpotValues[boss - 1];
 
             SettingsGrid.Row("Umbra Smash bait:");
             var bait = Overrides.BaitRole is { } r ? Array.IndexOf(BaitRoles, r) + 1 : 0;
-            ImGui.SetNextItemWidth(180);
+            SettingsGrid.ItemWidth(180);
             if (ImGui.Combo("##lcbait", ref bait, BaitLabels, BaitLabels.Length))
                 Overrides.BaitRole = bait == 0 ? null : BaitRoles[bait - 1];
 
             SettingsGrid.Row("Bot tank LB3:");
             var lb = Overrides.BotTankLimitBreak switch { true => 1, false => 2, null => 0 };
-            ImGui.SetNextItemWidth(200);
+            SettingsGrid.ItemWidth(200);
             if (ImGui.Combo("##lclb", ref lb, LimitBreakLabels, LimitBreakLabels.Length))
                 Overrides.BotTankLimitBreak = lb switch { 1 => true, 2 => false, _ => null };
 
@@ -79,13 +79,13 @@ public sealed class UmadP3LimitCutSettingsWindow
 
             SettingsGrid.Row($"{whose}number:");
             var number = Overrides.Number.Effective(editingSeat) ?? 0;
-            ImGui.SetNextItemWidth(140);
+            SettingsGrid.ItemWidth(140);
             if (ImGui.Combo("##lcnumber", ref number, NumberLabels, NumberLabels.Length))
                 Overrides.Number.Set(editingSeat, number == 0 ? null : number);
 
             SettingsGrid.Row($"{whose}wind:");
             var wind = Overrides.Wind.Effective(editingSeat) switch { Wind.Headwind => 1, Wind.Tailwind => 2, _ => 0 };
-            ImGui.SetNextItemWidth(140);
+            SettingsGrid.ItemWidth(140);
             if (ImGui.Combo("##lcwind", ref wind, WindLabels, WindLabels.Length))
                 Overrides.Wind.Set(editingSeat, wind switch { 1 => Wind.Headwind, 2 => Wind.Tailwind, _ => null });
 

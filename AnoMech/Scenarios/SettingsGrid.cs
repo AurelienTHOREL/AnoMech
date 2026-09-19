@@ -13,6 +13,11 @@ internal static class SettingsGrid
     public static bool Begin(string id) =>
         ImGui.BeginTable(id, 2, ImGuiTableFlags.SizingFixedFit);
 
+    // Widths of the panels' combos, scaled down inside the lobby's compact settings section.
+    public static float WidthScale = 1f;
+
+    public static void ItemWidth(float width) => ImGui.SetNextItemWidth(width * WidthScale);
+
     private static readonly string[] RoleLabels = ["MT", "OT", "H1", "H2", "M1", "M2", "R1", "R2"];
 
     public static string RoleLabel(PartyRole role) => RoleLabels[(int)role];
@@ -57,7 +62,7 @@ internal static class SettingsGrid
             labels[i] = $"{RoleLabel(role)} — {seat}";
         }
         var idx = (int)current;
-        ImGui.SetNextItemWidth(220);
+        ItemWidth(220);
         if (ImGui.Combo(id, ref idx, labels, labels.Length) && idx is >= 0 and < 8)
             current = (PartyRole)idx;
         if (ImGui.IsItemHovered())

@@ -63,37 +63,37 @@ public sealed class UmadP5FloodSettingsWindow
 
             SettingsGrid.Row("Leads first:");
             var idx = Overrides.NeSwFirst switch { true => 1, false => 2, null => 0 };
-            ImGui.SetNextItemWidth(140);
+            SettingsGrid.ItemWidth(140);
             if (ImGui.Combo("##firstline", ref idx, FirstLabels, FirstLabels.Length))
                 Overrides.NeSwFirst = idx switch { 1 => true, 2 => false, _ => null };
 
             SettingsGrid.Row("Stack target:");
             var anchorIdx = Overrides.AnchorRole is { } r ? Array.IndexOf(AnchorRoles, r) + 1 : 0;
-            ImGui.SetNextItemWidth(140);
+            SettingsGrid.ItemWidth(140);
             if (ImGui.Combo("##anchorrole", ref anchorIdx, AnchorLabels, AnchorLabels.Length))
                 Overrides.AnchorRole = anchorIdx == 0 ? null : AnchorRoles[anchorIdx - 1];
 
             SettingsGrid.Row("Starting quadrant:");
             var quadIdx = (Overrides.StartQuadrant ?? -1) + 1;
-            ImGui.SetNextItemWidth(140);
+            SettingsGrid.ItemWidth(140);
             if (ImGui.Combo("##startquadrant", ref quadIdx, QuadrantLabels, QuadrantLabels.Length))
                 Overrides.StartQuadrant = quadIdx == 0 ? null : quadIdx - 1;
 
             SettingsGrid.Row("Rotation:");
             var rotIdx = Overrides.RotationClockwise switch { true => 1, false => 2, null => 0 };
-            ImGui.SetNextItemWidth(160);
+            SettingsGrid.ItemWidth(160);
             if (ImGui.Combo("##rotationdir", ref rotIdx, RotationLabels, RotationLabels.Length))
                 Overrides.RotationClockwise = rotIdx switch { 1 => true, 2 => false, _ => null };
 
             SettingsGrid.Row("Wave carrier (debug):");
             var carrierIdx = (int)Overrides.CarrierMode;
-            ImGui.SetNextItemWidth(160);
+            SettingsGrid.ItemWidth(160);
             if (ImGui.Combo("##carriermode", ref carrierIdx, CarrierLabels, CarrierLabels.Length))
                 Overrides.CarrierMode = (FloodCarrierMode)carrierIdx;
 
             SettingsGrid.Row("Wave delivery (debug):");
             var deliveryIdx = (int)Overrides.WaveDelivery;
-            ImGui.SetNextItemWidth(160);
+            SettingsGrid.ItemWidth(160);
             if (ImGui.Combo("##wavedelivery", ref deliveryIdx, DeliveryLabels, DeliveryLabels.Length))
                 Overrides.WaveDelivery = (FloodWaveDelivery)deliveryIdx;
 
@@ -127,7 +127,7 @@ public sealed class UmadP5FloodSettingsWindow
     {
         SettingsGrid.Row(label);
         var idx = (int)current;
-        ImGui.SetNextItemWidth(140);
+        SettingsGrid.ItemWidth(140);
         if (ImGui.Combo(id, ref idx, DirectionLabels, DirectionLabels.Length))
             set((FloodDirection)idx);
     }

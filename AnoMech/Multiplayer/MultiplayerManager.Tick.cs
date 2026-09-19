@@ -219,26 +219,17 @@ public sealed partial class MultiplayerManager
         }
         else
         {
-            if (Plugin.GameInstance.World.Map.IsInInstance)
-            {
-                if (!peerEnteredInstance) DiagnosticLog.Info("[Multiplayer] Peer's deferred zone entry completed -- now sending SelfPose.");
-                peerEnteredInstance = true;
-                TryStartDebugBotReplay();
-                if (debugShadowStateGeneric != null && deltaSeconds > 0f
-                    && TryResolveScenario() is IMultiplayerReplayable replayable)
-                    replayable.TickReplay(debugShadowStateGeneric, deltaSeconds);
-            }
-            else if (peerEnteredInstance)
+            if (!peerEnteredInstance) return; // this run's zone entry is still queued
+            if (!Plugin.GameInstance.World.Map.IsInInstance)
             {
                 DiagnosticLog.Info("[Multiplayer] Peer's zone was unloaded out from under the run (IsInInstance went false) -- stopping locally.");
                 running = false;
                 StopDebugBotReplay();
                 return;
             }
-            else
-            {
-                return; // zone load still pending
-            }
+            if (debugShadowStateGeneric != null && deltaSeconds > 0f
+                && TryResolveScenario() is IMultiplayerReplayable replayable)
+                replayable.TickReplay(debugShadowStateGeneric, deltaSeconds);
             SendSelfPose();
             SendSelfMitigationIfChanged();
         }

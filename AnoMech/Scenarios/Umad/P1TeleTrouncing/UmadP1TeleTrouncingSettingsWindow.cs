@@ -37,7 +37,7 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
     {
         SettingsGrid.Row("Statue beats (debug):");
         var modeIdx = (int)Overrides.PropsBeatMode;
-        ImGui.SetNextItemWidth(170);
+        SettingsGrid.ItemWidth(170);
         if (ImGui.Combo("##propbeatmode", ref modeIdx, BeatModeLabels, BeatModeLabels.Length))
             Overrides.PropsBeatMode = (PropBeatMode)modeIdx;
         ImGui.SameLine();

@@ -7,6 +7,7 @@ using AnoMech.Core.Game;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
+using AnoMech.Core.Native;
 using AnoMech.Core.SimObjects;
 using AnoMech.Multiplayer;
 using static AnoMech.Scenarios.Umad.UmadConstants;
@@ -75,6 +76,15 @@ public sealed class UmadP4KefkaSaysScenario : IMultiplayerReplayable
         Run_OtherDebuffs();
         Run_AccelerationBomb();
     }
+
+    // First played on a fresh actor, where an unloaded timeline can drop (see ActionTimelinePreload).
+    private static readonly (ushort Id, string Key)[] NeoExdeathTimelines =
+    [
+        (TimelineId.NeoExdeathShow, "mon_sp/m0418/show/mon_sp001"),
+    ];
+
+    public void RunInstanceEvents(SimWorld instanceWorld)
+        => ActionTimelinePreload.Preload(NeoExdeathTimelines, "UmadP4KefkaSays");
 
     private void Run_InstanceEvents()
     {
@@ -244,7 +254,7 @@ public sealed class UmadP4KefkaSaysScenario : IMultiplayerReplayable
         SimEnemy? neo_Exdeath_400041A4 = null;
         world.Events.Add(0f, () => neo_Exdeath_400041A4 = world.SpawnEnemy(new EnemySpawnConfig(BNpcBaseId: BNpcBaseId.NeoExdeath, NameId: BNpcNameId.NeoExdeath, Level: 100, Targetable: false, EnemyList: EnemyListMode.OnlyWhenVisible, IsVisible: false, Placement: new Placement(new Vector3(20.000f, 0.000f, 0.000f), -1.570f))));
         world.Events.Add(6.32f, () => neo_Exdeath_400041A4?.SetPosition(new Placement(new Vector3(14.142f, 0.000f, -14.142f), -0.785f)));
-        world.Events.Add(6.46f, () => neo_Exdeath_400041A4?.PlayAnimationTimeline(TimelineId.Spawn));
+        world.Events.Add(6.46f, () => neo_Exdeath_400041A4?.PlayAnimationTimeline(TimelineId.NeoExdeathShow));
         world.Events.Add(6.46f, () => neo_Exdeath_400041A4?.SetVisible(true));
         
         world.Events.Add(11.28f, () => neo_Exdeath_400041A4?.AddStatus(StatusId.KefkaLiesVfx, stacks: state.Wave1TrueVal, overrideStacks: true));
@@ -259,7 +269,7 @@ public sealed class UmadP4KefkaSaysScenario : IMultiplayerReplayable
         
         world.Events.Add(53.28f, () => neo_Exdeath_400041A4?.PlayAnimationTimeline(TimelineId.WarpOut));
         world.Events.Add(55.25f, () => neo_Exdeath_400041A4?.SetPosition(state.NeoExdeathDirection.Apply(new Placement(new Vector3(0, 0, -20), 0))));
-        world.Events.Add(55.58f, () => neo_Exdeath_400041A4?.PlayAnimationTimeline(TimelineId.Spawn));
+        world.Events.Add(55.58f, () => neo_Exdeath_400041A4?.PlayAnimationTimeline(TimelineId.NeoExdeathShow));
         
         world.Events.Add(57.30f, () => neo_Exdeath_400041A4?.AddStatus(StatusId.KefkaLiesVfx, stacks: state.Wave4TrueVal, overrideStacks: true));
         world.Events.Add(57.39f, () => neo_Exdeath_400041A4?.Cast(state.Antilights[0].ResolveFloodAction));

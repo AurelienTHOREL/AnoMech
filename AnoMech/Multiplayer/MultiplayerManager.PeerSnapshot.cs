@@ -702,13 +702,15 @@ public sealed partial class MultiplayerManager
         if (NetGuard.Clean(msg.Reason) is { Length: > 0 } reason) AnnounceRunEnded(reason);
         running = false;
         StopDebugBotReplay();
-        // Leave() assumes a zone was entered; before the deferred entry it would teleport the
-        // real character to garbage coordinates.
-        if (!Plugin.GameInstance.World.Map.IsInInstance)
+        // Leave() assumes a zone was entered: an end that beats our queued entry is acted on by
+        // OnPeerStartResolved once the entry completes.
+        if (peerEntryQueued)
         {
-            DiagnosticLog.Info("[Multiplayer] EndMessage received before our own deferred zone entry completed -- nothing to leave/reset.");
+            endAfterPeerEntry = msg.ReturnedToInn;
+            DiagnosticLog.Info("[Multiplayer] EndMessage received while our zone entry is queued -- acting on it once it completes.");
             return;
         }
+        if (!Plugin.GameInstance.World.Map.IsInInstance) return;
         if (msg.ReturnedToInn)
             Plugin.GameInstance.Leave();
         else

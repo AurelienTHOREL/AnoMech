@@ -22,7 +22,7 @@ public sealed partial class MultiplayerManager
         Session.SelectedAi >= 0 && Session.SelectedAi < scenario.AiStrats.Count;
 
     // Needs both the host's replay message and our own zone entry, which arrive in either
-    // order, so Dispatch and Tick both call it.
+    // order, so Dispatch and OnPeerStartResolved both call it.
     private void TryStartDebugBotReplay()
     {
         if (!debugBotControlled || debugBotReplayStarted) return;

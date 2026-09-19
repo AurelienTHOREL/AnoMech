@@ -139,16 +139,25 @@ public sealed class Game : IDisposable
     }
 
     // Multiplayer host: RunScenario with `networkRoles` spawned as SimNetworkPuppet, named
-    // after their players (`networkNames`). `resolved` runs in the same callback, with why the
-    // start was refused, or null once the run is up.
+    // after their players (`networkNames`).
     public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Action<string?> resolved)
+        => RunResolved(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false), resolved);
+
+    // Multiplayer peer: same zone/party/waymarks, but never zone/phase/scenario.Run; every
+    // other slot is a puppet driven by the host's snapshots.
+    public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Action<string?> resolved)
+        => RunResolved(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true), resolved);
+
+    // `resolved` runs in the same deferred callback as the start, with why it was refused, or
+    // null once the run is up; an exception counts as a refusal.
+    private static void RunResolved(Func<string?> start, Action<string?> resolved)
     {
         Plugin.Framework.Run(() =>
         {
             string? refusal;
             try
             {
-                refusal = RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false);
+                refusal = start();
             }
             catch (Exception e)
             {
@@ -157,13 +166,6 @@ public sealed class Game : IDisposable
             }
             resolved(refusal);
         });
-    }
-
-    // Multiplayer peer: same zone/party/waymarks, but never zone/phase/scenario.Run; every
-    // other slot is a puppet driven by the host's snapshots.
-    public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames)
-    {
-        Plugin.Framework.Run(() => { RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true); });
     }
 
     // Raised when Kill actually takes a slot down; the host broadcasts RoleKilled from it. A

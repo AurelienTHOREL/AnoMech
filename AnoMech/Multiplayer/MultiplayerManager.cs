@@ -73,9 +73,13 @@ public sealed partial class MultiplayerManager : IDisposable
     // The host's status instance last applied per id (see DropRecreatedStatuses).
     private readonly Dictionary<int, Dictionary<ushort, int>> peerEnemyStatusInstances = new();
     private readonly Dictionary<PartyRole, Dictionary<ushort, int>> peerRoleStatusInstances = new();
-    // The peer's zone load is deferred a frame past running=true, so IsInInstance==false only
-    // means "left" once it has been true.
+    // Set by OnPeerStartResolved once this run's deferred zone entry has completed. After a
+    // Reset the zone is still loaded, so IsInInstance alone can't tell this run's party from
+    // the last one's.
     private bool peerEnteredInstance;
+    private bool peerEntryQueued;
+    // An EndMessage that arrived while the entry was queued: acted on once it completes.
+    private bool? endAfterPeerEntry;
 
     // ---- Connection-quality tracking (runs in the lobby too) ---------------
     private const float PingIntervalSeconds = 2f;
@@ -316,6 +320,8 @@ public sealed partial class MultiplayerManager : IDisposable
         relay = null;
 
         running = false;
+        peerEntryQueued = false;
+        endAfterPeerEntry = null;
         SessionCode = null;
         RelayUrl = null;
         ConnectionError = null;
@@ -932,9 +938,38 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEnemyEngineSeqs.Clear();
         peerEnemyModelHidden.Clear();
         peerEnteredInstance = false;
+        peerEntryQueued = true;
+        endAfterPeerEntry = null;
         StopDebugBotReplay();
-        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles, ClaimedRoleNames());
         running = true;
+        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles, ClaimedRoleNames(), OnPeerStartResolved);
+    }
+
+    // Called from RunScenarioInternal's own callback, so snapshots and the debug-bot replay only
+    // touch this run's party (a Reset leaves the zone loaded, so IsInInstance can't tell).
+    private void OnPeerStartResolved(string? refusal)
+    {
+        peerEntryQueued = false;
+        var end = endAfterPeerEntry;
+        endAfterPeerEntry = null;
+        if (!running)
+        {
+            // Ended while the entry was queued: what the end would have done had the zone been
+            // entered then.
+            if (refusal != null) return;
+            if (end == false) Plugin.GameInstance.Reset();
+            else if (Plugin.GameInstance.World.Map.IsInInstance) Plugin.GameInstance.Leave();
+            return;
+        }
+        if (refusal != null)
+        {
+            running = false;
+            AbortStart(refusal);
+            return;
+        }
+        DiagnosticLog.Info("[Multiplayer] Peer's deferred zone entry completed -- applying snapshots and sending SelfPose.");
+        peerEnteredInstance = true;
+        TryStartDebugBotReplay();
     }
 
     // Names for the puppets: every role claimed by someone else, the host's included from a

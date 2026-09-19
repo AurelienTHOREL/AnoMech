@@ -6,6 +6,8 @@ using AnoMech.Core.Game.Party;
 using AnoMech.Multiplayer;
 using AnoMech.Scenarios;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
+using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Windowing;
 using static AnoMech.Core.Game.Game;
 
@@ -34,8 +36,15 @@ public class MultiplayerWindow : Window, IDisposable
     {
         this.plugin = plugin;
         mp = plugin.Multiplayer;
-        Size = new Vector2(420, 440);
-        SizeCondition = ImGuiCond.FirstUseEver;
+        // Grows and shrinks with its content: a settings panel opening, a roster filling up.
+        SizeConstraints = new WindowSizeConstraints
+        {
+            MinimumSize = new Vector2(420, 0),
+            MaximumSize = new Vector2(float.MaxValue, float.MaxValue),
+        };
+        Flags |= ImGuiWindowFlags.AlwaysAutoResize;
+        compactFont = Plugin.PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(
+            e => e.OnPreBuild(tk => tk.AddDalamudDefaultFont(UiBuilder.DefaultFontSizePx * CompactFontFraction)));
         IsOpen = false;
         relayUrl = plugin.Configuration.RelayServerUrl;
         relayToken = plugin.Configuration.TokenForRelay(relayUrl);
@@ -43,7 +52,51 @@ public class MultiplayerWindow : Window, IDisposable
         // so the name is prefilled in Draw().
     }
 
-    public void Dispose() { }
+    public void Dispose() => compactFont.Dispose();
+
+    // The settings panels are the bulk of the window, so they get smaller text and tighter
+    // widgets than the rest of it.
+    private const float CompactFontFraction = 0.85f;
+    private const float CompactWidthScale = 0.8f;
+    private readonly IFontHandle compactFont;
+
+    private readonly struct CompactScope : IDisposable
+    {
+        private readonly IDisposable font;
+
+        public CompactScope(IFontHandle handle)
+        {
+            font = handle.Push();
+            ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(3f, 1f));
+            ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(6f, 2f));
+            ImGui.PushStyleVar(ImGuiStyleVar.CellPadding, new Vector2(2f, 1f));
+            SettingsGrid.WidthScale = CompactWidthScale;
+        }
+
+        public void Dispose()
+        {
+            SettingsGrid.WidthScale = 1f;
+            ImGui.PopStyleVar(3);
+            font.Dispose();
+        }
+    }
+
+    // An auto-resizing window widens to fit unwrapped text, so paragraphs wrap at a fixed width.
+    private const float WrapWidth = 400f;
+
+    private static void Wrapped(string text)
+    {
+        ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + WrapWidth);
+        ImGui.TextUnformatted(text);
+        ImGui.PopTextWrapPos();
+    }
+
+    private static void WrappedColored(Vector4 color, string text)
+    {
+        ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + WrapWidth);
+        ImGui.TextColored(color, text);
+        ImGui.PopTextWrapPos();
+    }
 
     // Hidden while the fake-zone instance is loaded -- see MainWindow's PreOpenCheck.
     private bool hiddenByUs;
@@ -81,14 +134,13 @@ public class MultiplayerWindow : Window, IDisposable
 
         WindowName = $"AnoMech Multiplayer ({CurrentScenarioLabel()})###AnoMechMultiplayer";
 
-        ImGui.TextWrapped(
-            $"Vertical-slice multiplayer for {CurrentScenarioLabel()}. One host runs the real " +
-            "simulation; up to 7 others join and take over bot slots.");
+        Wrapped($"Vertical-slice multiplayer for {CurrentScenarioLabel()}. One host runs the real " +
+                "simulation; up to 7 others join and take over bot slots.");
         if (mp.SessionCode == null
             && (Plugin.MainWindow.SelectedScenario is not { } sel || !sel.SupportsMultiplayer))
         {
             // IsHost is never reset on leave, so this isn't gated on it.
-            ImGui.TextColored(new Vector4(1f, 0.6f, 0.4f, 1f),
+            WrappedColored(new Vector4(1f, 0.6f, 0.4f, 1f),
                 "Select a multiplayer-supported scenario in the main window before hosting.");
         }
         ImGui.Separator();
@@ -127,9 +179,9 @@ public class MultiplayerWindow : Window, IDisposable
 
     private void DrawConnectPanel()
     {
-        ImGui.TextWrapped("Point this at a relay server you or someone in your group is running " +
-                           "-- there is no default/public one. See Relay/README.md for how to stand " +
-                           "one up.");
+        Wrapped("Point this at a relay server you or someone in your group is running " +
+                "-- there is no default/public one. See Relay/README.md for how to stand " +
+                "one up.");
 
         ImGui.SetNextItemWidth(300);
         if (ImGui.InputText("Relay URL##relayUrl", ref relayUrl, 256))
@@ -235,7 +287,7 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "This relay does not support compression.");
         if (stable && !mp.RelayAttestsSender)
         {
-            ImGui.TextColored(new Vector4(1f, 0.55f, 0.15f, 1f), "⚠ This relay can't tell who sent a message -- anyone in the session could act as the host.");
+            WrappedColored(new Vector4(1f, 0.55f, 0.15f, 1f), "⚠ This relay can't tell who sent a message -- anyone in the session could act as the host.");
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Only join sessions of people you trust on this relay, or update the relay (senderIdentity support).");
         }
@@ -250,7 +302,7 @@ public class MultiplayerWindow : Window, IDisposable
             ImGui.SetWindowFontScale(1f);
             ImGui.SameLine();
             if (ImGui.SmallButton("Copy")) ImGui.SetClipboardText(mp.SessionCode);
-            ImGui.TextWrapped("Share this code and your relay URL with whoever is joining.");
+            Wrapped("Share this code and your relay URL with whoever is joining.");
         }
         else
         {
@@ -470,6 +522,7 @@ public class MultiplayerWindow : Window, IDisposable
             mp.PublishSelectedScenario(scenario);
             if (ImGui.CollapsingHeader("Scenario settings##mpsettings", ImGuiTreeNodeFlags.DefaultOpen))
             {
+                using var compact = new CompactScope(compactFont);
                 if (scenario is not { SupportsMultiplayer: true })
                 {
                     ImGui.TextDisabled("Select a multiplayer-supported scenario in the main window.");
@@ -493,6 +546,7 @@ public class MultiplayerWindow : Window, IDisposable
         }
 
         if (!ImGui.CollapsingHeader("Scenario settings (set by the host)##mpsettings", ImGuiTreeNodeFlags.DefaultOpen)) return;
+        using var compactSummary = new CompactScope(compactFont);
         var lines = mp.Session.ScenarioSettings;
         if (lines.Count == 0) ImGui.TextDisabled("Everything random -- the host hasn't forced anything.");
         foreach (var line in lines) ImGui.BulletText(line);
