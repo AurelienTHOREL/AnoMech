@@ -216,7 +216,6 @@ public sealed class Game : IDisposable
             TeleportPlayerToSpawn();
         else
             TeleportPlayerToSpawnIfOutsideArena();
-        ResetSprintCooldown();
         if (previousScenario != scenario)
             MechanicStreak = 0;
         Plugin.UserActions.OnScenarioStart();

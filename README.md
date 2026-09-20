@@ -85,7 +85,7 @@ See: https://github.com/anomek/MyDalamudPlugins
 Thanks for contributors:
 * [WorstAquaPlayer](https://github.com/WorstAquaPlayer) - rewriting core & fixing crashes, scenarios for uwu
 * [Wydox](https://github.com/Wydox) - EU strats for Forsaken, UMAD Exaflares, core improvements
-* [RoarkGit](https://github.com/RoarkGit) - UMAD Celestriad
+* [RoarkGit](https://github.com/RoarkGit) - UMAD Celestriad, win streaks
 
 AnoMech leans heavily on the work of other Dalamud plugins. Huge thanks to their authors!  
 Without them, the following would not be possible:
