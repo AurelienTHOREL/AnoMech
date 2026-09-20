@@ -72,15 +72,6 @@ public unsafe class SimNpc : SimCharacter
         pendingDraw = true;
     }
 
-    public uint EntityId
-    {
-        get
-        {
-            var obj = BattleCharaPtr;
-            return obj == null ? 0u : obj->EntityId;
-        }
-    }
-
     public override void Tick(float deltaSeconds)
     {
         base.Tick(deltaSeconds);

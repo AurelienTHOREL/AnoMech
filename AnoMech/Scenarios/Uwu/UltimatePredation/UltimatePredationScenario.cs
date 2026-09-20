@@ -5,9 +5,7 @@ using System.Numerics;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Ai;
 using AnoMech.Core.Game.Party;
-using AnoMech.Core.Map;
 using AnoMech.Core.SimObjects;
-using AnoMech.Pointers;
 using Dalamud.Game.Text;
 using Dalamud.Game.Text.SeStringHandling;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -16,7 +14,7 @@ using static AnoMech.Scenarios.Uwu.UwuConstants;
 
 namespace AnoMech.Scenarios.Uwu.UltimatePredation;
 
-public unsafe class UltimatePredationScenario : IScenario
+public class UltimatePredationScenario : IScenario
 {
     public string Name => "Ultimate Predation";
     public IPhase Phase => UwuZone.Ultima;
@@ -28,6 +26,7 @@ public unsafe class UltimatePredationScenario : IScenario
     private SimWorld world = null!;
     private SimParty party = null!;
 
+    private UwuUtils utils = null!;
     private UltimatePredationState state = null!;
 
     private SimEnemy? ultima;
@@ -36,15 +35,15 @@ public unsafe class UltimatePredationScenario : IScenario
 
     private SimEnemy?[] dummies = new SimEnemy?[13];
 
-    private List<Vector3> featherRainPositions = new();
-
     private SimEnemy? titan => state.ScenarioObjects.Titan;
+    private Func<SimEnemy?>[] featherRainDummies => [() => dummies[8], () => dummies[9], () => dummies[10], () => dummies[11], () => dummies[12]];
 
     public void Run(SimWorld world, int? selectedAi)
     {
         this.world = world;
         party = world.Party;
 
+        utils = new(world);
         state = new(settingsWindow.Overrides);
 
         if (selectedAi is { } idx && idx < AiStrats.Count)
@@ -93,8 +92,6 @@ public unsafe class UltimatePredationScenario : IScenario
                         0))
                 );
 
-            garuda?.AddStatusParam(StatusId.Woken, 0);
-
             ifrit = world.SpawnEnemy(
                 new EnemySpawnConfig(
                     BNpcBaseId: BNpcBaseId.Ifrit,
@@ -107,8 +104,6 @@ public unsafe class UltimatePredationScenario : IScenario
                         new Vector3(0, 0, 0),
                         0))
                 );
-
-            ifrit?.AddStatusParam(StatusId.Woken, 0);
 
             var titan = world.SpawnEnemy(
                 new EnemySpawnConfig(
@@ -123,12 +118,10 @@ public unsafe class UltimatePredationScenario : IScenario
                         0))
             );
 
-            titan?.AddStatusParam(StatusId.Woken, 0);
-
-            Awaken(ultima!, true);
-            Awaken(garuda!, false);
-            Awaken(ifrit!, false);
-            Awaken(titan!, false);
+            utils.Awaken(ultima, true);
+            utils.Awaken(garuda, false);
+            utils.Awaken(ifrit, false);
+            utils.Awaken(titan, false);
 
             state.ScenarioObjects.Titan = titan;
 
@@ -170,9 +163,9 @@ public unsafe class UltimatePredationScenario : IScenario
             world.SpawnEventObject(config);
         });
 
-        world.Events.Add(1, () => UwuUtils.UpdateArena(1));
+        world.Events.Add(1, () => utils.UpdateArena(1));
 
-        world.Events.Add(71.57f, () => UwuUtils.UpdateArena(2));
+        world.Events.Add(71.57f, () => utils.UpdateArena(2));
     }
 
     private void Ultima()
@@ -329,7 +322,7 @@ public unsafe class UltimatePredationScenario : IScenario
                 );
         });
 
-        Landslide(55.09f, 57.25f, 5, LandslideType.Ultima);
+        utils.LandslideLines(() => ultima, [() => dummies[5], () => dummies[6], () => dummies[7]], 55.09f, 57.25f, LandslideType.Ultima);
 
         world.Events.Add(57.25f, () => ultima?.NativeActionEffect(
             ActionId.LandslideUltima,
@@ -499,7 +492,7 @@ public unsafe class UltimatePredationScenario : IScenario
             animationTargetId: garuda.GameObjectId
             ));
 
-        world.Events.Add(21.53f, () => ResolveSnapshot(wickedWheelSnapshot, "Wicked Wheel"));
+        world.Events.Add(21.53f, () => utils.ResolveSnapshot(wickedWheelSnapshot, "Wicked Wheel"));
 
         // Wicked Tornado is handled by dummies[2]
         world.Events.Add(22.28f, () => dummies[2]?.SetPosition(garuda!.Placement()));
@@ -520,15 +513,11 @@ public unsafe class UltimatePredationScenario : IScenario
             wickedTornadoSnapshot = party.Find.InsideActionAoe(ActionId.WickedTornado, dummies[2]!.Placement(), size: 7); // 7 is ActionId.WickedWheelAwaken's EffectRange
         });
 
-        world.Events.Add(22.98f, () => ResolveSnapshot(wickedTornadoSnapshot, "Wicked Tornado"));
+        world.Events.Add(22.98f, () => utils.ResolveSnapshot(wickedTornadoSnapshot, "Wicked Tornado"));
 
-        world.Events.Add(25.25f, () =>
-        {
-            garuda?.PlayActionTimeline(ActionTimelineId.WarpStart2);
-            SetFeatherRainPositions();
-        });
+        world.Events.Add(25.25f, () => garuda?.PlayActionTimeline(ActionTimelineId.WarpStart2));
 
-        FeatherRain(26.72f, 27.70f);
+        utils.FeatherRain(featherRainDummies, 25.25f, 26.72f, 27.70f);
     }
 
     private void GarudaPost()
@@ -567,17 +556,12 @@ public unsafe class UltimatePredationScenario : IScenario
             ));
 
         // Technically these are for the Sisters. But adding it to their code section will duplicate the amount (10) that the actual fight uses (5), so it's kept here.
-        world.Events.Add(72.49f, SetFeatherRainPositions);
-        FeatherRain(73.91f, 74.87f); 
+        utils.FeatherRain(featherRainDummies, 72.49f, 73.91f, 74.87f);
 
-        // These are the proper Garuda Feather Rains
-        world.Events.Add(76.04f, () =>
-        {
-            garuda?.PlayActionTimeline(ActionTimelineId.WarpStart2);
-            SetFeatherRainPositions();
-        });
+        // These are actually from Garuda
+        world.Events.Add(76.04f, () => garuda?.PlayActionTimeline(ActionTimelineId.WarpStart2));
 
-        FeatherRain(77.46f, 78.41f);
+        utils.FeatherRain(featherRainDummies, 76.04f, 77.46f, 78.41f);
     }
 
     private void Ifrit()
@@ -612,7 +596,7 @@ public unsafe class UltimatePredationScenario : IScenario
             animationTargetId: ifrit.GameObjectId
             ));
 
-        world.Events.Add(20.69f, () => ResolveSnapshot(crimsonCycloneSnapshot, "Crimson Cyclone"));
+        world.Events.Add(20.69f, () => utils.ResolveSnapshot(crimsonCycloneSnapshot, "Crimson Cyclone"));
 
         CrimsonCycloneAwaken(Geometry.CrimsonCycloneAwakenPlacements[0], 11);
         CrimsonCycloneAwaken(Geometry.CrimsonCycloneAwakenPlacements[1], 12);
@@ -642,8 +626,14 @@ public unsafe class UltimatePredationScenario : IScenario
             targetId: ifrit.GameObjectId
             ));
 
-        Eruption(39.03f, 42.05f, 11);
-        Eruption(41.13f, 43.94f, 9);
+        IReadOnlyList<SimCharacter> eruptionBaits = null!;
+        world.Events.Add(39.03f, () => eruptionBaits = party.Find.FarestN(ifrit!.Position, 2));
+        utils.EruptionPuddle(() => dummies[11], () => eruptionBaits[0], 39.03f, 42.05f);
+        utils.EruptionPuddle(() => dummies[12], () => eruptionBaits[1], 39.03f, 42.05f);
+
+        world.Events.Add(41.13f, () => eruptionBaits = party.Find.FarestN(ifrit!.Position, 2));
+        utils.EruptionPuddle(() => dummies[9], () => eruptionBaits[0], 41.13f, 43.94f);
+        utils.EruptionPuddle(() => dummies[10], () => eruptionBaits[1], 41.13f, 43.94f);
 
         world.Events.Add(41.59f, () => ifrit?.NativeActionEffect(
             ActionId.EruptionIfrit,
@@ -655,8 +645,13 @@ public unsafe class UltimatePredationScenario : IScenario
             animationTargetId: ifrit.GameObjectId
             ));
 
-        Eruption(43.02f, 46.15f, 11);
-        Eruption(45.15f, 48.13f, 9);
+        world.Events.Add(43.02f, () => eruptionBaits = party.Find.FarestN(ifrit!.Position, 2));
+        utils.EruptionPuddle(() => dummies[11], () => eruptionBaits[0], 43.02f, 46.15f);
+        utils.EruptionPuddle(() => dummies[12], () => eruptionBaits[1], 43.02f, 46.15f);
+
+        world.Events.Add(45.15f, () => eruptionBaits = party.Find.FarestN(ifrit!.Position, 2));
+        utils.EruptionPuddle(() => dummies[9], () => eruptionBaits[0], 45.15f, 48.13f);
+        utils.EruptionPuddle(() => dummies[10], () => eruptionBaits[1], 45.15f, 48.13f);
 
         // TODO: Actual Infernal Fetters logic
         world.Events.Add(46.94f, () => world.Tether(dps, ot, TetherId.InfernalFetters, 21, StatusId.InfernalFetters));
@@ -707,7 +702,7 @@ public unsafe class UltimatePredationScenario : IScenario
             targetId: titan.GameObjectId
             ));
 
-        Landslide(18.22f, 20.43f, 8, LandslideType.Normal);
+        utils.LandslideLines(() => titan, [() => dummies[8], () => dummies[9], () => dummies[10], () => dummies[11], () => dummies[12]], 18.22f, 20.43f, LandslideType.Normal);
 
         world.Events.Add(20.43f, () => titan?.NativeActionEffect(
             ActionId.LandslideTitan,
@@ -719,7 +714,7 @@ public unsafe class UltimatePredationScenario : IScenario
             animationTargetId: titan.GameObjectId
             ));
 
-        Landslide(20.43f, 22.48f, 3, LandslideType.Awaken);
+        utils.LandslideLines(() => titan, [() => dummies[3], () => dummies[4], () => dummies[5], () => dummies[6], () => dummies[7]], 20.43f, 22.48f, LandslideType.Awaken);
 
         world.Events.Add(25.50f, () => titan?.PlayActionTimeline(ActionTimelineId.WarpStart));
     }
@@ -781,7 +776,7 @@ public unsafe class UltimatePredationScenario : IScenario
                 );
         });
 
-        Landslide(54.45f, 56.50f, 8, LandslideType.Normal);
+        utils.LandslideLines(() => titan, [() => dummies[8], () => dummies[9], () => dummies[10], () => dummies[11], () => dummies[12]], 54.45f, 56.50f, LandslideType.Normal);
 
         world.Events.Add(56.50f, () => titan?.NativeActionEffect(
             ActionId.LandslideTitan,
@@ -793,7 +788,7 @@ public unsafe class UltimatePredationScenario : IScenario
             animationTargetId: titan.GameObjectId
             ));
 
-        Landslide(56.50f, 58.49f, 0, LandslideType.Awaken);
+        utils.LandslideLines(() => titan, [() => dummies[0], () => dummies[1], () => dummies[2], () => dummies[3], () => dummies[4]], 56.50f, 58.49f, LandslideType.Awaken);
 
         world.Events.Add(61.79f, () => titan?.NativeActionEffect(
             ActionId.Tumult,
@@ -868,12 +863,6 @@ public unsafe class UltimatePredationScenario : IScenario
         world.Events.Add(69.61f, () => titan?.PlayActionTimeline(ActionTimelineId.WarpStart));
     }
 
-    private void Awaken(SimEnemy enemy, bool isUltima)
-    {
-        enemy?.AddStatusParam(StatusId.Woken, isUltima ? 97 : 0);
-        TimelineContainerPointers.SetAnimationState(&enemy!.BattleCharaPtr->Timeline, 0, 1);
-    }
-
     private void RadiantPlume(Vector3 position, int dummyIndex)
     {
         world.Events.Add(49.05f, () => dummies[dummyIndex]?.NativeCast(
@@ -899,79 +888,7 @@ public unsafe class UltimatePredationScenario : IScenario
             position: position
             ));
 
-        world.Events.Add(53.61f, () => ResolveSnapshot(radiantPlumeSnapshot, "Radiant Plume"));
-    }
-
-    private void SetFeatherRainPositions()
-    {
-        featherRainPositions.Clear();
-        var players = RoleList.Random(party, 5);
-
-        for (int i = 0; i < 5; i++)
-        {
-            featherRainPositions.Add(players.Get(i)!.Position);
-        }
-    }
-
-    private void FeatherRain(float castOffset, float effectOffset)
-    {
-        world.Events.Add(castOffset, () =>
-        {
-            for (int i = 0; i < 5; i++)
-            {
-                var dummy = dummies[8 + i];
-
-                dummy?.SetPosition(
-                    new Placement(
-                        featherRainPositions[i],
-                        0
-                        ));
-
-                dummy?.NativeCast(
-                    ActionId.FeatherRain,
-                    ActionType.Action,
-                    0f,
-                    0.7f,
-                    false
-                    );
-            }
-        });
-
-        var featherRainSnapshots = new List<IReadOnlyList<SimCharacter>>();
-        world.Events.Add(castOffset + 0.7f, () =>
-        {
-            for (int i = 0; i < 5; i++)
-            {
-                var dummy = dummies[8 + i];
-                featherRainSnapshots.Add(party.Find.InsideActionAoe(ActionId.FeatherRain, dummy!.Placement()));
-            }
-        });
-
-        world.Events.Add(effectOffset, () =>
-        {
-            for (int i = 0; i < 5; i++)
-            {
-                var dummy = dummies[8 + i];
-
-                dummy?.NativeActionEffect(
-                    ActionId.FeatherRain,
-                    1.1f,
-                    (ushort)ActionId.FeatherRain,
-                    0,
-                    ActionType.Action,
-                    0,
-                    position: dummy.Position
-                    );
-            }
-        });
-
-        world.Events.Add(effectOffset + 0.2f, () =>
-        {
-            foreach (var featherRainSnapshot in featherRainSnapshots)
-            {
-                ResolveSnapshot(featherRainSnapshot, "Feather Rain");
-            }
-        });
+        world.Events.Add(53.61f, () => utils.ResolveSnapshot(radiantPlumeSnapshot, "Radiant Plume"));
     }
 
     private void GarudaSister(Placement placement, uint nameId)
@@ -1016,7 +933,7 @@ public unsafe class UltimatePredationScenario : IScenario
             animationTargetId: sister.GameObjectId
             ));
 
-        world.Events.Add(70.71f, () => ResolveSnapshot(wickedWheelSnapshot, "Wicked Wheel"));
+        world.Events.Add(70.71f, () => utils.ResolveSnapshot(wickedWheelSnapshot, "Wicked Wheel"));
 
         world.Events.Add(72.49f, () => sister?.PlayActionTimeline(ActionTimelineId.WarpStart2));
 
@@ -1049,180 +966,7 @@ public unsafe class UltimatePredationScenario : IScenario
             crimsonCycloneAwakenSnapshot = party.Find.InsideActionAoe(ActionId.CrimsonCycloneAwaken, dummy!.Placement());
         });
 
-        world.Events.Add(22.95f, () => ResolveSnapshot(crimsonCycloneAwakenSnapshot, "Crimson Cyclone (Awaken)"));
-    }
-
-    private void Eruption(float castOffset, float effectOffset, int dummyStartIndex)
-    {
-        var position1 = Vector3.Zero;
-        var position2 = Vector3.Zero;
-
-        world.Events.Add(castOffset, () =>
-        {
-            var baits = party.Find.FarestN(ifrit!.Position, 2);
-
-            position1 = baits[0].Position;
-            position2 = baits[1].Position;
-
-            dummies[dummyStartIndex]?.NativeCast(
-                ActionId.EruptionPuddle,
-                ActionType.Action,
-                0f,
-                2.7f,
-                false,
-                rotation: float.Pi,
-                position: position1
-                );
-
-            dummies[dummyStartIndex + 1]?.NativeCast(
-                ActionId.EruptionPuddle,
-                ActionType.Action,
-                0f,
-                2.7f,
-                false,
-                rotation: float.Pi,
-                position: position2
-                );
-        });
-
-        IReadOnlyList<SimCharacter> eruptionSnapshot1 = null!;
-        IReadOnlyList<SimCharacter> eruptionSnapshot2 = null!;
-        world.Events.Add(castOffset + 2.7f, () =>
-        {
-            eruptionSnapshot1 = party.Find.InsideActionAoe(ActionId.EruptionPuddle, new(position1, 0));
-            eruptionSnapshot2 = party.Find.InsideActionAoe(ActionId.EruptionPuddle, new(position2, 0));
-        });
-
-        world.Events.Add(effectOffset, () =>
-        {
-            dummies[dummyStartIndex]?.NativeActionEffect(
-                ActionId.EruptionPuddle,
-                0.1f,
-                (ushort)ActionId.EruptionPuddle,
-                0,
-                ActionType.Action,
-                0,
-                rotation: 0,
-                position: position1
-                );
-
-            dummies[dummyStartIndex + 1]?.NativeActionEffect(
-                ActionId.EruptionPuddle,
-                0.1f,
-                (ushort)ActionId.EruptionPuddle,
-                0,
-                ActionType.Action,
-                0,
-                rotation: 0,
-                position: position2
-                );
-        });
-
-        world.Events.Add(effectOffset + 0.66f, () =>
-        {
-            ResolveSnapshot(eruptionSnapshot1, "Eruption");
-            ResolveSnapshot(eruptionSnapshot2, "Eruption");
-        });
-    }
-
-    private void Landslide(float castOffset, float effectOffset, int dummyStartIndex, LandslideType type)
-    {
-        float[] rotationOffsets;
-        uint actionId;
-        float castTime;
-        float animationLock;
-
-        switch (type)
-        {
-            case LandslideType.Normal:
-                rotationOffsets = Geometry.TitanLandslideOffsets.ToArray();
-                actionId = ActionId.LandslideLine;
-                castTime = 1.9f;
-                animationLock = 2.1f;
-                break;
-            case LandslideType.Awaken:
-                rotationOffsets = Geometry.TitanLandslideAwakenOffsets.ToArray();
-                actionId = ActionId.LandslideAwaken;
-                castTime = 1.7f;
-                animationLock = 1.1f;
-                break;
-            case LandslideType.Ultima:
-                rotationOffsets = Geometry.UltimaLandslideOffsets.ToArray();
-                actionId = ActionId.LandslideLineUltima;
-                castTime = 1.9f;
-                animationLock = 1.1f;
-                break;
-            default:
-                throw new Exception($"[UltimatePredationScenario.Landslide] Unsupported LandslideType {type}");
-        }
-
-        world.Events.Add(castOffset, () =>
-        {
-            var enemy = type == LandslideType.Ultima ? ultima : titan;
-
-            for (int i = 0; i < rotationOffsets.Length; i++)
-            {
-                var dummy = dummies[dummyStartIndex + i];
-
-                dummy?.SetPosition(
-                    new Placement(
-                        enemy!.Position,
-                        enemy.Rotation + rotationOffsets[i]
-                        ));
-
-                dummy?.NativeCast(
-                    actionId,
-                    ActionType.Action,
-                    0f,
-                    castTime,
-                    false,
-                    targetId: dummy.GameObjectId
-                    );
-            }
-        });
-
-        var landslideSnapshots = new List<IReadOnlyList<SimCharacter>>();
-        world.Events.Add(castOffset + castTime, () =>
-        {
-            for (int i = 0; i < rotationOffsets.Length; i++)
-            {
-                var dummy = dummies[dummyStartIndex + i];
-                var snapshot = party.Find.InsideActionAoe(actionId, dummy!.Placement());
-                landslideSnapshots.Add(snapshot);
-            }
-        });
-
-        world.Events.Add(effectOffset, () =>
-        {
-            for (int i = 0; i < rotationOffsets.Length; i++)
-            {
-                var dummy = dummies[dummyStartIndex + i];
-
-                dummy?.NativeActionEffect(
-                    actionId,
-                    animationLock,
-                    (ushort)actionId,
-                    0,
-                    ActionType.Action,
-                    0,
-                    animationTargetId: dummy.GameObjectId
-                    );
-            }
-        });
-
-        world.Events.Add(effectOffset + 0.73f, () =>
-        {
-            var enemy = type == LandslideType.Ultima ? ultima : titan;
-
-            foreach (var landslideSnapshot in landslideSnapshots)
-            {
-                foreach (var character in landslideSnapshot)
-                {
-                    // TODO: "30" and "50" are from Titan EX, but doubled. Need to find the proper UWU values.
-                    (character as ISimPartyMember)?.Knockback(enemy!.Position, 30, 50);
-                }
-            }
-        });
+        world.Events.Add(22.95f, () => utils.ResolveSnapshot(crimsonCycloneAwakenSnapshot, "Crimson Cyclone (Awaken)"));
     }
 
     private void BombBoulder(float spawnOffset, float buryOffset, float castOffset, float effectOffset, float fadeOffset, float despawnOffset, Vector3 position)
@@ -1260,7 +1004,7 @@ public unsafe class UltimatePredationScenario : IScenario
             burySnapshot = party.Find.InsideActionAoe(ActionId.Bury, boulder!.Placement());
         });
 
-        world.Events.Add(buryOffset + 0.53f, () => ResolveSnapshot(burySnapshot, "Bury"));
+        world.Events.Add(buryOffset + 0.53f, () => utils.ResolveSnapshot(burySnapshot, "Bury"));
 
         world.Events.Add(castOffset, () => boulder?.NativeCast(
             ActionId.Burst,
@@ -1286,18 +1030,10 @@ public unsafe class UltimatePredationScenario : IScenario
             )
         );
 
-        world.Events.Add(effectOffset + 0.16f, () => ResolveSnapshot(burstSnapshot, "Burst"));
+        world.Events.Add(effectOffset + 0.16f, () => utils.ResolveSnapshot(burstSnapshot, "Burst"));
 
         world.Events.Add(fadeOffset, () => PacketDispatcher.HandleActorControlPacket(boulder!.EntityId, 607, boulder.EntityId, 1, 0, 100, 0, 0, 0, 0, 0xE0000000, false));
         world.Events.Add(despawnOffset, () => boulder?.Despawn());
-    }
-
-    private void ResolveSnapshot(IReadOnlyList<SimCharacter> snapshot, string dieCause)
-    {
-        foreach (var character in snapshot)
-        {
-            character.Die(dieCause);
-        }
     }
 
     private void ResolveSnapshotTankbuster(IReadOnlyList<SimCharacter> snapshot, string dieCause)
@@ -1311,10 +1047,5 @@ public unsafe class UltimatePredationScenario : IScenario
         }
     }
 
-    private enum LandslideType
-    {
-        Normal,
-        Awaken,
-        Ultima
-    }
+    
 }
