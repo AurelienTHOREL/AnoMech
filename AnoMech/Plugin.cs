@@ -9,6 +9,7 @@ using AnoMech.Core;
 using AnoMech.Core.Game;
 using AnoMech.Core.Map;
 using AnoMech.Core.Native;
+using AnoMech.Core.UserActions;
 using AnoMech.Windows;
 using AnoMech.Pointers;
 using CSFramework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
@@ -51,6 +52,8 @@ public sealed class Plugin : IDalamudPlugin
     // per load rather than per scenario. SimPlayer is the sole writer of their
     // flags — it reconciles them from its own state each tick.
     internal static LocalPlayerInputHooks PlayerInputHooks { get; private set; } = null!;
+    // Optional, detached module: resolves the player's own actions client-side.
+    internal static UserActions UserActions { get; private set; } = null!;
     internal static LogManager LogManager { get; private set; } = null!;
     private ConfigWindow ConfigWindow { get; init; }
     private MainWindow MainWindow { get; init; }
@@ -69,6 +72,8 @@ public sealed class Plugin : IDalamudPlugin
         PlayerInputHooks = new LocalPlayerInputHooks(GameInterop);
         Game = new Game();
         GameInstance = Game;
+        UserActions = new UserActions(PlayerInputHooks);
+        if (Config.EnableUserActions) UserActions.Enable();
         ConfigWindow = new ConfigWindow(this);
         MainWindow = new MainWindow(this);
 
@@ -132,6 +137,7 @@ public sealed class Plugin : IDalamudPlugin
         WindowSystem.RemoveAllWindows();
 
         Game.Dispose();
+        UserActions.Dispose();
         // After Game.Dispose so World.Dispose → SimPlayer.Despawn can still clear
         // the lock flags through the hooks before they're torn down.
         PlayerInputHooks.Dispose();
@@ -154,6 +160,7 @@ public sealed class Plugin : IDalamudPlugin
         var fw = CSFramework.Instance();
         if (fw == null) return;
         Game.Tick(fw->FrameDeltaTime);
+        UserActions.Tick(fw->FrameDeltaTime);
     }
 
     private void OnTerritoryChanged(uint territory)

@@ -21,6 +21,12 @@ While simulating:
   * Ready checks will not pop.
  
 
+### Beta: Advanced Simulation Resolution
+
+The simulator now includes a beta feature that properly resolves most skills, triggers, and gauges during simulation. 
+As this feature is still in beta, some edge cases and less common interactions may not yet resolve correctly.
+
+
 ## Installation
 
 See: https://github.com/anomek/MyDalamudPlugins
@@ -71,6 +77,7 @@ See: https://github.com/anomek/MyDalamudPlugins
 * In scenarios for Top Omega Protocol (Ultimate):
   * Tether distance threshold are very rough estimations
   * Line AOE from Optiocal Unit (eye) doesn't render
+* Not all skills will resolve properly
 
 #  Acknowledgments
 
