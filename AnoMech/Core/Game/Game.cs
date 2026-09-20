@@ -59,6 +59,36 @@ public sealed class Game : IDisposable
     // gameplay side effect (HP=0, KO timeline, stun hooks, freeze timer).
     public bool GodMode { get; set; }
 
+    // When true, a successful run (see UpdateMechanicResult) immediately starts the same
+    // scenario again with the same parameters, for hands-free repetition. A real death
+    // cancels it (set false directly in Kill) rather than restarting past a failure the
+    // freeze/overlay exists to let the user actually see.
+    public bool AutoRestart { get; set; }
+    private RunScenarioParams? lastRun;
+
+    // Consecutive successful completions of whatever scenario is currently active. Reset by
+    // Kill on any real (non-godmode) death and by RunScenarioInternal when a different
+    // scenario starts. Incremented automatically once IScenario.IsFinished reports true and
+    // stays true for MechanicResultSettleSeconds (see UpdateMechanicResult): no per-scenario
+    // reporting needed. In-memory only: does not survive a plugin reload.
+    public int MechanicStreak { get; private set; }
+
+    // How long IsFinished has to stay true before it counts as "reached the end cleanly".
+    // Covers a death whose failure check trails a few frames behind the scenario's own
+    // last scheduled action (rather than firing in the exact same frame, which the Tick
+    // call order below already handles on its own).
+    private const float MechanicResultSettleSeconds = 1f;
+    private float? scenarioFinishedElapsed;
+    private bool mechanicResultReported;
+
+    // Set by Kill on any real death, scoped to the current run (cleared by ResetInternal).
+    // IsFinished can go true on a queue that Kill's own freeze-timer event never touches
+    // (e.g. a scenario with a private EventScheduler immune to EventTimeScale): there's no
+    // structural guarantee that queue and the freeze timer interleave correctly the way two
+    // entries on the same Events queue would, so this flag is the actual source of truth for
+    // "did this run fail", independent of any queue or timing race.
+    private bool deathOccurredThisRun;
+
     private IScenario? activeScenario;
     private float scenarioElapsed;
     private bool firstDeathScheduled;
@@ -116,8 +146,12 @@ public sealed class Game : IDisposable
     // solo (no doppels, no AI). Defaults to 0 = run the first strat with a full party.
     // selectedWaymark: index into the scenario's WaymarkPresets; ignored when it has none.
     public void RunScenario(IScenario scenario, PartyRole? roleOverride = null, int? selectedAi = 0, int selectedWaymark = 0)
+        => RunScenario(new RunScenarioParams(scenario, roleOverride, selectedAi, selectedWaymark));
+
+    private void RunScenario(RunScenarioParams p)
     {
-        Plugin.Framework.Run(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark));
+        lastRun = p;
+        Plugin.Framework.Run(() => RunScenarioInternal(p.Scenario, p.RoleOverride, p.SelectedAi, p.SelectedWaymark));
     }
 
     // The selected preset, or [0] as the default.
@@ -143,6 +177,9 @@ public sealed class Game : IDisposable
             return;
         }
 
+        // Captured before ResetInternal clears activeScenario, so restarting the same
+        // scenario (the normal way to extend a streak) doesn't look like a switch.
+        var previousScenario = activeScenario;
         ResetInternal();
 
         var player = Plugin.ObjectTable.LocalPlayer;
@@ -179,6 +216,9 @@ public sealed class Game : IDisposable
             TeleportPlayerToSpawn();
         else
             TeleportPlayerToSpawnIfOutsideArena();
+        ResetSprintCooldown();
+        if (previousScenario != scenario)
+            MechanicStreak = 0;
         Plugin.UserActions.OnScenarioStart();
         activeScenario = scenario;
         scenarioElapsed = 0f;
@@ -207,7 +247,31 @@ public sealed class Game : IDisposable
         {
             scenarioElapsed += deltaSeconds;
             activeScenario.Tick(deltaSeconds, scenarioElapsed);
+            UpdateMechanicResult(deltaSeconds);
         }
+    }
+
+    // Infers a clean run from IScenario.IsFinished going true and staying true, rather than
+    // needing each scenario to report its own completion. deathOccurredThisRun (set by Kill,
+    // independent of whichever queue IsFinished watches) is the actual gate against a failed
+    // run being mistaken for a clean one: a queue running dry is not by itself proof nothing
+    // died, since Kill's own freeze-timer event lives on Events specifically and a scenario's
+    // IsFinished override may watch a different queue entirely.
+    private void UpdateMechanicResult(float deltaSeconds)
+    {
+        if (mechanicResultReported) return;
+        if (activeScenario is null || !activeScenario.IsFinished(World))
+        {
+            scenarioFinishedElapsed = null;
+            return;
+        }
+        scenarioFinishedElapsed = (scenarioFinishedElapsed ?? 0f) + deltaSeconds;
+        if (scenarioFinishedElapsed < MechanicResultSettleSeconds) return;
+        mechanicResultReported = true;
+        if (deathOccurredThisRun) return;
+        MechanicStreak++;
+        if (AutoRestart && lastRun is { } p)
+            RunScenario(p);
     }
 
     // Godmode preview: how long a swallowed-death HP-bar drop stays down before healing back.
@@ -254,6 +318,9 @@ public sealed class Game : IDisposable
             return false;
         }
         target.OnKilled();
+        MechanicStreak = 0;
+        deathOccurredThisRun = true;
+        AutoRestart = false;
         if (!firstFreezeScheduled)
         {
             firstFreezeScheduled = true;
@@ -349,6 +416,9 @@ public sealed class Game : IDisposable
         Paused = false;
         firstDeathScheduled = false;
         firstFreezeScheduled = false;
+        scenarioFinishedElapsed = null;
+        mechanicResultReported = false;
+        deathOccurredThisRun = false;
 #if DEBUG
         AnoMech.Windows.DamageDebugWindow.Instance?.ResetFreeze();
 #endif
@@ -370,3 +440,7 @@ public sealed class Game : IDisposable
         opcodeUpdater.Dispose();
     }
 }
+
+// A single RunScenario call's arguments, bundled so Game can replay the exact same run (see
+// AutoRestart) without tracking each argument as its own field.
+public sealed record RunScenarioParams(IScenario Scenario, PartyRole? RoleOverride, int? SelectedAi, int SelectedWaymark);

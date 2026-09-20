@@ -267,6 +267,13 @@ public unsafe class MainWindow : Window, IDisposable
 
         var god = game.GodMode;
         if (ImGui.Checkbox("God mode", ref god)) game.GodMode = god;
+        ImGui.SameLine();
+        var autoRestart = game.AutoRestart;
+        if (ImGui.Checkbox("Auto-restart", ref autoRestart)) game.AutoRestart = autoRestart;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Restart the same scenario immediately after a successful run. A death turns this back off.");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"Streak: {game.MechanicStreak}");
 
 #if DEBUG
         debugMenu.DrawSpeedControl();

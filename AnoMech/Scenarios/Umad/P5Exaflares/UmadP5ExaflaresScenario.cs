@@ -112,6 +112,11 @@ public sealed class UmadP5ExaflaresScenario : IScenario
         timeline.Add(30.0f, DespawnAll);
     }
 
+    // The whole mechanic lives on the private `timeline`, not world.Events (see the class
+    // header comment), so Game's default IsFinished (world.Events.IsEmpty) would read true
+    // from the first tick. Watch the real queue instead.
+    public bool IsFinished(SimWorld world) => timeline.IsEmpty;
+
     public void Tick(float delta, float elapsed)
     {
         // Advance the timeline by real wall time, capping pause/hitch gaps so a freeze can't
