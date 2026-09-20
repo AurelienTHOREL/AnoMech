@@ -102,6 +102,7 @@ public unsafe class SimEventObject : ISimObject, IPositioned
     public string DisplayName => $"EObj 0x{EObjRowId:X}";
     public int Slot => slot;
     public nint Address => (nint)obj;
+    public GameObjectId GameObjectId => obj == null ? default : obj->GetGameObjectId();
 
     public bool IsAlive => slot >= 0 && obj != null;
     // No death-vs-presence distinction for event objects: kept while the slot is live.
