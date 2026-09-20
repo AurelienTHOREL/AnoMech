@@ -18,6 +18,7 @@ using AnoMech.Scenarios.Umad.P4KefkaSays;
 using AnoMech.Scenarios.Umad.P5Celestriad;
 using AnoMech.Scenarios.Umad.P5Exaflares;
 using AnoMech.Scenarios.Uwu.UltimatePredation;
+using AnoMech.Scenarios.Uwu.UltimateSuppression;
 using Dalamud.Game.Text;
 using Dalamud.Game.Text.SeStringHandling;
 using FFXIVClientStructs.FFXIV.Client.UI;
@@ -112,7 +113,8 @@ public sealed class Game : IDisposable
             new TopP5SigmaScenario(),
             new TopP5OmegaScenario(),
             new TopP6WaveCannon2Scenario(),
-            new UltimatePredationScenario()
+            new UltimatePredationScenario(),
+            new UltimateSuppressionScenario()
         };
 
         // Derive the zone tree from the flat registry (first-appearance order).

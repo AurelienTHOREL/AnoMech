@@ -198,6 +198,15 @@ public sealed unsafe class ZoneSession : IDisposable
                 SetLocalPlayerPosition(sessionSave.Position, sessionSave.Rotation);
                 condition->Occupied = false;
 
+                // TODO: this is here because of Suppression. Either define it as normal behaviour, or add an OnLeave method on Scenarios
+                condition->SufferingStatusAffliction = false;
+                condition->SufferingStatusAffliction2 = false;
+
+                if (Plugin.ObjectTable.LocalPlayer != null)
+                {
+                    PacketDispatcher.HandleActorControlPacket(Plugin.ObjectTable.LocalPlayer.EntityId, 54, 1, 0, 0, 0, 0, 0, 0, 0, 0xE0000000, false);
+                }
+
                 DisableFirewall();
             });
 

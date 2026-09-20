@@ -27,8 +27,10 @@ public class UwuConstants
     {
         public const uint Garuda = 8722;
         public const uint SuparnaChirada = 8723;
+        public const uint RazorPlume = 8724;
         public const uint Titan = 8727;
         public const uint BombBoulder = 8728;
+        public const uint GraniteGaol = 8729;
         public const uint Ifrit = 8730;
         public const uint UltimaWeapon = 8734;
         public const uint Dummy = 9020;
@@ -42,12 +44,18 @@ public class UwuConstants
         public const uint Garuda = 1644;
         public const uint Suparna = 1645;
         public const uint Chirada = 1646;
+        public const uint RazorPlume = 1647;
         public const uint Titan = 1801;
+        public const uint GraniteGaol = 1804;
         public const uint UltimaWeapon = 2137;
     }
 
     public class ActionId
     {
+        public const uint Featherlance = 11075;
+        public const uint GreatWhirlwind = 11073;
+        public const uint Mesohigh = 11081;
+        public const uint MistralSongSuparnaChirada = 11083;
         public const uint WickedWheel = 11084;
         public const uint FeatherRain = 11085;
         public const uint WickedWheelAwaken = 11086;
@@ -55,12 +63,14 @@ public class UwuConstants
         public const uint MistralShriek = 11092;
         public const uint EruptionIfrit = 11097;
         public const uint EruptionPuddle = 11098;
+        public const uint FlamingCrush = 11101;
         public const uint CrimsonCyclone = 11103;
         public const uint CrimsonCycloneAwaken = 11104;
         public const uint RadiantPlumePuddle = 11105;
         public const uint BoulderTitan = 11112;
         public const uint Bury = 11113;
         public const uint Burst = 11114;
+        public const uint RockThrow = 11115;
         public const uint LandslideLine = 11120;
         public const uint LandslideTitan = 11121;
         public const uint UltimatePredation = 11126;
@@ -71,17 +81,27 @@ public class UwuConstants
         public const uint RadiantPlumeUltima = 11133;
         public const uint LandslideUltima = 11134;
         public const uint LandslideLineUltima = 11135;
+        public const uint LightPillarUltima = 11138;
+        public const uint LightPillarCircle = 11139;
+        public const uint AetherochemicalLaserCenter = 11140;
+        public const uint AetherochemicalLaserRight = 11141;
+        public const uint AetherochemicalLaserLeft = 11142;
+        public const uint TankPurge = 11143;
+        public const uint MistralSong = 11150;
         public const uint Tumult = 11288;
         public const uint InfernalFetters = 11289;
         public const uint LandslideAwaken = 11298;
+        public const uint GraniteImpact = 11448;
         public const uint PostUltimatePredation1 = 11475;
         public const uint PostUltimatePredation2 = 11476;
         public const uint PostUltimatePredation3 = 11477;
         public const uint UltimateAnnihilation = 11596;
+        public const uint UltimateSuppression = 11597;
     }
 
     public class ActionTimelineId
     {
+        public const ushort RazorPlume = 1412;
         public const ushort WarpStart = 7737;
         public const ushort WarpStart2 = 7738;
         public const ushort WarpEnd = 7747;
@@ -89,13 +109,29 @@ public class UwuConstants
 
     public class StatusId
     {
+        public const ushort Fetters = 292;
         public const ushort InfernalFetters = 377;
+        public const ushort ThermalLow = 1525;
+        public const ushort AccursedFlame = 1527;
         public const ushort Woken = 1529;
     }
 
     public class TetherId
     {
+        public const ushort Mesohigh = 4;
         public const ushort InfernalFetters = 9;
+    }
+
+    public class LockonId
+    {
+        public const ushort MistralSong = 16;
+        public const ushort FlamingCrush = 117;
+    }
+
+    public class Duration
+    {
+        public const float RazorPlumeRotation = 17.95f;
+        public const float RazorPlumeBack = 1f;
     }
 
     public class Geometry
@@ -103,6 +139,8 @@ public class UwuConstants
         public const float ArenaRadius = 19.4f;
         public const float WickedTornadoOuterRadius = 20; // 20 is the EffectRange in the Action sheet
 
+        public static readonly float RazorPlumeRotation = float.DegreesToRadians(-450);
+        public static readonly float RazorPlumeBackDistance = 3.6f;
         public static readonly FrozenDictionary<DirectionEnum, float> LookAtCenterRotation;
         public static readonly FrozenDictionary<DirectionEnum, Placement> UltimaPlacements;
         public static readonly FrozenDictionary<DirectionEnum, Placement> GarudaPlacements;
