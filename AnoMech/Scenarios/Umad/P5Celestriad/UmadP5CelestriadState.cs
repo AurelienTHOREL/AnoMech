@@ -4,13 +4,38 @@ using System.Linq;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
+using static AnoMech.Scenarios.Umad.UmadConstants;
 using static AnoMech.Scenarios.Umad.P5Celestriad.UmadP5CelestriadConstants;
 
 namespace AnoMech.Scenarios.Umad.P5Celestriad;
 
 // Declared in the confirmed real clockwise ring order (Fire block, then Lightning block, then
 // Ice block): ElementForSet's cyclic shift relies on this order to mean "next clockwise".
-public enum CelestriadElement { Fire, Lightning, Ice }
+public sealed record CelestriadElement(
+    uint TowerSoakedActionId,
+    uint TowerFailedActionId,
+    DamageType DamageType,
+    ushort VulnUpStatusId,
+    uint TowerEObjId)
+{
+    public static readonly CelestriadElement Fire =
+        new(CelestriadActionId.FireIII, CelestriadActionId.StardustFireIII,
+            DamageType.Fire, CelestriadStatusId.FireResistanceDownII, CelestriadTowerEObjId.Fire);
+    public static readonly CelestriadElement Lightning =
+        new(CelestriadActionId.ThunderIII, CelestriadActionId.StardustThunderIII,
+            DamageType.Lightning, UmadConstants.StatusId.LightningResistanceDownII, CelestriadTowerEObjId.Lightning);
+    public static readonly CelestriadElement Ice =
+        new(CelestriadActionId.BlizzardIII, CelestriadActionId.StardustBlizzardIII,
+            DamageType.Ice, CelestriadStatusId.IceResistanceDownII, CelestriadTowerEObjId.Ice);
+}
+
+public sealed record CatastrophicChoice(uint CastActionId, uint ResolveActionId)
+{
+    public static readonly CatastrophicChoice Aero =
+        new(CelestriadActionId.CatastrophicChoiceAero, CelestriadActionId.CatastrophicChoiceAeroResolution);
+    public static readonly CatastrophicChoice Earth =
+        new(CelestriadActionId.CatastrophicChoiceEarth, CelestriadActionId.CatastrophicChoiceEarthResolution);
+}
 
 // One of the 9 fixed towers, spawned once for the whole mechanic; position never changes.
 public sealed record CelestriadTower(CelestriadElement Element, int SubIndex, Vector3 Position);
@@ -42,13 +67,16 @@ public sealed class UmadP5CelestriadState
     public IReadOnlyDictionary<PartyRole, CelestriadElement?> PlayerDebuffElement { get; }
     public IReadOnlyList<CelestriadElement> DoubleElement { get; }
     public IReadOnlyList<CelestriadTower> AllTowers { get; }
-    public IReadOnlyList<IReadOnlyList<CelestriadTower>> SetActiveTowers { get; }
-    public IReadOnlyList<bool?> AeroVariant { get; }
+    // Each entry is an index into AllTowers. AllTowers has a fixed order for the lifetime of this state.
+    public IReadOnlyList<IReadOnlyList<int>> SetActiveTowers { get; }
+    public IReadOnlyList<CatastrophicChoice?> AeroVariant { get; }
 
     // The element this role should physically soak at this set. NOT the same as their permanent
     // debuff except in set 2. Free (undebuffed) players always fill in for the doubled element.
     public CelestriadElement ElementForSet(PartyRole role, int set) =>
-        PlayerDebuffElement[role] is { } own ? (CelestriadElement)(((int)own + SetOffset[set]) % 3) : DoubleElement[set];
+        PlayerDebuffElement[role] is { } own
+            ? Elements[(Array.IndexOf(Elements, own) + SetOffset[set]) % Elements.Length]
+            : DoubleElement[set];
 
     public UmadP5CelestriadState(SimParty party, UmadP5CelestriadStateOverrides overrides)
     {
@@ -85,20 +113,20 @@ public sealed class UmadP5CelestriadState
                 allTowers.Add(new CelestriadTower(element, sub, TowerPosition(element, sub)));
         AllTowers = allTowers;
 
-        var setActive = new List<IReadOnlyList<CelestriadTower>>(3);
-        var aero = new List<bool?>(3);
+        var setActive = new List<IReadOnlyList<int>>(3);
+        var aero = new List<CatastrophicChoice?>(3);
         for (var set = 0; set < 3; set++)
         {
-            var active = new List<CelestriadTower>(4);
+            var active = new List<int>(4);
             foreach (var element in Elements)
             {
-                var elementTowers = allTowers.Where(t => t.Element == element).ToArray();
                 var isDouble = element == DoubleElement[set];
                 // Which sub-towers light up is random; sorted ascending so a doubled element's
                 // pair always lists in a stable, deterministic clockwise order for whoever reads
                 // "first" vs "second" out of it (the AI, when deciding who goes where).
                 var subs = rng.Shuffle(0, 1, 2).Take(isDouble ? 2 : 1).OrderBy(s => s).ToArray();
-                active.AddRange(subs.Select(s => elementTowers[s]));
+                var elementStart = Array.IndexOf(Elements, element) * 3;
+                active.AddRange(subs.Select(s => elementStart + s));
             }
             setActive.Add(active);
             aero.Add(ResolveAero(set, overrides));
@@ -107,19 +135,19 @@ public sealed class UmadP5CelestriadState
         AeroVariant = aero;
     }
 
-    private bool? ResolveAero(int set, UmadP5CelestriadStateOverrides overrides) => set switch
+    private CatastrophicChoice? ResolveAero(int set, UmadP5CelestriadStateOverrides overrides) => set switch
     {
         0 => overrides.Set1 switch
         {
-            CatastrophicVariantOverride.Aero => true,
-            CatastrophicVariantOverride.Earth => false,
-            _ => rng.NextBool(),
+            CatastrophicVariantOverride.Aero => CatastrophicChoice.Aero,
+            CatastrophicVariantOverride.Earth => CatastrophicChoice.Earth,
+            _ => rng.NextBool() ? CatastrophicChoice.Aero : CatastrophicChoice.Earth,
         },
         2 => overrides.Set3 switch
         {
-            CatastrophicVariantOverride.Aero => true,
-            CatastrophicVariantOverride.Earth => false,
-            _ => rng.NextBool(),
+            CatastrophicVariantOverride.Aero => CatastrophicChoice.Aero,
+            CatastrophicVariantOverride.Earth => CatastrophicChoice.Earth,
+            _ => rng.NextBool() ? CatastrophicChoice.Aero : CatastrophicChoice.Earth,
         },
         _ => null, // set 1 (index 1, the "second" soak) has no Catastrophic Choice
     };
@@ -129,7 +157,7 @@ public sealed class UmadP5CelestriadState
     // positions (see UmadP5CelestriadConstants). subIndex selects which of an element's 3 ring spots.
     public static Vector3 TowerPosition(CelestriadElement element, int subIndex)
     {
-        var ringIndex = (int)element * 3 + subIndex;
+        var ringIndex = Array.IndexOf(Elements, element) * 3 + subIndex;
         var angle = MathF.PI / 9f + ringIndex * (MathF.PI * 2f / 9f);
         return new Vector3(MathF.Sin(angle) * CelestriadGeometry.RingRadius, 0f, -MathF.Cos(angle) * CelestriadGeometry.RingRadius);
     }

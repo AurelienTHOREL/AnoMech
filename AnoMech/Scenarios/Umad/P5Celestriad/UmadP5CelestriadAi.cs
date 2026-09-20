@@ -46,7 +46,9 @@ public sealed class UmadP5CelestriadAi : IScenarioAi<UmadP5CelestriadState>
     }
 
     private static float HalfFor(UmadP5CelestriadState state, int set) =>
-        state.AeroVariant[set] is { } aero ? (aero ? -1f : 1f) : 0f;
+        state.AeroVariant[set] is { } choice
+            ? (choice == CatastrophicChoice.Aero ? -1f : 1f)
+            : 0f;
 
     private static void PlaceSet(SimWorld world, UmadP5CelestriadState state, int set, int playerSlot, float half)
     {
@@ -57,7 +59,9 @@ public sealed class UmadP5CelestriadAi : IScenarioAi<UmadP5CelestriadState>
         // sub-index): within a doubled element's 2 active towers, the first always gets that
         // set's debuffed pair for this element and the second always gets the free pair. This
         // pairing is this AI's own strategy choice, not a fact State hands us.
-        foreach (var group in state.SetActiveTowers[set].GroupBy(t => t.Element))
+        foreach (var group in state.SetActiveTowers[set]
+                     .Select(towerIndex => state.AllTowers[towerIndex])
+                     .GroupBy(tower => tower.Element))
         {
             var debuffedRoles = state.PlayerDebuffElement
                 .Where(kv => kv.Value is not null && state.ElementForSet(kv.Key, set) == group.Key)

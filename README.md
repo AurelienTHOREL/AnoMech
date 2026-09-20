@@ -45,6 +45,7 @@ See: https://github.com/anomek/MyDalamudPlugins
     - P3 Black Hole _old bh (DSA, single tethers, n/s stomps)_
     - P4 Kefka Says _kefkabin_
     - P5 Exaflares _by [Wydox](https://github.com/Wydox)_
+    - P5 Celestriad _y [RoarkGit](https://github.com/RoarkGit)_
     - P5 Forsaken Null _no ai or damage_
 - The Omega Protocol (Ultimate): _NA pf strats_
     - P2 Party Synergy
@@ -84,6 +85,7 @@ See: https://github.com/anomek/MyDalamudPlugins
 Thanks for contributors:
 * [WorstAquaPlayer](https://github.com/WorstAquaPlayer) - rewriting core & fixing crashes, scenarios for uwu
 * [Wydox](https://github.com/Wydox) - EU strats for Forsaken, UMAD Exaflares, core improvements
+* [RoarkGit](https://github.com/RoarkGit) - UMAD Celestriad
 
 AnoMech leans heavily on the work of other Dalamud plugins. Huge thanks to their authors!  
 Without them, the following would not be possible:

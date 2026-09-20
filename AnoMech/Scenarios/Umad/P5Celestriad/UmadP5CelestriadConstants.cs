@@ -34,6 +34,11 @@ public static class UmadP5CelestriadConstants
         public const uint FireIII = 0xBB43U;
         public const uint BlizzardIII = 0xBB44U;
         public const uint ThunderIII = 0xBB45U;
+        public const uint StardustFireIII = 0xBB46U;
+        public const uint StardustBlizzardIII = 0xBB47U;
+        public const uint StardustThunderIII = 0xBB48U;
+        public const uint CatastrophicChoiceEarthResolution = 0xBB4BU; // Tornado, 40-yalm donut
+        public const uint CatastrophicChoiceAeroResolution = 0xBB4AU;  // Quake, 10-yalm circle
     }
 
     // LightningResistanceDownII and DamageDown are already in the shared UmadConstants.StatusId
