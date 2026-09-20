@@ -5,6 +5,7 @@ using System.Reflection;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Components;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using AnoMech.Core.Map;
 using AnoMech.Core;
@@ -126,7 +127,7 @@ public unsafe class MainWindow : Window, IDisposable
 
     public override void Draw()
     {
-        var leftWidth = _leftPanelOpen ? ScenarioPanelWidth() : 30f;
+        var leftWidth = _leftPanelOpen ? ScenarioPanelWidth() : 30f * ImGuiHelpers.GlobalScale;
 
         if (ImGui.BeginTable("##layout", 2, ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.SizingFixedFit))
         {
@@ -154,7 +155,7 @@ public unsafe class MainWindow : Window, IDisposable
                     widest = Math.Max(widest, ImGui.CalcTextSize(DisplayName(scenario)).X);
         }
         var measured = widest + style.FramePadding.X * 2 + style.CellPadding.X * 2;
-        return Math.Max(180f, measured);
+        return Math.Max(180f * ImGuiHelpers.GlobalScale, measured);
     }
 
     private void DrawScenariosPanel()
@@ -312,7 +313,7 @@ public unsafe class MainWindow : Window, IDisposable
 
         ImGui.TextUnformatted("Waymarks:");
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(180);
+        ImGui.SetNextItemWidth(180 * ImGuiHelpers.GlobalScale);
         if (ImGui.Combo("##waymarks", ref _selectedWaymark, labels, labels.Length)
             && plugin.Game.World.Map.IsInInstance)
             plugin.Game.World.PlaceWaymarks(presets[_selectedWaymark].Markers);
@@ -323,7 +324,7 @@ public unsafe class MainWindow : Window, IDisposable
         var idx = _roleOverride is { } role ? (int)role + 1 : 0;
         ImGui.TextUnformatted("Select your Role:");
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * ImGuiHelpers.GlobalScale);
         if (ImGui.Combo("##role", ref idx, RoleLabels, RoleLabels.Length))
             _roleOverride = idx == 0 ? null : (PartyRole)(idx - 1);
     }
@@ -348,7 +349,7 @@ public unsafe class MainWindow : Window, IDisposable
         for (var i = 0; i < strats.Count; i++) labels[i] = strats[i].Name;
         ImGui.TextUnformatted("Select Strat:");
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(280);
+        ImGui.SetNextItemWidth(280 * ImGuiHelpers.GlobalScale);
         ImGui.Combo("##strat", ref _selectedStrat, labels, labels.Length);
     }
 
@@ -394,7 +395,7 @@ public unsafe class MainWindow : Window, IDisposable
         var localIdx = filtered.IndexOf(_selectedStrat);
         var labels = new string[filtered.Count];
         for (var i = 0; i < filtered.Count; i++) labels[i] = strats[filtered[i]].Name;
-        ImGui.SetNextItemWidth(280);
+        ImGui.SetNextItemWidth(280 * ImGuiHelpers.GlobalScale);
         if (ImGui.Combo("##strat", ref localIdx, labels, labels.Length))
             _selectedStrat = filtered[localIdx];
     }

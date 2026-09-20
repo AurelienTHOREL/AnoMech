@@ -4,7 +4,6 @@ using System.Linq;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
-using AnoMech.Core.Native;
 using AnoMech.Core.SimObjects;
 using AnoMech.Scenarios;
 using AnoMech.Scenarios.Top.P2PartySynergy;
@@ -16,11 +15,11 @@ using AnoMech.Scenarios.Umad;
 using AnoMech.Scenarios.Umad.P2Forsaken;
 using AnoMech.Scenarios.Umad.P3BlackHole;
 using AnoMech.Scenarios.Umad.P4KefkaSays;
+using AnoMech.Scenarios.Umad.P5Celestriad;
 using AnoMech.Scenarios.Umad.P5Exaflares;
 using AnoMech.Scenarios.Uwu.UltimatePredation;
 using Dalamud.Game.Text;
 using Dalamud.Game.Text.SeStringHandling;
-using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI;
 
 namespace AnoMech.Core.Game;
@@ -106,6 +105,7 @@ public sealed class Game : IDisposable
             new UmadP3BlackHoleScenario(),
             new UmadP4KefkaSaysScenario(),
             new UmadP5ExaflaresScenario(),
+            new UmadP5CelestriadScenario(),
             new UmadP5ForsakenNull(),
             new TopP2PartySynergyScenario(),
             new TopP5DeltaScenario(),
@@ -193,6 +193,11 @@ public sealed class Game : IDisposable
         // zone entry), true for any restart/switch within the already-loaded zone.
         var freshLoad = !World.Map.IsZoneLoaded;
 
+        // Snapshot the player's pristine job gauge once per session, before any action mutates
+        // it, so Leave can restore it. Only on a true zone entry — a restart must keep the
+        // original snapshot, not re-capture the already-simulated gauge.
+        if (freshLoad) Plugin.UserActions.OnSessionStart();
+
         World.HideObject(ExitObjectBaseId);
         World.Map.TryLoad(
             new TargetInstance(zone.TerritoryId, zone.Origin, zone.Origin + PlayerSpawnLocal, phase.Weather),
@@ -214,6 +219,7 @@ public sealed class Game : IDisposable
         ResetSprintCooldown();
         if (previousScenario != scenario)
             MechanicStreak = 0;
+        Plugin.UserActions.OnScenarioStart();
         activeScenario = scenario;
         scenarioElapsed = 0f;
 
@@ -230,22 +236,6 @@ public sealed class Game : IDisposable
             Type = XivChatType.SystemMessage,
             Message = new SeStringBuilder().AddText($"[AnoMech] Starting: {FullName(scenario)}{(solo ? " (Solo)" : "")}").Build(),
         });
-    }
-
-    // Sprint goes on cooldown when the player presses it inside a scenario
-    // (LocalPlayerInputHooks lets Original run so the recast starts). Clear it
-    // here so each scenario starts with Sprint ready, regardless of whether
-    // the player pressed it just before clicking Start.
-    private static unsafe void ResetSprintCooldown()
-    {
-        var am = ActionManager.Instance();
-        if (am == null) return;
-        var group = am->GetRecastGroup((int)ActionType.Action, LocalPlayerInputHooks.SprintActionId);
-        if (group < 0) return;
-        var detail = am->GetRecastGroupDetail(group);
-        if (detail == null) return;
-        detail->IsActive = false;
-        detail->Elapsed = 0f;
     }
 
     public void Tick(float deltaSeconds)
@@ -407,6 +397,7 @@ public sealed class Game : IDisposable
         Plugin.Framework.Run(() =>
         {
             ResetInternal();
+            Plugin.UserActions.OnSessionEnd();   // restore the job gauge captured at session start
             Bgm.Reset();
             World.Map.Unload();
         });
@@ -443,6 +434,7 @@ public sealed class Game : IDisposable
     {
         activeScenario = null;
         Events.Clear();
+        Plugin.UserActions.OnSessionEnd();   // restore the gauge if the plugin unloads mid-session (no-op otherwise)
         Bgm.Dispose();
         World.Dispose();
         opcodeUpdater.Dispose();

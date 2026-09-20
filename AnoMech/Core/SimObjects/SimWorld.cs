@@ -133,6 +133,13 @@ public sealed class SimWorld : ISimObject, IDisposable
     public void SpawnOmen(string path, Placement placement, Vector3 scale, float durationSeconds)
         => children.Add(new SimOmen(Coordinates, path, placement, scale, durationSeconds));
 
+    // Standalone telegraph derived from `actionId`'s own Omen sheet entry (shape/scale
+    // read from Action.CastType/EffectRange/XAxisModifier), for a boss ability whose real
+    // telegraph is duty-scripted rather than driven by the caster's own cast. SimCast
+    // bypasses Character::StartCast, so the native auto-omen never fires on its own.
+    public void SpawnActionOmen(uint actionId, Vector3 origin, float rotation, float durationSeconds)
+        => children.Add(new SimOmen(Coordinates, actionId, origin, rotation, durationSeconds));
+
     // Change the active weather mid-scenario. weatherId is a Weather-sheet row;
     // transition is the fade-in time in seconds. A scenario's default weather
     // (TargetInstance.WeatherId) is re-applied automatically on restart, so any

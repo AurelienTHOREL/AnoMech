@@ -25,13 +25,14 @@ namespace AnoMech.Core.Native;
 // will need to rev them together.
 public sealed unsafe class LocalPlayerInputHooks : IDisposable
 {
-    internal const uint SprintActionId = 3;
-    private const ushort SprintStatusId = 50;
-    private const float SprintDuration = 10f; 
-    internal const ushort SprintStatusParam = 30;
-
     public bool DisableAllActions { get; set; }
     public bool ZeroMovement { get; set; }
+
+    // Raised after the local player successfully executes a real action (the
+    // auto-attack-cancel general action is filtered out). The UserActions module
+    // subscribes to resolve effects the sim firewall blocks; nothing here depends
+    // on a subscriber.
+    public event Action<ActionType, uint>? ActionExecuted;
 
     // --- Player activity signals (read by SimPlayer to drive Party.Player.IsMoving/IsActing) ---
     // Movement is the engine's own per-frame movement sample taken in RMIWalkDetour — the same
@@ -58,6 +59,19 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         return used;
     }
 
+    // Latched whenever the game calls Hotbar.CancelCast — i.e. the player requested a
+    // cast cancel (ESC / the cancel-cast keybind, however it's bound; also cancels
+    // auto-attack). This is the outgoing intent the server would act on; the sim
+    // firewall eats that round-trip, so UserActions drains this each frame and
+    // synthesizes the interrupt itself.
+    private bool cancelCastRequested;
+    public bool PollCancelCast()
+    {
+        var requested = cancelCastRequested;
+        cancelCastRequested = false;
+        return requested;
+    }
+
     private delegate void RMIWalkDelegate(void* self, float* sumLeft, float* sumForward, float* sumTurnLeft, byte* haveBackwardOrStrafe, byte* a6, byte bAdditiveUnk);
     [Signature("E8 ?? ?? ?? ?? 80 7B 3E 00 48 8D 3D")]
     private Hook<RMIWalkDelegate> rmiWalkHook = null!;
@@ -77,6 +91,7 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
     private readonly Hook<ActionManager.Delegates.Update> updateHook;
     private readonly Hook<ActionManager.Delegates.UseAction> useActionHook;
     private readonly Hook<ActionManager.Delegates.UseActionLocation> useActionLocationHook;
+    private readonly Hook<Hotbar.Delegates.CancelCast> cancelCastHook;
 
     public LocalPlayerInputHooks(IGameInteropProvider hook)
     {
@@ -90,6 +105,8 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
             ActionManager.Addresses.UseAction.Value, UseActionDetour);
         useActionLocationHook = hook.HookFromAddress<ActionManager.Delegates.UseActionLocation>(
             ActionManager.Addresses.UseActionLocation.Value, UseActionLocationDetour);
+        cancelCastHook = hook.HookFromAddress<Hotbar.Delegates.CancelCast>(
+            Hotbar.Addresses.CancelCast.Value, CancelCastDetour);
 
         rmiWalkHook.Enable();
         checkStrafeKeybindHook.Enable();
@@ -97,6 +114,7 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         updateHook.Enable();
         useActionHook.Enable();
         useActionLocationHook.Enable();
+        cancelCastHook.Enable();
     }
 
     public void Dispose()
@@ -107,6 +125,15 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         updateHook?.Dispose();
         useActionHook?.Dispose();
         useActionLocationHook?.Dispose();
+        cancelCastHook?.Dispose();
+    }
+
+    // The player asked to cancel their cast; latch it and let the original run (its
+    // outgoing packet is firewalled in the sim, so it has no visible effect here).
+    private void CancelCastDetour(Hotbar* thisPtr)
+    {
+        cancelCastRequested = true;
+        cancelCastHook.Original(thisPtr);
     }
 
     private void RMIWalkDetour(void* self, float* sumLeft, float* sumForward, float* sumTurnLeft, byte* haveBackwardOrStrafe, byte* a6, byte bAdditiveUnk)
@@ -152,9 +179,10 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         // Record a real action use for Party.Player.IsActing — but ignore the auto-attack-cancel
         // general action that UpdateDetour issues while stunned.
         if (result && !IsStopAutosAction(actionType, actionId))
+        {
             actionUsedSincePoll = true;
-        if (result && actionType == ActionType.Action && actionId == SprintActionId)
-            Plugin.GameInstance?.Player?.AddStatus(SprintStatusId, SprintDuration, SprintStatusParam);
+            ActionExecuted?.Invoke(actionType, actionId);
+        }
         return result;
     }
 
@@ -162,7 +190,11 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
     {
         if (DisableAllActions && !IsStopAutosAction(actionType, actionId)) return false;
         var result = useActionLocationHook.Original(self, actionType, actionId, targetId, location, extraParam, a7);
-        if (result) actionUsedSincePoll = true;
+        if (result)
+        {
+            actionUsedSincePoll = true;
+            ActionExecuted?.Invoke(actionType, actionId);
+        }
         return result;
     }
 
