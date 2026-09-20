@@ -176,7 +176,10 @@ public unsafe class MainWindow : Window, IDisposable
                     {
                         var selected = _selectedScenario == scenario;
                         if (selected) ImGui.PushStyleColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.ButtonActive));
-                        ImGui.PushID(scenario.Name);
+                        // Zone-qualified: two zones can hold same-named scenarios (UMAD and UCOB
+                        // both have a P5 "Exaflares"), and a shared ImGui id makes the second
+                        // button unclickable.
+                        ImGui.PushID(FullName(scenario));
                         if (ImGui.Button(DisplayName(scenario), new Vector2(-1, 0)))
                             SelectScenario(scenario);
                         ImGui.PopID();

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using FFXIVClientStructs.FFXIV.Client.LayoutEngine;
 using FFXIVClientStructs.FFXIV.Client.LayoutEngine.Group;
@@ -37,6 +38,28 @@ internal static unsafe class LayoutQuery
             }
         }
         return count;
+    }
+
+    // Pointers to every layout instance (any type, not just SharedGroup) belonging to one LGB
+    // layer key, for MapController.SuppressLayer — a client-side zone load activates every
+    // layer at once (there's no real duty director picking the current phase's), so competing
+    // floor geometry from different phases can end up occupying the same space and z-fight.
+    public static List<nint> CollectLayerInstances(ushort layerKey)
+    {
+        var lw = LayoutWorld.Instance();
+        var result = new List<nint>();
+        if (lw == null || lw->ActiveLayout == null) return result;
+        foreach (var layerKv in lw->ActiveLayout->Layers)
+        {
+            var layer = layerKv.Item2.Value;
+            if (layer == null || layerKv.Item1 != layerKey) continue;
+            foreach (var instKv in layer->Instances)
+            {
+                var inst = instKv.Item2.Value;
+                if (inst != null) result.Add((nint)inst);
+            }
+        }
+        return result;
     }
 
     public static SharedGroupLayoutInstance* FindBySgbPath(string sgbPath)

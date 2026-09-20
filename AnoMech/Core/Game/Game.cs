@@ -15,6 +15,7 @@ using AnoMech.Scenarios.Umad;
 using AnoMech.Scenarios.Umad.P2Forsaken;
 using AnoMech.Scenarios.Umad.P3BlackHole;
 using AnoMech.Scenarios.Umad.P4KefkaSays;
+using AnoMech.Scenarios.Ucob.P5Exaflares;
 using AnoMech.Scenarios.Umad.P5Celestriad;
 using AnoMech.Scenarios.Umad.P5Exaflares;
 using AnoMech.Scenarios.Uwu.UltimatePredation;
@@ -114,7 +115,8 @@ public sealed class Game : IDisposable
             new TopP5OmegaScenario(),
             new TopP6WaveCannon2Scenario(),
             new UltimatePredationScenario(),
-            new UltimateSuppressionScenario()
+            new UltimateSuppressionScenario(),
+            new UcobP5ExaflaresScenario()
         };
 
         // Derive the zone tree from the flat registry (first-appearance order).
