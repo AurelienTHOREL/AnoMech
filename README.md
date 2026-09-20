@@ -55,6 +55,7 @@ See: https://github.com/anomek/MyDalamudPlugins
     - P6 Exasquares / Wave Cannon 2
 - The Weapon's Refrain (Ultimate) _by [WorstAquaPlayer](https://github.com/WorstAquaPlayer)_
     - Ultimate Predaction
+    - Ultimate Suppression
 
 ## Details
 
