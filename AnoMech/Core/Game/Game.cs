@@ -87,6 +87,11 @@ public sealed class Game : IDisposable
     private const string MechanicSuccessVfx = "vfx/monster/gimmick2/eff/e3d2_b2_g04t0x.avfx";
     private const string MechanicFailureVfx = "vfx/monster/gimmick2/eff/e3d2_b2_g05t0x.avfx";
 
+    // When the last mistake was marked, null while the run is still clean. Godmode deaths return
+    // before deathOccurredThisRun is set, so this is the only mistake signal spanning both modes.
+    private const float MistakeMarkCooldownSeconds = 1f;
+    private float? lastMistakeElapsed;
+
     // Set by Kill on any real death, scoped to the current run (cleared by ResetInternal).
     // IsFinished can go true on a queue that Kill's own freeze-timer event never touches
     // (e.g. a scenario with a private EventScheduler immune to EventTimeScale): there's no
@@ -276,8 +281,11 @@ public sealed class Game : IDisposable
         if (scenarioFinishedElapsed < MechanicResultSettleSeconds) return;
         mechanicResultReported = true;
         if (deathOccurredThisRun) return;
-        MechanicStreak++;
-        World.Party.Player?.AddVfx(MechanicSuccessVfx, persistent: false);
+        if (lastMistakeElapsed is null)
+        {
+            MechanicStreak++;
+            World.Party.Player?.AddVfx(MechanicSuccessVfx, persistent: false);
+        }
         if (AutoRestart && lastRun is { } p)
             RunScenario(p);
     }
@@ -311,6 +319,12 @@ public sealed class Game : IDisposable
         {
             firstDeathScheduled = true;
             ShowFirstDeathOverlay(target, cause);
+        }
+        // Above the godmode return so every swallowed mistake marks.
+        // Prevent Mark stacking by enforcing a cooldown.
+        if (lastMistakeElapsed is not { } last || scenarioElapsed - last > MistakeMarkCooldownSeconds)
+        {
+            lastMistakeElapsed = scenarioElapsed;
             World.Party.Player?.AddVfx(MechanicFailureVfx, persistent: false);
         }
 
@@ -428,6 +442,7 @@ public sealed class Game : IDisposable
         scenarioFinishedElapsed = null;
         mechanicResultReported = false;
         deathOccurredThisRun = false;
+        lastMistakeElapsed = null;
 #if DEBUG
         AnoMech.Windows.DamageDebugWindow.Instance?.ResetFreeze();
 #endif
