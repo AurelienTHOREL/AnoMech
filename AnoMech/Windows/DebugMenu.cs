@@ -12,6 +12,7 @@ using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Environment;
+using Dalamud.Interface.Utility;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -223,6 +224,7 @@ internal sealed unsafe class DebugMenu
 
     public void DrawDebugContent()
     {
+        var uiScale = ImGuiHelpers.GlobalScale;
         ImGui.TextUnformatted($"TerritoryId: {Plugin.ClientState.TerritoryType}");
 
         if (ImGui.Button("Damage debug window"))
@@ -253,11 +255,11 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Manual spawn");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("BNpcBaseId", ref debugBNpcBaseIdText, 16);
-        ImGui.SetNextItemWidth(80);
+        ImGui.SetNextItemWidth(80 * uiScale);
         ImGui.InputText("Scale (0 = default)", ref debugSpawnScaleText, 16);
-        ImGui.SetNextItemWidth(80);
+        ImGui.SetNextItemWidth(80 * uiScale);
         ImGui.InputText("ModeAttrFlags (blank = none)", ref debugSpawnModeAttrFlagsText, 16);
         if (ImGui.Button("Spawn"))
         {
@@ -294,7 +296,7 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Manual EObj spawn");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("EObjRowId", ref debugEObjRowIdText, 16);
         if (ImGui.Button("Spawn EObj"))
         {
@@ -318,7 +320,7 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Play animation on target");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("TimelineId", ref debugTimelineIdText, 16);
         if (ImGui.Button("Play on target"))
         {
@@ -331,7 +333,7 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Attach lockon VFX to target");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("LockonId", ref debugLockonIdText, 16);
         if (ImGui.Button("Attach lockon on target"))
         {
@@ -343,7 +345,7 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Set ModelState on target");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("ModelState", ref debugModelStateText, 16);
         if (ImGui.Button("Set ModelState"))
         {
@@ -356,7 +358,7 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Apply ModeAttributeFlags on target");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("ModeAttrFlags", ref debugModeAttrFlagsText, 16);
         if (ImGui.Button("Apply ModeAttributeFlags"))
         {
@@ -368,9 +370,9 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Cast on player");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("ActionId", ref debugCastActionIdText, 16);
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("AnimationVariation", ref debugCastAnimVariationText, 16);
         if (ImGui.Button("Cast on player"))
         {
@@ -395,11 +397,11 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Apply status");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("StatusId", ref debugStatusIdText, 16);
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("Duration (0 = default)", ref debugStatusDurationText, 16);
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("Stacks (blank = 1)", ref debugStatusStacksText, 16);
         if (ImGui.Button("Apply on target##status"))
             ApplyStatus(onPlayer: false);
@@ -456,11 +458,11 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Map effect");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(80);
+        ImGui.SetNextItemWidth(80 * uiScale);
         ImGui.InputText("Index", ref debugMapEffectIndexText, 16);
-        ImGui.SetNextItemWidth(80);
+        ImGui.SetNextItemWidth(80 * uiScale);
         ImGui.InputText("Status", ref debugMapEffectStatusText, 16);
-        ImGui.SetNextItemWidth(80);
+        ImGui.SetNextItemWidth(80 * uiScale);
         ImGui.InputText("Flag", ref debugMapEffectFlagText, 16);
         if (ImGui.Button("Apply map effect"))
         {
@@ -506,9 +508,9 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("Director update (ActorControl replay)");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("Category", ref debugDirectorCategoryText, 16);
-        ImGui.SetNextItemWidth(120);
+        ImGui.SetNextItemWidth(120 * uiScale);
         ImGui.InputText("Arg1", ref debugDirectorArg1Text, 16);
         if (ImGui.Button("Fire director update"))
         {
@@ -540,7 +542,7 @@ internal sealed unsafe class DebugMenu
         ImGui.Spacing();
         ImGui.TextUnformatted("BGM test");
         ImGui.Separator();
-        ImGui.SetNextItemWidth(80);
+        ImGui.SetNextItemWidth(80 * uiScale);
         ImGui.InputText("BgmId", ref debugBgmIdText, 16);
         ImGui.SameLine();
         if (ImGui.Button("Play##bgm"))

@@ -136,6 +136,7 @@ public unsafe class SimEventObject : ISimObject, IPositioned
     public EventObjectSpawnConfig? SpawnConfig { get; private set; }
     public int Slot => slot;
     public nint Address => (nint)obj;
+    public GameObjectId GameObjectId => obj == null ? default : obj->GetGameObjectId();
 
     public bool IsAlive => slot >= 0 && obj != null;
 

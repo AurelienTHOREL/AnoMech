@@ -33,6 +33,11 @@ public sealed class EventScheduler
             elapsed = now;
         }
     }
+    // No more scheduled work. A scenario's whole timeline lives in this queue, so this
+    // doubles as a generic "reached its declared end" signal for whoever's watching (Game
+    // uses it to infer a clean run for the mechanic-streak counter) without needing scenarios
+    // to report completion themselves.
+    public bool IsEmpty => entries.Count == 0;
 
     public void Add(float offset, Action action)
     {

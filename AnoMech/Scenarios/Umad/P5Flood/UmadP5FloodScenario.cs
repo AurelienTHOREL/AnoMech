@@ -206,6 +206,10 @@ public sealed class UmadP5FloodScenario : IMultiplayerReplayable
         if (settingsWindow.Overrides.PreloadWaveTimelines) ActionTimelinePreload.Preload(WaveTimelines, "UmadP5Flood");
     }
 
+    // The mechanic runs on the private `timeline`, so the default (world.Events.IsEmpty)
+    // would read finished from the first tick.
+    public bool IsFinished(SimWorld world) => timeline.IsEmpty;
+
     public void Tick(float delta, float elapsed)
     {
         var now = wallClock.Elapsed.TotalSeconds;

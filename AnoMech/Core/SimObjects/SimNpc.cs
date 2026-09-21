@@ -105,15 +105,6 @@ public unsafe class SimNpc : SimCharacter
         pendingDraw = true;
     }
 
-    public uint EntityId
-    {
-        get
-        {
-            var obj = BattleCharaPtr;
-            return obj == null ? 0u : obj->EntityId;
-        }
-    }
-
     // Plays an action's own animation and VFX on this doppel through the same synthetic
     // ActionEffect a boss cast fires -- what lets a bot tank visibly pop its LB3 in Umad P3
     // Limit Cut. Effects (statuses, damage) stay the caller's job, exactly as for an enemy Cast.

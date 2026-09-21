@@ -39,6 +39,14 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     public GameObjectId GameObjectId => BattleCharaPtr == null ? default : BattleCharaPtr->GetGameObjectId();
     public float HitboxRadius => BattleCharaPtr == null ? 0f : BattleCharaPtr->HitboxRadius;
 
+    public uint EntityId
+    {
+        get
+        {
+            var obj = BattleCharaPtr;
+            return obj == null ? 0u : obj->EntityId;
+        }
+    }
 
     public virtual void Tick(float deltaSeconds)
     {
@@ -106,7 +114,7 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
     public void MoveTo(Vector3 target, float speed = 6f, float? finalRotation = null)
         => Movement.MoveTo(target, speed, finalRotation);
     public void MoveTo(Placement p) => MoveTo(p.Position);
-    protected void StopMoving() => Movement.Stop();
+    public void StopMoving() => Movement.Stop();
 
     public void Intercept(SimTether? tether, float margin = 3f) => Movement.Intercept(tether, margin);
     public bool IsIntercepting => Movement.IsIntercepting;

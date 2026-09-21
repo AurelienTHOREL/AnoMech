@@ -5,7 +5,6 @@ using System.Linq;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.Map;
-using AnoMech.Core.Native;
 using AnoMech.Core.SimObjects;
 using AnoMech.Scenarios;
 using AnoMech.Scenarios.Top.P2PartySynergy;
@@ -19,9 +18,12 @@ using AnoMech.Scenarios.Umad.P2Forsaken;
 using AnoMech.Scenarios.Umad.P3BlackHole;
 using AnoMech.Scenarios.Umad.P3LimitCut;
 using AnoMech.Scenarios.Umad.P4KefkaSays;
+using AnoMech.Scenarios.Ucob.P5Exaflares;
+using AnoMech.Scenarios.Umad.P5Celestriad;
 using AnoMech.Scenarios.Umad.P5Exaflares;
 using AnoMech.Scenarios.Umad.P5Flood;
 using AnoMech.Scenarios.Uwu.UltimatePredation;
+using AnoMech.Scenarios.Uwu.UltimateSuppression;
 using Dalamud.Game.Text;
 using Dalamud.Game.Text.SeStringHandling;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -67,6 +69,36 @@ public sealed class Game : IDisposable
     // gameplay side effect (HP=0, KO timeline, stun hooks, freeze timer).
     public bool GodMode { get; set; }
 
+    // When true, a successful run (see UpdateMechanicResult) immediately starts the same
+    // scenario again with the same parameters, for hands-free repetition. A real death
+    // cancels it (set false directly in Kill) rather than restarting past a failure the
+    // freeze/overlay exists to let the user actually see.
+    public bool AutoRestart { get; set; }
+    private RunScenarioParams? lastRun;
+
+    // Consecutive successful completions of whatever scenario is currently active. Reset by
+    // Kill on any real (non-godmode) death and by RunScenarioInternal when a different
+    // scenario starts. Incremented automatically once IScenario.IsFinished reports true and
+    // stays true for MechanicResultSettleSeconds (see UpdateMechanicResult): no per-scenario
+    // reporting needed. In-memory only: does not survive a plugin reload.
+    public int MechanicStreak { get; private set; }
+
+    // How long IsFinished has to stay true before it counts as "reached the end cleanly".
+    // Covers a death whose failure check trails a few frames behind the scenario's own
+    // last scheduled action (rather than firing in the exact same frame, which the Tick
+    // call order below already handles on its own).
+    private const float MechanicResultSettleSeconds = 1f;
+    private float? scenarioFinishedElapsed;
+    private bool mechanicResultReported;
+
+    // Set by Kill on any real death, scoped to the current run (cleared by ResetInternal).
+    // IsFinished can go true on a queue that Kill's own freeze-timer event never touches
+    // (e.g. a scenario with a private EventScheduler immune to EventTimeScale): there's no
+    // structural guarantee that queue and the freeze timer interleave correctly the way two
+    // entries on the same Events queue would, so this flag is the actual source of truth for
+    // "did this run fail", independent of any queue or timing race.
+    private bool deathOccurredThisRun;
+
     private IScenario? activeScenario;
     private float scenarioElapsed;
     private long lastEventTick;
@@ -103,13 +135,16 @@ public sealed class Game : IDisposable
             new UmadP4KefkaSaysScenario(),
             new UmadP5ExaflaresScenario(),
             new UmadP5FloodScenario(),
+            new UmadP5CelestriadScenario(),
             new UmadP5ForsakenNull(),
             new TopP2PartySynergyScenario(),
             new TopP5DeltaScenario(),
             new TopP5SigmaScenario(),
             new TopP5OmegaScenario(),
             new TopP6WaveCannon2Scenario(),
-            new UltimatePredationScenario()
+            new UltimatePredationScenario(),
+            new UltimateSuppressionScenario(),
+            new UcobP5ExaflaresScenario()
         };
 
         // Derive the zone tree from the flat registry (first-appearance order).
@@ -143,19 +178,31 @@ public sealed class Game : IDisposable
     // solo (no doppels, no AI). Defaults to 0 = run the first strat with a full party.
     // selectedWaymark: index into the scenario's WaymarkPresets; ignored when it has none.
     public void RunScenario(IScenario scenario, PartyRole? roleOverride = null, int? selectedAi = 0, int selectedWaymark = 0)
+        => RunScenario(new RunScenarioParams(scenario, roleOverride, selectedAi, selectedWaymark));
+
+    private void RunScenario(RunScenarioParams p)
     {
-        Plugin.Framework.Run(() => { RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, null, null, isPeer: false); });
+        lastRun = p;
+        Plugin.Framework.Run(() => { RunScenarioInternal(p.Scenario, p.RoleOverride, p.SelectedAi, p.SelectedWaymark, null, null, isPeer: false); });
     }
 
     // Multiplayer host: RunScenario with `networkRoles` spawned as SimNetworkPuppet, named
     // after their players (`networkNames`).
     public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Action<string?> resolved)
-        => RunResolved(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false), resolved);
+    {
+        // Auto-restart is a solo affordance: a host silently rerunning would desync the session,
+        // and a stale lastRun would rerun the wrong scenario entirely.
+        lastRun = null;
+        RunResolved(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false), resolved);
+    }
 
     // Multiplayer peer: same zone/party/waymarks, but never zone/phase/scenario.Run; every
     // other slot is a puppet driven by the host's snapshots.
     public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Action<string?> resolved)
-        => RunResolved(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true), resolved);
+    {
+        lastRun = null;
+        RunResolved(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true), resolved);
+    }
 
     // `resolved` runs in the same deferred callback as the start, with why it was refused, or
     // null once the run is up; an exception counts as a refusal.
@@ -216,6 +263,9 @@ public sealed class Game : IDisposable
             return "impossible scenario settings";
         }
 
+        // Captured before ResetInternal clears activeScenario, so restarting the same
+        // scenario (the normal way to extend a streak) doesn't look like a switch.
+        var previousScenario = activeScenario;
         ResetInternal();
 
         var player = Plugin.ObjectTable.LocalPlayer;
@@ -243,6 +293,11 @@ public sealed class Game : IDisposable
             Plugin.Log.Warning($"Game: {scenario.Name} did not enter its zone; aborting.");
             return "the zone was not entered (see the log)";
         }
+        // Snapshot the player's pristine job gauge once per session, before any action mutates
+        // it, so Leave can restore it. Only on a true zone entry — a restart must keep the
+        // original snapshot, not re-capture the already-simulated gauge.
+        if (freshLoad) Plugin.UserActions.OnSessionStart();
+
         World.HideObject(ExitObjectBaseId);
         lastPhase = phase;
         World.ScenarioOrigin = zone.Origin;
@@ -277,7 +332,9 @@ public sealed class Game : IDisposable
             TeleportPlayerToSpawn();
         else
             TeleportPlayerToSpawnIfOutsideArena();
-        ResetSprintCooldown();
+        if (previousScenario != scenario)
+            MechanicStreak = 0;
+        Plugin.UserActions.OnScenarioStart();
         if (!isPeer)
         {
             activeScenario = scenario;
@@ -301,25 +358,9 @@ public sealed class Game : IDisposable
         return null;
     }
 
-    // Sprint goes on cooldown when the player presses it inside a scenario
-    // (LocalPlayerInputHooks lets Original run so the recast starts). Clear it
-    // here so each scenario starts with Sprint ready, regardless of whether
-    // the player pressed it just before clicking Start.
-    private static unsafe void ResetSprintCooldown()
-    {
-        var am = ActionManager.Instance();
-        if (am == null) return;
-        var group = am->GetRecastGroup((int)ActionType.Action, LocalPlayerInputHooks.SprintActionId);
-        if (group < 0) return;
-        var detail = am->GetRecastGroupDetail(group);
-        if (detail == null) return;
-        detail->IsActive = false;
-        detail->Elapsed = 0f;
-    }
-
     // Undoes LocalPlayerInputHooks.ForceRecastSweep's fake cooldown display on every
     // intercepted mitigation -- the real recast group never actually started, so this just
-    // clears our own fake sweep (same as ResetSprintCooldown above).
+    // clears our own fake sweep.
     private static unsafe void ClearFakedTankMitigationCooldowns()
     {
         var am = ActionManager.Instance();
@@ -348,6 +389,7 @@ public sealed class Game : IDisposable
         {
             scenarioElapsed += deltaSeconds;
             activeScenario.Tick(deltaSeconds, scenarioElapsed);
+            UpdateMechanicResult(deltaSeconds);
         }
 #if DEBUG
         // Gated so an idle client doesn't spam empty snapshots into the size-capped log.
@@ -365,6 +407,29 @@ public sealed class Game : IDisposable
             periodicDumpTimer = 0f;
         }
 #endif
+    }
+
+    // Infers a clean run from IScenario.IsFinished going true and staying true, rather than
+    // needing each scenario to report its own completion. deathOccurredThisRun (set by Kill,
+    // independent of whichever queue IsFinished watches) is the actual gate against a failed
+    // run being mistaken for a clean one: a queue running dry is not by itself proof nothing
+    // died, since Kill's own freeze-timer event lives on Events specifically and a scenario's
+    // IsFinished override may watch a different queue entirely.
+    private void UpdateMechanicResult(float deltaSeconds)
+    {
+        if (mechanicResultReported) return;
+        if (activeScenario is null || !activeScenario.IsFinished(World))
+        {
+            scenarioFinishedElapsed = null;
+            return;
+        }
+        scenarioFinishedElapsed = (scenarioFinishedElapsed ?? 0f) + deltaSeconds;
+        if (scenarioFinishedElapsed < MechanicResultSettleSeconds) return;
+        mechanicResultReported = true;
+        if (deathOccurredThisRun) return;
+        MechanicStreak++;
+        if (AutoRestart && lastRun is { } p)
+            RunScenario(p);
     }
 
     // Godmode preview: how long a swallowed-death HP-bar drop stays down before healing back.
@@ -414,6 +479,9 @@ public sealed class Game : IDisposable
         }
         target.OnKilled();
         PartyMemberKilled?.Invoke(target.Role, cause);
+        MechanicStreak = 0;
+        deathOccurredThisRun = true;
+        AutoRestart = false;
         if (!firstFreezeScheduled)
         {
             firstFreezeScheduled = true;
@@ -493,6 +561,7 @@ public sealed class Game : IDisposable
         Plugin.Framework.Run(() =>
         {
             ResetInternal();
+            Plugin.UserActions.OnSessionEnd();   // restore the job gauge captured at session start
             Bgm.Reset();
             World.Map.Unload();
         });
@@ -518,6 +587,9 @@ public sealed class Game : IDisposable
         Paused = false;
         firstDeathScheduled = false;
         firstFreezeScheduled = false;
+        scenarioFinishedElapsed = null;
+        mechanicResultReported = false;
+        deathOccurredThisRun = false;
 #if DEBUG
         periodicDumpTimer = 0f;
         AnoMech.Windows.DamageDebugWindow.Instance?.ResetFreeze();
@@ -530,8 +602,13 @@ public sealed class Game : IDisposable
     {
         activeScenario = null;
         Events.Clear();
+        Plugin.UserActions.OnSessionEnd();   // restore the gauge if the plugin unloads mid-session (no-op otherwise)
         Bgm.Dispose();
         World.Dispose();
         opcodeUpdater.Dispose();
     }
 }
+
+// A single RunScenario call's arguments, bundled so Game can replay the exact same run (see
+// AutoRestart) without tracking each argument as its own field.
+public sealed record RunScenarioParams(IScenario Scenario, PartyRole? RoleOverride, int? SelectedAi, int SelectedWaymark);

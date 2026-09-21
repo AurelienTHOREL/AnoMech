@@ -51,6 +51,16 @@ public class Configuration : IPluginConfiguration
         Save();
         return PeerSecret;
     }
+    // Resolve the player's own actions client-side, since the sim firewall blocks
+    // the server responses that normally grant them. Sprint is always resolved;
+    // this gates everything else (shared actions + per-job kits).
+    public bool EnableUserActions { get; set; } = true;
+
+    // Seconds before a player cast finishes during which it can no longer be
+    // interrupted by move/jump/cancel — the slidecast window the server's
+    // ActionEffect ack opens (measured ~0.5s from replay data). Gated by
+    // EnableUserActions.
+    public float CastInterruptThreshold { get; set; } = 0.5f;
 
     // Firewall opcode config — updated automatically by OpcodeUpdater on game version change.
     public uint[] ZoneDownOpcodes { get; set; } = [];

@@ -21,6 +21,12 @@ While simulating:
   * Ready checks will not pop.
  
 
+### Beta: Advanced Simulation Resolution
+
+The simulator now includes a beta feature that properly resolves most skills, triggers, and gauges during simulation. 
+As this feature is still in beta, some edge cases and less common interactions may not yet resolve correctly.
+
+
 ## Installation
 
 See: https://github.com/anomek/MyDalamudPlugins
@@ -39,6 +45,7 @@ See: https://github.com/anomek/MyDalamudPlugins
     - P3 Black Hole _old bh (DSA, single tethers, n/s stomps)_
     - P4 Kefka Says _kefkabin_
     - P5 Exaflares _by [Wydox](https://github.com/Wydox)_
+    - P5 Celestriad _by [RoarkGit](https://github.com/RoarkGit)_
     - P5 Forsaken Null _no ai or damage_
 - The Omega Protocol (Ultimate): _NA pf strats_
     - P2 Party Synergy
@@ -48,6 +55,9 @@ See: https://github.com/anomek/MyDalamudPlugins
     - P6 Exasquares / Wave Cannon 2
 - The Weapon's Refrain (Ultimate) _by [WorstAquaPlayer](https://github.com/WorstAquaPlayer)_
     - Ultimate Predaction
+    - Ultimate Suppression
+- The Unending Coil of Bahamut (Ultimate) _by [RoarkGit](https://github.com/RoarkGit)_
+    - Exaflares
 
 ## Details
 
@@ -71,12 +81,14 @@ See: https://github.com/anomek/MyDalamudPlugins
 * In scenarios for Top Omega Protocol (Ultimate):
   * Tether distance threshold are very rough estimations
   * Line AOE from Optiocal Unit (eye) doesn't render
+* Not all skills will resolve properly
 
 #  Acknowledgments
 
 Thanks for contributors:
 * [WorstAquaPlayer](https://github.com/WorstAquaPlayer) - rewriting core & fixing crashes, scenarios for uwu
 * [Wydox](https://github.com/Wydox) - EU strats for Forsaken, UMAD Exaflares, core improvements
+* [RoarkGit](https://github.com/RoarkGit) - UMAD Celestriad, UCOB exas, win streaks
 
 AnoMech leans heavily on the work of other Dalamud plugins. Huge thanks to their authors!  
 Without them, the following would not be possible:

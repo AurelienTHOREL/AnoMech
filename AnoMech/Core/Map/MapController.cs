@@ -1,4 +1,5 @@
 using AnoMech.Helpers;
+using FFXIVClientStructs.FFXIV.Client.LayoutEngine;
 using System;
 using System.Collections.Generic;
 using System.Numerics;
@@ -8,10 +9,13 @@ namespace AnoMech.Core.Map;
 // Unified entry point for zone loading and map effects. Owned by SimWorld as
 // world.Map. Zone and effects state are reset by Reset(); zone hooks are
 // released by Dispose().
-public sealed class MapController : IDisposable
+public sealed unsafe class MapController : IDisposable
 {
     private readonly MapEffects effects = new();
     private readonly ZoneSession zone = new();
+
+    // Layout instances forced inactive for the run's lifetime — see SuppressLayer.
+    private readonly List<nint> suppressedLayerInstances = new();
 
     // Collider-deactivation state. Zone-load is async (resources stream in over
     // several frames), so each pending drop re-tries DisableSpawnAreaColliders
@@ -127,11 +131,22 @@ public sealed class MapController : IDisposable
         pendingDirectorUpdates.Clear();
         suppressedArenaSlots.Clear();
         effects.ForgetSuppressions();
+        suppressedLayerInstances.Clear();
     }
+
+    // Forces one native LGB layer's instances inactive for as long as the zone stays loaded.
+    // Some zones' client-side load activates every layer at once (there is no real duty
+    // director selecting the current phase's), so competing geometry from different phases can
+    // render in the same space and z-fight. A one-shot SetActive doesn't stick — the engine
+    // reconciles it back within a frame or two — so this re-asserts every tick until Unload.
+    public void SuppressLayer(ushort layerKey)
+        => suppressedLayerInstances.AddRange(LayoutQuery.CollectLayerInstances(layerKey));
 
     // Per-frame poll. Called from SimWorld.Tick.
     internal void Tick()
     {
+        foreach (var ptr in suppressedLayerInstances)
+            ((ILayoutInstance*)ptr)->SetActive(false);
         zone.TickWeather();
         foreach (var slot in suppressedArenaSlots) effects.SilenceSlotSounds(slot);
 

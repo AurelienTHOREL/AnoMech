@@ -214,6 +214,8 @@ public enum DamageType
     Any,
     Magic,
     TankBuster,
+    Fire,
+    Ice,
     Lightning,
     Earth,
     Black,

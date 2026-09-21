@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 
 namespace AnoMech.Windows;
@@ -36,6 +37,26 @@ public class ConfigWindow : Window, IDisposable
         {
             configuration.SuppressBgm = suppressBgm;
             configuration.Save();
+        }
+
+        var userActions = configuration.EnableUserActions;
+        if (ImGui.Checkbox("Resolve your own actions", ref userActions))
+        {
+            configuration.EnableUserActions = userActions;
+            configuration.Save();
+            if (userActions) Plugin.UserActions.Enable();
+            else Plugin.UserActions.Disable();
+        }
+
+        if (configuration.EnableUserActions)
+        {
+            var threshold = configuration.CastInterruptThreshold;
+            ImGui.SetNextItemWidth(90 * ImGuiHelpers.GlobalScale);
+            if (ImGui.InputFloat("Slidecast window (s)", ref threshold, 0.05f, 0.1f, "%.2f"))
+            {
+                configuration.CastInterruptThreshold = Math.Clamp(threshold, 0f, 5f);
+                configuration.Save();
+            }
         }
 
         ImGui.Separator();

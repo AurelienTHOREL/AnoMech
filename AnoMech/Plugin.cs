@@ -11,6 +11,7 @@ using AnoMech.Core.Game;
 using AnoMech.Core.Map;
 using AnoMech.Core.Native;
 using AnoMech.Multiplayer;
+using AnoMech.Core.UserActions;
 using AnoMech.Windows;
 using AnoMech.Pointers;
 using CSFramework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
@@ -55,6 +56,8 @@ public sealed class Plugin : IDalamudPlugin
     internal static Game GameInstance { get; private set; } = null!;
     // Session-lifetime, hooked once per load; SimPlayer is the sole writer of their flags.
     internal static LocalPlayerInputHooks PlayerInputHooks { get; private set; } = null!;
+    // Optional, detached module: resolves the player's own actions client-side.
+    internal static UserActions UserActions { get; private set; } = null!;
     internal static LogManager LogManager { get; private set; } = null!;
     private ConfigWindow ConfigWindow { get; init; }
     // Static so MultiplayerManager can read the host's current selection.
@@ -81,6 +84,8 @@ public sealed class Plugin : IDalamudPlugin
             Game = new Game();
             GameInstance = Game;
             MultiplayerInstance = Multiplayer;
+            UserActions = new UserActions(PlayerInputHooks);
+            if (Config.EnableUserActions) UserActions.Enable();
             ConfigWindow = new ConfigWindow(this);
             MainWindow = new MainWindow(this);
             MultiplayerWindow = new MultiplayerWindow(this);
@@ -175,6 +180,7 @@ public sealed class Plugin : IDalamudPlugin
         Core.Native.VfxSpawnLog.Dispose();
         Multiplayer.Dispose();
         Game?.Dispose();
+        UserActions?.Dispose();
         // After Game.Dispose so World.Dispose → SimPlayer.Despawn can still clear
         // the lock flags through the hooks before they're torn down.
         PlayerInputHooks?.Dispose();
@@ -210,6 +216,8 @@ public sealed class Plugin : IDalamudPlugin
         // pump down.
         try { Game.Tick(fw->FrameDeltaTime); }
         catch (Exception e) { Core.DiagnosticLog.Warn($"[Plugin] Game.Tick threw: {e}"); }
+        try { UserActions.Tick(fw->FrameDeltaTime); }
+        catch (Exception e) { Core.DiagnosticLog.Warn($"[Plugin] UserActions.Tick threw: {e}"); }
         try { Multiplayer.Tick(fw->FrameDeltaTime); }
         catch (Exception e) { Core.DiagnosticLog.Warn($"[Plugin] Multiplayer.Tick threw: {e}"); }
     }
