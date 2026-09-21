@@ -284,7 +284,8 @@ public sealed class Game : IDisposable
         if (lastMistakeElapsed is null)
         {
             MechanicStreak++;
-            World.Party.Player?.AddVfx(MechanicSuccessVfx, persistent: false);
+            if (Plugin.Config.EnableMechanicResultMarks)
+                World.Party.Player?.AddVfx(MechanicSuccessVfx, persistent: false);
         }
         if (AutoRestart && lastRun is { } p)
             RunScenario(p);
@@ -325,7 +326,8 @@ public sealed class Game : IDisposable
         if (lastMistakeElapsed is not { } last || scenarioElapsed - last > MistakeMarkCooldownSeconds)
         {
             lastMistakeElapsed = scenarioElapsed;
-            World.Party.Player?.AddVfx(MechanicFailureVfx, persistent: false);
+            if (Plugin.Config.EnableMechanicResultMarks)
+                World.Party.Player?.AddVfx(MechanicFailureVfx, persistent: false);
         }
 
         if (GodMode)

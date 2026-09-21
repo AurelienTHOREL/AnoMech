@@ -12,6 +12,7 @@ public class Configuration : IPluginConfiguration
     public bool OpenSimMenuOnSupportedInstanceSolo { get; set; } = false;
     public bool EnableEventLogging { get; set; } = false;
     public bool SuppressBgm { get; set; } = true;
+    public bool EnableMechanicResultMarks { get; set; } = false;
 
     // Resolve the player's own actions client-side, since the sim firewall blocks
     // the server responses that normally grant them. Sprint is always resolved;

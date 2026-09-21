@@ -15,7 +15,7 @@ public class ConfigWindow : Window, IDisposable
         Flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar |
                 ImGuiWindowFlags.NoScrollWithMouse;
 
-        Size = new Vector2(380, 280);
+        Size = new Vector2(380, 310);
         SizeCondition = ImGuiCond.Always;
 
         configuration = plugin.Configuration;
@@ -36,6 +36,13 @@ public class ConfigWindow : Window, IDisposable
         if (ImGui.Checkbox("Suppress scenario BGM", ref suppressBgm))
         {
             configuration.SuppressBgm = suppressBgm;
+            configuration.Save();
+        }
+
+        var resultMarks = configuration.EnableMechanicResultMarks;
+        if (ImGui.Checkbox("Show mechanic success/failure marks", ref resultMarks))
+        {
+            configuration.EnableMechanicResultMarks = resultMarks;
             configuration.Save();
         }
 
