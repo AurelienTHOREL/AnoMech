@@ -83,6 +83,10 @@ public sealed class Game : IDisposable
     private float? scenarioFinishedElapsed;
     private bool mechanicResultReported;
 
+    // Bardam's Mettle's Success/Failure marks (Checkmark/X).
+    private const string MechanicSuccessVfx = "vfx/monster/gimmick2/eff/e3d2_b2_g04t0x.avfx";
+    private const string MechanicFailureVfx = "vfx/monster/gimmick2/eff/e3d2_b2_g05t0x.avfx";
+
     // Set by Kill on any real death, scoped to the current run (cleared by ResetInternal).
     // IsFinished can go true on a queue that Kill's own freeze-timer event never touches
     // (e.g. a scenario with a private EventScheduler immune to EventTimeScale): there's no
@@ -273,6 +277,7 @@ public sealed class Game : IDisposable
         mechanicResultReported = true;
         if (deathOccurredThisRun) return;
         MechanicStreak++;
+        World.Party.Player?.AddVfx(MechanicSuccessVfx, persistent: false);
         if (AutoRestart && lastRun is { } p)
             RunScenario(p);
     }
@@ -306,6 +311,7 @@ public sealed class Game : IDisposable
         {
             firstDeathScheduled = true;
             ShowFirstDeathOverlay(target, cause);
+            World.Party.Player?.AddVfx(MechanicFailureVfx, persistent: false);
         }
 
         if (GodMode)
