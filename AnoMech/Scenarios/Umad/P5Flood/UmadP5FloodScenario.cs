@@ -28,7 +28,7 @@ namespace AnoMech.Scenarios.Umad.P5Flood;
 // for field (EnemyState.LastInstantCastIsNativeEffect); the RawPacket delivery knob is host-only.
 public sealed class UmadP5FloodScenario : IMultiplayerReplayable
 {
-    public string Name => "Flood (WIP)";
+    public string Name => "Flood";
     public IPhase Phase => UmadZone.P5Flood;
     public bool SupportsSolo => true;
     public bool SupportsMultiplayer => true;

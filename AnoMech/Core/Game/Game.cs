@@ -130,11 +130,11 @@ public sealed class Game : IDisposable
         {
             new UmadP1TeleTrouncingScenario(),
             new UmadP2ForsakenScenario(),
-            new UmadP3BlackHoleScenario(),
             new UmadP3LimitCutScenario(),
+            new UmadP3BlackHoleScenario(),
             new UmadP4KefkaSaysScenario(),
-            new UmadP5ExaflaresScenario(),
             new UmadP5FloodScenario(),
+            new UmadP5ExaflaresScenario(),
             new UmadP5CelestriadScenario(),
             new UmadP5ForsakenNull(),
             new TopP2PartySynergyScenario(),
