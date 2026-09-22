@@ -9,9 +9,23 @@ using static AnoMech.Scenarios.Umad.UmadConstants;
 
 namespace AnoMech.Scenarios.Umad.P3BlackHole;
 
-public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
+public sealed class UmadP3BlackHoleAi(UmadP3BlackHoleAi.TetherOrder tetherOrder) : IScenarioAi<UmadP3BlackHoleState>
 {
-    public string Name => "Black Hole (WIP)";
+    public enum TetherOrder { DpsSupportAccretion, SupportDpsAccretion }
+
+    public string Name => tetherOrder switch
+    {
+        TetherOrder.SupportDpsAccretion => "Black Hole: S>D>A",
+        _ => "Black Hole: D>S>A",
+    };
+
+    // The timeline below is written in D>S>A seats. S>D>A is the same choreography with the
+    // three support seats and the three DPS seats trading places, line position kept; the two
+    // Accretion seats (3 and 7) take the third tether either way.
+    private static readonly int[] SupportsBeforeDps = [4, 5, 6, 3, 0, 1, 2, 7];
+
+    private int TetherSeat(int seat) =>
+        tetherOrder == TetherOrder.SupportDpsAccretion ? SupportsBeforeDps[seat] : seat;
 
     private UmadP3BlackHoleState state = null!;
     private SimWorld world = null!;
@@ -421,20 +435,20 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
     }
 
     private void ReturnToMiddle(int playerIndex) =>
-        state.Roles.Get(playerIndex)?.MoveTo(new Vector3(0f, 0f, 0f));
+        state.Roles.Get(TetherSeat(playerIndex))?.MoveTo(new Vector3(0f, 0f, 0f));
 
     // Look Upon (rect along the KefkaPosition[lookKefkaIndex] axis through centre, 16y
     // wide) split. The tether holder rides the last black hole's tether out to the arena
     // edge, but the hole's bearing may sit in the Look-Upon corridor; nudge it ±45° to the
     // side that clears the line and send the holder there. The rest take the opposite edge
     // (180°), which the centre-symmetric corridor leaves equally clear.
-    private Vector3 LookUponHolderSpot(int tetherPlayerIndex, int lookKefkaIndex)
+    private Vector3 LookUponHolderSpot(int holderSeat, int lookKefkaIndex)
     {
         var theta = state.KefkaPosition[lookKefkaIndex].RadiansFromNorth;   // Look-Upon line bearing
 
         // Bearing centre→black hole the holder is tethered to. Falls back to the line's
         // perpendicular (always clear) if no active tether is readable.
-        var holder = state.Roles.Get(tetherPlayerIndex);
+        var holder = state.Roles.Get(holderSeat);
         var blackHole = (TetherHeldBy(holder) ?? state.ScenarioObjects.Tethers.FirstOrDefault())?.A;
         var alpha = blackHole is { } bh
                         ? MathF.Atan2(bh.Position.X, -bh.Position.Z)
@@ -455,8 +469,9 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
     // not a PartyRole ordinal.
     private IAiMove DodgeLookUponSplitHolder(int tetherPlayerIndex, int lookKefkaIndex)
     {
-        var holderSpot = LookUponHolderSpot(tetherPlayerIndex, lookKefkaIndex);
-        var holderRole = state.Roles[tetherPlayerIndex];
+        var holderSeat = TetherSeat(tetherPlayerIndex);
+        var holderSpot = LookUponHolderSpot(holderSeat, lookKefkaIndex);
+        var holderRole = state.Roles[holderSeat];
         var coords = new Vector2?[8];
         coords[(int)holderRole] = new Vector2(holderSpot.X, holderSpot.Z);
         return AiMove.Create(coords).NaturalOrder();
@@ -464,8 +479,9 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
 
     private IAiMove DodgeLookUponSplitOthers(int tetherPlayerIndex, int lookKefkaIndex)
     {
-        var holderSpot = LookUponHolderSpot(tetherPlayerIndex, lookKefkaIndex);
-        var holderRole = state.Roles[tetherPlayerIndex];
+        var holderSeat = TetherSeat(tetherPlayerIndex);
+        var holderSpot = LookUponHolderSpot(holderSeat, lookKefkaIndex);
+        var holderRole = state.Roles[holderSeat];
         var coords = new Vector2?[8];
         for (int i = 0; i < 8; i++)
             if ((PartyRole)i != holderRole)
@@ -481,10 +497,11 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
 
     private void GrabTether(int tetherIndex, int playerIndex, float intercept = 3f)
     {
-        var player = state.Roles.Get(playerIndex);
+        var seat = TetherSeat(playerIndex);
+        var player = state.Roles.Get(seat);
         var tether = state.ScenarioObjects.Tethers.ElementAtOrDefault(tetherIndex);
-        assignedHole[playerIndex] = tether?.A;
-        var role = (player as ISimPartyMember)?.Role.ToString() ?? $"player#{playerIndex}";
+        assignedHole[seat] = tether?.A;
+        var role = (player as ISimPartyMember)?.Role.ToString() ?? $"player#{seat}";
         if (tether is null)
         {
             AnoMech.Core.DiagnosticLog.Warn($"[UmadP3BlackHoleAi] GrabTether: tetherIndex {tetherIndex} not found in ScenarioObjects.Tethers ({state.ScenarioObjects.Tethers.Count} known) -- {role} sent nowhere.");
@@ -502,10 +519,11 @@ public sealed class UmadP3BlackHoleAi : IScenarioAi<UmadP3BlackHoleState>
 
     private void PullTether(int playerIndex, int retriesLeft = PullTetherMaxRetries)
     {
-        var player = state.Roles.Get(playerIndex);
-        var role = (player as ISimPartyMember)?.Role.ToString() ?? $"player#{playerIndex}";
+        var seat = TetherSeat(playerIndex);
+        var player = state.Roles.Get(seat);
+        var role = (player as ISimPartyMember)?.Role.ToString() ?? $"player#{seat}";
         // Only the assigned hole's tether counts (see assignedHole); re-resolved each call.
-        var hole = assignedHole.GetValueOrDefault(playerIndex);
+        var hole = assignedHole.GetValueOrDefault(seat);
         var assigned = hole is null ? null : state.ScenarioObjects.Tethers.FirstOrDefault(t => ReferenceEquals(t.A, hole));
         if (assigned is not { A: { } blackHole, B: { } held } || !ReferenceEquals(held, player))
         {

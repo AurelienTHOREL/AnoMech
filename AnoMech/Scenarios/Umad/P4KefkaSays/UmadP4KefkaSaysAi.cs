@@ -40,8 +40,8 @@ public sealed class UmadP4KefkaSaysAi(UmadP4KefkaSaysAi.GazeLayout gazeLayout) :
 
     public string Name => gazeLayout switch
     {
-        GazeLayout.SupportsNorthDpsSouth => "Kefka Says (WIP), gazes: supports N / DPS S",
-        _ => "Kefka Says (WIP)",
+        GazeLayout.SupportsNorthDpsSouth => "Kefka Says, gazes: supports N / DPS S",
+        _ => "Kefka Says",
     };
 
     public void Run(UmadP4KefkaSaysState state, SimWorld world)
