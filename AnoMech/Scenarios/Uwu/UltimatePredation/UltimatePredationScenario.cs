@@ -30,7 +30,9 @@ public unsafe class UltimatePredationScenario : IMultiplayerReplayable
     private SimWorld world = null!;
     private SimParty party = null!;
 
-    private UwuUtils utils = null!;
+    // Lazy off `world`: RunInstanceEvents runs for a peer, which never calls Run.
+    private UwuUtils? utilsInstance;
+    private UwuUtils utils => utilsInstance ??= new UwuUtils(world);
     private UltimatePredationState state = null!;
 
     // Exposed so MultiplayerManager can read the AI-relevant subset after a host Start and
@@ -51,7 +53,6 @@ public unsafe class UltimatePredationScenario : IMultiplayerReplayable
         this.world = world;
         party = world.Party;
 
-        utils = new(world);
         state = new(settingsWindow.Overrides);
         LastState = state;
         // Unconditional, before the optional bot-run below -- a debug-bot peer needs these

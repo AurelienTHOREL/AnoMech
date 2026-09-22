@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using System.Linq;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using Dalamud.Game.ClientState.Conditions;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -159,9 +162,16 @@ public sealed unsafe partial class ZoneSession
     private uint innClientTerritory;
     private uint loadedTerritory;
     private uint lastNativeTerritory;
-    // What the firewall held, for the stay summary.
+    // Position and territory are the whole surface the sim can corrupt; the lift checks the live
+    // ones against these before the client may report them.
+    private Vector3 armedPosition;
+    private float armedRotation;
+    private const float LiftPositionTolerance = 2f;
+    private long lastHeartbeatAt;
+    private const double HeartbeatSeconds = 30;
+    // The detours may not run on the framework thread, and the snapshot reads these from it.
     private long heldInbound;
-    private readonly Dictionary<ushort, long> heldOutbound = new();
+    private readonly ConcurrentDictionary<ushort, long> heldOutbound = new();
 
     private static uint NativeTerritory()
     {
@@ -175,6 +185,64 @@ public sealed unsafe partial class ZoneSession
         if (client != innClientTerritory && client != loadedTerritory)
             return $"the client's territory reads {client}, neither the inn ({innClientTerritory}) nor the loaded zone ({loadedTerritory})";
         return null;
+    }
+
+    private const string NoLocalPlayer = "there is no local player to check the position against";
+
+    private string? PositionDrift()
+    {
+        if (Plugin.ObjectTable.LocalPlayer is not { } player) return NoLocalPlayer;
+        var here = player.Position;
+        if (!Finite(here) || !Finite(armedPosition))
+            return $"a position is not a real number (player {Describe(here, player.Rotation)}, inn {Describe(armedPosition, armedRotation)})";
+        var apart = Vector3.Distance(here, armedPosition);
+        if (apart > LiftPositionTolerance)
+            return $"the character is {apart:F1}y from where the inn left them (player {Describe(here, player.Rotation)}, inn {Describe(armedPosition, armedRotation)})";
+        return null;
+    }
+
+    private static bool Finite(Vector3 p) => float.IsFinite(p.X) && float.IsFinite(p.Y) && float.IsFinite(p.Z);
+
+    private static string Describe(Vector3 p, float rotation) => $"({p.X:F2},{p.Y:F2},{p.Z:F2}) rot {rotation:F2}";
+
+    private static string Describe(Vector3? p) => p is { } v ? $"({v.X:F2},{v.Y:F2},{v.Z:F2})" : "none";
+
+    // Everything the guard judges, so a FATAL dump says what the client looked like rather than
+    // only which check failed.
+    private string StateSnapshot(string where)
+    {
+        try
+        {
+            return BuildStateSnapshot(where);
+        }
+        catch (Exception e)
+        {
+            return $"[ZoneGuard] {where} -- snapshot failed ({e.GetType().Name}: {e.Message})";
+        }
+    }
+
+    private string BuildStateSnapshot(string where)
+    {
+        var player = Plugin.ObjectTable.LocalPlayer;
+        var here = player is { } p ? Describe(p.Position, p.Rotation) : "none";
+        var apart = player is { } q ? $"{Vector3.Distance(q.Position, armedPosition):F2}y" : "n/a";
+        var outbound = heldOutbound.Count == 0
+            ? "none"
+            : string.Join(",", heldOutbound.OrderByDescending(kv => kv.Value).Select(kv => $"0x{kv.Key:X4}x{kv.Value}"));
+        var conditions = string.Join(",", Enum.GetValues<ConditionFlag>()
+            .Where(f => (int)f != 0 && Plugin.Condition[f]).Select(f => f.ToString()).Distinct());
+        return $"[ZoneGuard] {where} -- stay #{stayId}, {Stopwatch.GetElapsedTime(guardArmedAt).TotalSeconds:F2}s in, armed={guardArmed}, sessionActive={IsActive}, trip={tripReason ?? "none"}; "
+             + $"player {here}, inn {Describe(armedPosition, armedRotation)}, apart {apart}; "
+             + $"territory Dalamud={Plugin.ClientState.TerritoryType} GameMain={NativeTerritory()} (inn {innClientTerritory}, loaded {loadedTerritory}); "
+             + $"loggedIn={Plugin.ClientState.IsLoggedIn}; hooks send={sendPacketHook.IsEnabled}/disposed={sendPacketHook.IsDisposed} recv={receivePacketHook.IsEnabled}/disposed={receivePacketHook.IsDisposed}; "
+             + $"held {heldInbound} inbound, outbound [{outbound}]; conditions [{conditions}]";
+    }
+
+    private void LogStayHeartbeat()
+    {
+        if (Stopwatch.GetElapsedTime(lastHeartbeatAt).TotalSeconds < HeartbeatSeconds) return;
+        lastHeartbeatAt = Stopwatch.GetTimestamp();
+        DiagnosticLog.Info(StateSnapshot("stay heartbeat"));
     }
 
     private void LogNativeTerritoryChange()
@@ -196,10 +264,13 @@ public sealed unsafe partial class ZoneSession
         return true;
     }
 
+    // sessionSave was filled from the live player one statement earlier in Enter.
     private void CaptureInnState()
     {
         innClientTerritory = Plugin.ClientState.TerritoryType;
         lastNativeTerritory = NativeTerritory();
+        armedPosition = sessionSave.Position;
+        armedRotation = sessionSave.Rotation;
     }
 
     private void ArmGuard(uint territoryId)
@@ -209,9 +280,13 @@ public sealed unsafe partial class ZoneSession
         heldInbound = 0;
         heldOutbound.Clear();
         guardArmedAt = Stopwatch.GetTimestamp();
+        lastHeartbeatAt = guardArmedAt;
+        pendingLift = null;
+        liftHoldLoggedReason = null;
         stayId++;
         guardArmed = true;
         DiagnosticLog.Info($"[ZoneGuard] Armed for territory {territoryId}: inn territory {innClientTerritory}, Dalamud now reads {Plugin.ClientState.TerritoryType}, GameMain {lastNativeTerritory} -> {NativeTerritory()}.");
+        DiagnosticLog.Info(StateSnapshot("armed"));
         lastNativeTerritory = NativeTerritory();
     }
 
@@ -219,6 +294,7 @@ public sealed unsafe partial class ZoneSession
     {
         if (!guardArmed || tripReason != null) return;
         LogNativeTerritoryChange();
+        LogStayHeartbeat();
         var c = Plugin.Condition;
         if (!sendPacketHook.IsEnabled || !receivePacketHook.IsEnabled)
             Trip("a firewall hook was found disabled while armed");
@@ -234,6 +310,8 @@ public sealed unsafe partial class ZoneSession
                  && player.CastActionId is TeleportActionId or ReturnActionId
                  && player.CurrentCastTime > Stopwatch.GetElapsedTime(guardArmedAt).TotalSeconds + 0.05)
             Trip($"a {ActionLookup.Name(player.CastActionId)} cast begun before the firewall went up is completing on the server");
+
+        if (pendingLift != null && tripReason == null) TryLift();
     }
 
     private void GuardTerritoryChanged(uint territory)
@@ -253,32 +331,80 @@ public sealed unsafe partial class ZoneSession
     private void Trip(string reason)
     {
         tripReason = reason;
+        DiagnosticLog.Warn(StateSnapshot($"TRIPPED: {reason}"));
         Die(reason);
     }
 
     // Dalamud's territory must read the inn again here: the reload has run, and only a real
     // zone-in moves that reading.
+    private const string HookDisabled = "a firewall hook was found disabled";
+
     private string? LiftBlockedReason()
     {
         if (tripReason is { } tripped) return tripped;
-        if (!sendPacketHook.IsEnabled || !receivePacketHook.IsEnabled) return "a firewall hook was found disabled";
+        if (!sendPacketHook.IsEnabled || !receivePacketHook.IsEnabled) return HookDisabled;
         if (!Plugin.ClientState.IsLoggedIn) return "not logged in";
         var c = Plugin.Condition;
         if (c[ConditionFlag.BetweenAreas] || c[ConditionFlag.BetweenAreas51]) return "a zone transition is in progress";
         if (c[ConditionFlag.LoggingOut]) return "logging out";
         if (Plugin.ClientState.TerritoryType != innClientTerritory)
             return $"the client reports territory {Plugin.ClientState.TerritoryType}, not the inn ({innClientTerritory}) the firewall was armed in";
-        return TerritoryDrift();
+        return TerritoryDrift() ?? PositionDrift();
     }
 
+    private string? pendingLift;
+    private bool pendingLiftMayRetry;
+    private string? liftHoldLoggedReason;
+    private long pendingLiftSince;
+    private const double LiftRetrySeconds = 3;
+
+    // Any blocker holds the lift with the firewall up and is re-checked every frame; the stay
+    // dies if it hasn't cleared within LiftRetrySeconds. These two die at once instead: waiting
+    // cannot improve a tripped stay, and a hook already off means the filter is down now.
+    private bool MustDieNow(string reason) => reason == tripReason || reason == HookDisabled;
+
     // Once per stay: Dispose lifts an early one, and the delayed lift then finds nothing to do.
-    private void LiftFirewallOrDie(string when)
+    // Dispose passes mayRetry: false, since there are no further frames to re-check in.
+    private void LiftFirewallOrDie(string when, bool mayRetry = true)
     {
         if (!guardArmed) return;
-        if (LiftBlockedReason() is { } reason) Die($"{reason} ({when})");
+        if (pendingLift == null)
+        {
+            pendingLift = when;
+            pendingLiftMayRetry = mayRetry;
+            pendingLiftSince = Stopwatch.GetTimestamp();
+            DiagnosticLog.Info(StateSnapshot($"lift check ({when})"));
+        }
+        else
+        {
+            pendingLiftMayRetry &= mayRetry;
+        }
+        TryLift();
+    }
+
+    private void TryLift()
+    {
+        if (pendingLift is not { } when) return;
+        if (LiftBlockedReason() is { } reason)
+        {
+            var waited = Stopwatch.GetElapsedTime(pendingLiftSince).TotalSeconds;
+            if (pendingLiftMayRetry && !MustDieNow(reason) && waited < LiftRetrySeconds)
+            {
+                if (liftHoldLoggedReason == reason) return;
+                liftHoldLoggedReason = reason;
+                DiagnosticLog.Warn($"[ZoneGuard] Lift held {waited:F2}s in ({when}): {reason} -- firewall stays up, re-checking every frame until {LiftRetrySeconds:F0}s.");
+                return;
+            }
+            DiagnosticLog.Warn(StateSnapshot($"LIFT REFUSED after {waited:F2}s ({when}): {reason}"));
+            Die($"{reason} ({when}, unverified for {waited:F1}s)");
+        }
+        var player = Plugin.ObjectTable.LocalPlayer;
+        var here = player is { } p ? Describe(p.Position, p.Rotation) : "none";
+        pendingLift = null;
+        liftHoldLoggedReason = null;
         guardArmed = false;
         DisableFirewall();
-        DiagnosticLog.Info($"[ZoneGuard] Firewall lifted {when}: back in territory {innClientTerritory} as the server left it (GameMain reads {NativeTerritory()}).");
+        DiagnosticLog.Info($"[ZoneGuard] Firewall lifted {when}: territory {innClientTerritory} (GameMain {NativeTerritory()}), player {here} vs inn {Describe(armedPosition, armedRotation)}, held {heldInbound} inbound / {heldOutbound.Values.Sum()} outbound.");
     }
 
     private void LogStaySummary()

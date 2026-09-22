@@ -5,6 +5,7 @@ using AnoMech.Core.Game.Party;
 using AnoMech.Core.Native;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
+using CastBarNumberArray = FFXIVClientStructs.FFXIV.Client.UI.Arrays.CastBarNumberArray;
 
 namespace AnoMech.Core.SimObjects;
 
@@ -85,7 +86,113 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
     {
         base.Tick(deltaSeconds);
         SampleActivity();
+        TickLimitBreak(deltaSeconds);
         SyncInputLock();
+    }
+
+    // The client's own prediction runs the whole cast -- bar, animations, lock, cancel-on-move.
+    // All the sim does is watch it, to refund the faked gauge when it doesn't land and to count
+    // the cast as activity for stillness mechanics.
+    private uint limitBreakActionId;
+    private LimitBreakWatch limitBreakWatch;
+    private float limitBreakGrace;
+    private float limitBreakTotal;
+    private float limitBreakWatched;
+    private float limitBreakRemaining;
+    private float limitBreakSample;
+
+    private enum LimitBreakWatch { Idle, Starting, Casting }
+
+    // The client needs a frame or two after UseAction before its cast bar exists.
+    private const float LimitBreakStartGrace = 0.5f;
+    private const float LimitBreakSampleSeconds = 0.5f;
+    // How long past its own cast time the bar may linger before we stop believing it.
+    private const float LimitBreakOverstaySeconds = 1.5f;
+
+    public bool IsLimitBreaking => limitBreakWatch != LimitBreakWatch.Idle;
+
+    // An instant limit break (every tank LB3) has no cast to lose, so there is nothing to watch.
+    public void WatchLimitBreak(uint actionId, float castSeconds)
+    {
+        limitBreakActionId = actionId;
+        limitBreakTotal = castSeconds;
+        limitBreakWatched = 0f;
+        limitBreakRemaining = castSeconds;
+        limitBreakSample = LimitBreakSampleSeconds;
+        if (castSeconds <= 0f)
+        {
+            limitBreakWatch = LimitBreakWatch.Idle;
+            DiagnosticLog.Info($"[LimitBreak] {ActionLookup.Name(actionId)} ({actionId}) is instant -- the gauge stays spent. Timeline slots {SimEnemy.DescribeActionTimeline(BattleCharaPtr)}.");
+            return;
+        }
+        limitBreakWatch = LimitBreakWatch.Starting;
+        limitBreakGrace = LimitBreakStartGrace;
+        DiagnosticLog.Info($"[LimitBreak] {ActionLookup.Name(actionId)} ({actionId}) accepted, {castSeconds:F1}s cast -- watching the client's own bar. {DescribeCast()}.");
+    }
+
+    private void TickLimitBreak(float deltaSeconds)
+    {
+        if (limitBreakWatch == LimitBreakWatch.Idle) return;
+        var bc = BattleCharaPtr;
+        if (bc == null) { DropLimitBreakWatch("there is no character to watch", refund: true); return; }
+
+        limitBreakWatched += deltaSeconds;
+        var casting = bc->CastInfo.IsCasting && bc->CastInfo.ActionId == limitBreakActionId;
+        if (casting)
+        {
+            limitBreakWatch = LimitBreakWatch.Casting;
+            limitBreakRemaining = bc->CastInfo.TotalCastTime - bc->CastInfo.CurrentCastTime;
+            // An overstaying bar means the client is holding out for a reply the firewall ate;
+            // pinning IsActing true for the rest of the run is worse.
+            if (limitBreakWatched > limitBreakTotal + LimitBreakOverstaySeconds)
+                DropLimitBreakWatch($"the client's bar never cleared ({limitBreakWatched:F1}s for a {limitBreakTotal:F1}s cast)", refund: false);
+            else
+                SampleLimitBreak(deltaSeconds);
+            return;
+        }
+
+        if (limitBreakWatch == LimitBreakWatch.Starting)
+        {
+            limitBreakGrace -= deltaSeconds;
+            if (limitBreakGrace <= 0f)
+                DropLimitBreakWatch("the client never opened a cast bar for it", refund: true);
+            return;
+        }
+
+        // Past the slidecast window the action is committed; anything earlier is an interrupt,
+        // which costs nothing in retail.
+        var landed = limitBreakRemaining <= Plugin.Config.CastInterruptThreshold;
+        DropLimitBreakWatch(landed
+            ? $"it landed (bar cleared with {limitBreakRemaining:F2}s left)"
+            : $"it was interrupted with {limitBreakRemaining:F2}s left", refund: !landed);
+    }
+
+    private void DropLimitBreakWatch(string why, bool refund)
+    {
+        limitBreakWatch = LimitBreakWatch.Idle;
+        if (refund) Plugin.PlayerInputHooks.RefundLimitBreak();
+        DiagnosticLog.Info($"[LimitBreak] {ActionLookup.Name(limitBreakActionId)}: {why}{(refund ? " -- the gauge is refunded" : "")}. Timeline slots {SimEnemy.DescribeActionTimeline(BattleCharaPtr)}.");
+    }
+
+    private void SampleLimitBreak(float deltaSeconds)
+    {
+        limitBreakSample -= deltaSeconds;
+        if (limitBreakSample > 0f) return;
+        limitBreakSample = LimitBreakSampleSeconds;
+        DiagnosticLog.Info($"[LimitBreak] {ActionLookup.Name(limitBreakActionId)} casting, {limitBreakRemaining:F2}s left: {DescribeCast()}; timeline {SimEnemy.DescribeActionTimeline(BattleCharaPtr)}.");
+    }
+
+    private string DescribeCast()
+    {
+        var bc = BattleCharaPtr;
+        var hud = CastBarNumberArray.Instance();
+        var info = bc == null
+            ? "none"
+            : $"casting={bc->CastInfo.IsCasting} action={bc->CastInfo.ActionId} {bc->CastInfo.CurrentCastTime:F2}/{bc->CastInfo.TotalCastTime:F2}";
+        var bar = hud == null
+            ? "none"
+            : $"icon={hud->CastIconId} {hud->CompletionPercentage}% interrupted={hud->Interupted}";
+        return $"CastInfo({info}) HUD({bar})";
     }
 
     private void SampleActivity()
@@ -100,11 +207,19 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
             return;
         }
         IsMoving = hooks.MovementInputActive || actedThisFrame || hooks.IsJumping || Movement.IsMoving;
-        IsActing = IsMoving || hooks.IsAutoAttacking;
+        // A limit break casts for seconds, and an Acceleration Bomb landing in that window has
+        // caught the player acting, exactly as it would in the fight.
+        IsActing = IsMoving || hooks.IsAutoAttacking || IsLimitBreaking;
+    }
+
+    private void CancelLimitBreak(string why)
+    {
+        if (IsLimitBreaking) DropLimitBreakWatch(why, refund: true);
     }
 
     public void OnKilled()
     {
+        CancelLimitBreak("the player died");
         Dead = true;
         StopMoving();
         DropHpBar(); // godmode preview skips this path
@@ -115,6 +230,7 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
 
     public override void Despawn()
     {
+        CancelLimitBreak("the run ended");
         base.Despawn();
         StopMoving();
         // Order matters; see RestoreRealMaxHealth.

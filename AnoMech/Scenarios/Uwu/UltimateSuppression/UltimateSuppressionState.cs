@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
@@ -17,6 +18,25 @@ public class UltimateSuppressionState
     public SimCharacter? PlayerFlamingCrush = null!;
 
     public SimTether? MesohighTether = null;
+
+    // LightPillarPlacement is resolved mid-run on the host and never read by the Ai, so it stays
+    // at its default here.
+    public static UltimateSuppressionState? FromNetworkReplay(
+        SimParty party, PartyRole lightPillar, IReadOnlyList<PartyRole> mistralSongs,
+        IReadOnlyList<PartyRole> eruptions, PartyRole gaol, PartyRole flamingCrush)
+    {
+        if (mistralSongs.Count != 2 || eruptions.Count != 2) return null;
+        return new UltimateSuppressionState
+        {
+            PlayerLightPillar = party.Get(lightPillar),
+            PlayerMistralSongs = [party.Get(mistralSongs[0]), party.Get(mistralSongs[1])],
+            PlayerEruptions = [party.Get(eruptions[0]), party.Get(eruptions[1])],
+            PlayerGaol = party.Get(gaol),
+            PlayerFlamingCrush = party.Get(flamingCrush),
+        };
+    }
+
+    private UltimateSuppressionState() { }
 
     public UltimateSuppressionState(SimParty party, UltimateSuppressionStateOverrides overrides)
     {

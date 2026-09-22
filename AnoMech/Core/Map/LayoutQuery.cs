@@ -62,6 +62,40 @@ internal static unsafe class LayoutQuery
         return result;
     }
 
+    // Which layers the engine actually brought up has no other signal.
+    public static string DescribeActiveLayers()
+    {
+        var lw = LayoutWorld.Instance();
+        if (lw == null || lw->ActiveLayout == null) return "no active layout";
+        var lm = lw->ActiveLayout;
+        // Layers are filtered by (TerritoryTypeId, CfcId), and a client-side load never sets CfcId.
+        var filters = new List<string>();
+        foreach (var kv in lm->Filters)
+        {
+            var filter = kv.Item2.Value;
+            if (filter != null) filters.Add($"{filter->Key}=>terr{filter->TerritoryTypeId}/cfc{filter->CfcId}");
+        }
+        var header = $"init={lm->InitState} terr={lm->TerritoryTypeId} cfc={lm->CfcId} filterKey={lm->LayerFilterKey}"
+            + $" filters[{filters.Count}]={string.Join(",", filters)} -- ";
+        var parts = new List<string>();
+        foreach (var layerKv in lw->ActiveLayout->Layers)
+        {
+            var layer = layerKv.Item2.Value;
+            if (layer == null) continue;
+            int total = 0, active = 0;
+            foreach (var instKv in layer->Instances)
+            {
+                var inst = instKv.Item2.Value;
+                if (inst == null) continue;
+                total++;
+                if (inst->IsActive) active++;
+            }
+            parts.Add($"0x{layerKv.Item1:X}:{active}/{total}");
+        }
+        parts.Sort(StringComparer.Ordinal);
+        return header + $"{parts.Count} layers -- " + string.Join(" ", parts);
+    }
+
     public static SharedGroupLayoutInstance* FindBySgbPath(string sgbPath)
     {
         if (string.IsNullOrEmpty(sgbPath)) return null;

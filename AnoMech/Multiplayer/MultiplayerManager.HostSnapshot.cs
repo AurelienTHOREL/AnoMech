@@ -72,6 +72,7 @@ public sealed partial class MultiplayerManager
             hostEnemyLastLoggedStatuses.Remove(stale);
             hostEnemyLastLoggedAnimationTimeline.Remove(stale);
             hostEnemyLastLoggedAnimationState.Remove(stale);
+            hostEnemyLastLoggedInstantCastSeq.Remove(stale);
         }
 
         var enemies = new List<EnemyState>(liveEnemies.Count);
@@ -92,7 +93,7 @@ public sealed partial class MultiplayerManager
             }
             var statusSnapshot = enemy.ActiveStatusSnapshot;
             if (!hostEnemyLastLoggedStatuses.TryGetValue(enemy, out var lastStatuses))
-                hostEnemyLastLoggedStatuses[enemy] = lastStatuses = new Dictionary<ushort, ushort>();
+                hostEnemyLastLoggedStatuses[enemy] = lastStatuses = new Dictionary<(ushort Id, int Ordinal), ushort>();
             LogStatusChanges($"Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId})", statusSnapshot, lastStatuses);
             if (enemy.AnimationTimelineId is { } timelineId
                 && (!hostEnemyLastLoggedAnimationTimeline.TryGetValue(enemy, out var lastSeq) || lastSeq != enemy.AnimationTimelineSeq))
@@ -108,6 +109,14 @@ public sealed partial class MultiplayerManager
             {
                 hostEnemyLastLoggedAnimationState[enemy] = enemy.AnimationStateSeq;
                 DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) AnimationState -> ({animState.Arg2},{animState.Arg3}) (seq {enemy.AnimationStateSeq}).");
+            }
+            // Pairs with the peer's line, so a missing effect narrows to the send or the receive.
+            if (enemy.LastInstantCastSeq > 0
+                && (!hostEnemyLastLoggedInstantCastSeq.TryGetValue(enemy, out var lastInstantLogged) || lastInstantLogged != enemy.LastInstantCastSeq))
+            {
+                hostEnemyLastLoggedInstantCastSeq[enemy] = enemy.LastInstantCastSeq;
+                DiagnosticLog.Info($"[Multiplayer] Host: enemy NetId {netId} (BNpcBase {enemy.BNpcBaseId}) instant cast -> action {enemy.LastInstantCastActionId} "
+                    + $"(seq {enemy.LastInstantCastSeq}, native={enemy.LastInstantCastIsNativeEffect}, lock={enemy.LastInstantCastAnimationLock:F2}).");
             }
             var (castTargetEnemyNetId, castTargetRole) = ResolveTargetId(world, enemy.CastTargetId);
             var (instantTargetEnemyNetId, instantTargetRole) = ResolveTargetId(world, enemy.LastInstantCastTargetId);
@@ -133,7 +142,7 @@ public sealed partial class MultiplayerManager
                 enemy.AnimationTimelineId, enemy.AnimationTimelineSeq, newLockonVfxIds,
                 enemy.AnimationState?.Arg2, enemy.AnimationState?.Arg3, enemy.AnimationStateSeq,
                 enemy.Position.X, enemy.Position.Y, enemy.Position.Z, enemy.Rotation,
-                enemy.IsCasting, enemy.CastSeq, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay,
+                enemy.IsCasting, enemy.CastSeq, enemy.CastActionId, enemy.CastTotalSeconds, enemy.CastOmenDelay, enemy.CastOmenRotate,
                 enemy.CastTargetLocation?.X, enemy.CastTargetLocation?.Y, enemy.CastTargetLocation?.Z,
                 castTargetEnemyNetId, castTargetRole,
                 enemy.LastInstantCastSeq, enemy.LastInstantCastActionId,
@@ -238,7 +247,7 @@ public sealed partial class MultiplayerManager
             {
                 var statusSnapshot = member.ActiveStatusSnapshot;
                 if (!hostRoleLastLoggedStatuses.TryGetValue(role, out var lastStatuses))
-                    hostRoleLastLoggedStatuses[role] = lastStatuses = new Dictionary<ushort, ushort>();
+                    hostRoleLastLoggedStatuses[role] = lastStatuses = new Dictionary<(ushort Id, int Ordinal), ushort>();
                 LogStatusChanges($"Host: role {role} ({DescribeRoleOwner(role, member)})", statusSnapshot, lastStatuses);
                 newLockonVfxIds = member.DrainPendingLockonVfxIds();
                 if (newLockonVfxIds.Count > 0)

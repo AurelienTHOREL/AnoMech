@@ -7,7 +7,7 @@ using AnoMech.Core;
 
 namespace AnoMech.Multiplayer;
 
-internal enum SimAssetKind { Action, BNpcBase, EObj, Lockon, Tether, Timeline, OmenPath, Layout, EventId }
+internal enum SimAssetKind { Action, BNpcBase, EObj, Lockon, Tether, Timeline, OmenPath, Layout, EventId, ModelChara }
 
 // A peer rebuilds the world from raw engine ids the host sends and runs no scenario logic, so
 // it cannot judge whether an id belongs to the fight. Handing the engine an id loads that
@@ -17,6 +17,9 @@ internal enum SimAssetKind { Action, BNpcBase, EObj, Lockon, Tether, Timeline, O
 // The allowlist is harvested by reflection: every constant in a class named for an id kind
 // (UmadConstants.ActionId, ...) plus any static field whose own name names one
 // (BlasterLockons). Declaring a constant is registering it; there is no manifest to drift.
+//
+// A keyword must be the id-suffixed form, never a bare noun: the field name wins over the class,
+// so a plain word also claims any descriptively-named constant containing it.
 //
 // StatusId is not enforced: its sources are open-ended (a peer's real Rampart, chart
 // abilities, Sprint) and a status id only resolves an icon.
@@ -28,11 +31,12 @@ internal static class SimAssets
         [SimAssetKind.BNpcBase] = ["BNpcBase"],
         [SimAssetKind.EObj] = ["EObjId"],
         [SimAssetKind.Lockon] = ["Lockon"],
-        [SimAssetKind.Tether] = ["Tether"],
+        [SimAssetKind.Tether] = ["TetherId"],
         [SimAssetKind.Timeline] = ["TimelineId"],
         [SimAssetKind.OmenPath] = ["VfxPath", "OmenPath"],
         [SimAssetKind.Layout] = ["LayoutId"],
         [SimAssetKind.EventId] = ["EventId"],
+        [SimAssetKind.ModelChara] = ["ModelCharaId"],
     };
 
     private static Dictionary<SimAssetKind, HashSet<ulong>>? numbers;

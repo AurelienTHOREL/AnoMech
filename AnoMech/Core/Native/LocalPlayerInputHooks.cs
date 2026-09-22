@@ -77,7 +77,8 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
 
     // Edge-triggered gain/loss logging; reads the local player directly so it works with no
     // scenario running.
-    private readonly HashSet<ushort> lastLoggedStatusIds = new();
+    // Counted, not just present: the same id can be held twice.
+    private readonly Dictionary<ushort, int> lastLoggedStatusCounts = new();
 
     private void ScanAndLogActiveStatuses()
     {
@@ -86,16 +87,20 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         var bc = (BattleChara*)localPlayer.Address;
         if (bc == null) return;
         var jobId = localPlayer.ClassJob.RowId;
-        var current = new Dictionary<ushort, float>();
+        var current = new Dictionary<ushort, (int Count, float Remaining)>();
         foreach (var status in bc->StatusManager.Status)
-            if (status.StatusId != 0) current[status.StatusId] = status.RemainingTime;
-        foreach (var (gained, remaining) in current)
-            if (!lastLoggedStatusIds.Contains(gained))
-                Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Status gained: {gained} -- {Core.StatusLookup.Name(gained)} (job={jobId}, duration={remaining:F1}).");
-        foreach (var lost in lastLoggedStatusIds.Except(current.Keys))
+        {
+            if (status.StatusId == 0) continue;
+            var seen = current.GetValueOrDefault(status.StatusId);
+            current[status.StatusId] = (seen.Count + 1, status.RemainingTime);
+        }
+        foreach (var (gained, (count, remaining)) in current)
+            if (count > lastLoggedStatusCounts.GetValueOrDefault(gained))
+                Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Status gained: {gained} -- {Core.StatusLookup.Name(gained)} (job={jobId}, duration={remaining:F1}, x{count}).");
+        foreach (var lost in lastLoggedStatusCounts.Keys.Except(current.Keys))
             Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Status lost: {lost} -- {Core.StatusLookup.Name(lost)} (job={jobId}).");
-        lastLoggedStatusIds.Clear();
-        foreach (var id in current.Keys) lastLoggedStatusIds.Add(id);
+        lastLoggedStatusCounts.Clear();
+        foreach (var (id, (count, _)) in current) lastLoggedStatusCounts[id] = count;
     }
 
     // Latched whenever the game calls Hotbar.CancelCast — i.e. the player requested a
@@ -308,24 +313,63 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
         savedOathGauge = null;
     }
 
-    // Limit breaks the chart doesn't simulate are dropped while a sim runs: with the gauge
-    // faked full, the real UseAction would fire an LB the server never granted.
-    private static bool SwallowLimitBreak(ActionType actionType, uint actionId)
+    // Null outside a scenario too: there the gauge is the player's own and none of this applies.
+    private int? LimitBreakLevel(ActionType actionType, uint actionId)
     {
-        if (actionType != ActionType.Action) return false;
-        if (Plugin.GameInstance is not { } game || !game.World.Map.IsInInstance) return false;
-        if (Plugin.ObjectTable.LocalPlayer is not { } local) return false;
+        if (actionType != ActionType.Action) return null;
+        if (Plugin.GameInstance is not { } game || !game.World.Map.IsInInstance) return null;
+        if (Plugin.ObjectTable.LocalPlayer is not { } local) return null;
         var lb = LimitBreakController.Instance();
-        if (lb == null) return false;
+        if (lb == null) return null;
         var character = (Character*)local.Address;
-        for (byte level = 0; level < 3; level++)
-            if (lb->GetActionId(character, level) == actionId)
-            {
-                Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Limit break press (actionId={actionId}, level {level + 1}) swallowed -- only tank LB3s are simulated (TankMitigationChart).");
-                return true;
-            }
+        for (byte i = 0; i < 3; i++)
+            if (lb->GetActionId(character, i) == actionId) return i;
+        return null;
+    }
+
+    // Only LB3, and only once per run. Everything else is the client's own: with the gauge faked
+    // it runs the real UseAction, and the request packet that goes with it is eaten by the firewall.
+    private bool RefuseLimitBreak(int level, uint actionId)
+    {
+        var name = Core.ActionLookup.Name(actionId);
+        var job = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId;
+        if (level < 2)
+        {
+            Core.DiagnosticLog.Info($"[LimitBreak] {name} ({actionId}, LB{level + 1}, job={job}) pressed -- only LB3 is simulated, press dropped.");
+            return true;
+        }
+        if (limitBreakConsumed)
+        {
+            Core.DiagnosticLog.Info($"[LimitBreak] {name} ({actionId}, job={job}) pressed but this run's gauge is already spent -- press dropped.");
+            return true;
+        }
         return false;
     }
+
+    // The client's own refusal reason is the only way to see why a press did nothing.
+    private void NoteLimitBreakPress(uint actionId, ulong targetId, bool accepted)
+    {
+        var name = Core.ActionLookup.Name(actionId);
+        var job = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId;
+        if (!accepted)
+        {
+            var am = ActionManager.Instance();
+            var status = am == null ? 0u : am->GetActionStatus(ActionType.Action, actionId, targetId);
+            var reason = Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.LogMessage>()
+                .GetRowOrDefault(status)?.Text.ExtractText() ?? "";
+            Core.DiagnosticLog.Info($"[LimitBreak] {name} ({actionId}, job={job}) refused by the client -- status {status} \"{reason}\".");
+            return;
+        }
+        limitBreakConsumed = true;
+        var castSeconds = Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Action>().TryGetRow(actionId, out var row)
+            ? row.Cast100ms / 10f
+            : 0f;
+        Core.DiagnosticLog.Info($"[LimitBreak] {name} ({actionId}, LB3, job={job}) accepted by the client, UseAction target 0x{targetId:X}.");
+        Plugin.GameInstance?.World.Party.Player?.WatchLimitBreak(actionId, castSeconds);
+    }
+
+    // A cancelled cast costs nothing in retail, so the faked gauge refills for another try.
+    public void RefundLimitBreak() => limitBreakConsumed = false;
 
     private bool UseActionDetour(ActionManager* self, ActionType actionType, uint actionId, ulong targetId, uint extraParam, ActionManager.UseActionMode mode, uint comboRouteId, bool* outOptAreaTargeted)
     {
@@ -336,8 +380,10 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
             actionUsedSincePoll = true;
             return true;
         }
-        if (SwallowLimitBreak(actionType, actionId)) return false;
+        var limitBreakLevel = LimitBreakLevel(actionType, actionId);
+        if (limitBreakLevel is { } level && RefuseLimitBreak(level, actionId)) return false;
         var result = useActionHook.Original(self, actionType, actionId, targetId, extraParam, mode, comboRouteId, outOptAreaTargeted);
+        if (limitBreakLevel == 2) NoteLimitBreakPress(actionId, targetId, result);
         // Ignore the auto-attack-cancel general action that UpdateDetour issues while stunned.
         if (result && !IsStopAutosAction(actionType, actionId))
         {
@@ -355,6 +401,8 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
     {
         if (Plugin.GameInstance is not { } game || !game.World.Map.IsInInstance) return false;
         if (!TankMitigation.ByActionId.TryGetValue(actionId, out var ability)) return false;
+        // A spent gauge means the gate below refuses the press, so the mitigation must not apply.
+        if (limitBreakConsumed && TankLimitBreakActionIds.Contains(actionId)) return false;
         var party = game.World.Party;
         var role = party.PlayerRole;
         if (party.Player is not { } player) return false;
@@ -405,10 +453,15 @@ public sealed unsafe class LocalPlayerInputHooks : IDisposable
             Plugin.MultiplayerInstance?.ReportAppliedRoleStatus(appliedRoles, ability.StatusId, ability.Duration ?? 0f, shieldFraction);
 
         TankMitigationTracker.RecordUse(role, ability.StatusId, ability.Cooldown ?? 0f);
-        // A tank LB3 has no recast group to sweep -- what it spends is the (faked) gauge.
-        if (TankLimitBreakActionIds.Contains(actionId)) limitBreakConsumed = true;
-        else ForceRecastSweep(actionId, ability.Cooldown ?? 0f);
         var jobId = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId;
+        // A tank LB3 spends the gauge, not a recast group, so the press falls through to the
+        // real UseAction for the client to play.
+        if (TankLimitBreakActionIds.Contains(actionId))
+        {
+            Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Applied {ability.Name} (actionId={actionId}) for {role} (job={jobId}) -- status {ability.StatusId} on [{string.Join(",", appliedRoles)}]; the press goes on to the client for its animation.");
+            return false;
+        }
+        ForceRecastSweep(actionId, ability.Cooldown ?? 0f);
         Core.DiagnosticLog.Info($"[LocalPlayerInputHooks] Intercepted {ability.Name} (actionId={actionId}) for {role} (job={jobId}), scope={ability.Scope} -- applied synthetic status {ability.StatusId} to [{string.Join(",", appliedRoles)}], real ability never touched.");
         return true;
     }

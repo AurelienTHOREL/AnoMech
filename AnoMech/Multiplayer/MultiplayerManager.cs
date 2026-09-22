@@ -36,10 +36,11 @@ public sealed partial class MultiplayerManager : IDisposable
     private int nextTetherNetId;
     // Host-only, for edge-triggered logging; every snapshot still carries the full state.
     private readonly Dictionary<SimEnemy, byte> hostEnemyLastLoggedModelState = new();
-    private readonly Dictionary<SimEnemy, Dictionary<ushort, ushort>> hostEnemyLastLoggedStatuses = new();
+    private readonly Dictionary<SimEnemy, Dictionary<(ushort Id, int Ordinal), ushort>> hostEnemyLastLoggedStatuses = new();
     private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedAnimationTimeline = new();
     private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedAnimationState = new();
-    private readonly Dictionary<PartyRole, Dictionary<ushort, ushort>> hostRoleLastLoggedStatuses = new();
+    private readonly Dictionary<SimEnemy, int> hostEnemyLastLoggedInstantCastSeq = new();
+    private readonly Dictionary<PartyRole, Dictionary<(ushort Id, int Ordinal), ushort>> hostRoleLastLoggedStatuses = new();
     private readonly Dictionary<PartyRole, int> hostRoleLastLoggedAnimationTimeline = new();
 
     private readonly Dictionary<SimEventObject, int> hostEventObjectNetIds = new();
@@ -51,7 +52,7 @@ public sealed partial class MultiplayerManager : IDisposable
     // Peer-only: last applied value per NetId. Re-issuing an unchanged ModelState rebuilds the
     // model (visible flicker) and re-playing an animation restarts it.
     private readonly Dictionary<int, byte> peerEnemyModelState = new();
-    private readonly Dictionary<int, Dictionary<ushort, ushort>> peerEnemyLastLoggedStatuses = new();
+    private readonly Dictionary<int, Dictionary<(ushort Id, int Ordinal), ushort>> peerEnemyLastLoggedStatuses = new();
     private readonly Dictionary<int, int> peerEnemyAnimationTimeline = new();
     private readonly Dictionary<int, int> peerEnemyAnimationState = new();
     private readonly Dictionary<int, int> peerEnemyLastInstantCastSeq = new();
@@ -67,10 +68,11 @@ public sealed partial class MultiplayerManager : IDisposable
     private readonly Dictionary<int, bool> peerEnemyModelHidden = new();
     private readonly Dictionary<PartyRole, int> peerRoleAnimationTimelineSeq = new();
     private readonly Dictionary<PartyRole, int> peerRolePlayedActionSeq = new();
-    private readonly Dictionary<PartyRole, Dictionary<ushort, ushort>> peerRoleLastLoggedStatuses = new();
+    private readonly Dictionary<PartyRole, Dictionary<(ushort Id, int Ordinal), ushort>> peerRoleLastLoggedStatuses = new();
     // Statuses this client put on a role by reconciliation; removal must only undo those, never
     // a status the local client manages itself (Sprint via LocalPlayerInputHooks).
-    private readonly Dictionary<PartyRole, HashSet<ushort>> peerRoleReconciledStatusIds = new();
+    private readonly Dictionary<PartyRole, HashSet<(ushort Id, GameObjectId Source)>> peerRoleReconciledStatuses = new();
+    private readonly Dictionary<int, HashSet<(ushort Id, GameObjectId Source)>> peerEnemyReconciledStatuses = new();
     // The host's status instance last applied per id (see DropRecreatedStatuses).
     private readonly Dictionary<int, Dictionary<ushort, int>> peerEnemyStatusInstances = new();
     private readonly Dictionary<PartyRole, Dictionary<ushort, int>> peerRoleStatusInstances = new();
@@ -243,6 +245,7 @@ public sealed partial class MultiplayerManager : IDisposable
         relayAccessToken = Plugin.Config.TokenForRelay(relayUrl);
         Session = new MultiplayerSession { HostId = MyPeerId };
         Session.Names[MyPeerId] = DisplayName;
+        Session.Jobs[MyPeerId] = LocalClassJob;
         Session.Builds[MyPeerId] = new PeerBuildInfo(PluginBuildInfo.Version, PluginBuildInfo.Checksum);
 
         DiagnosticLog.Info($"[Multiplayer] Hosting a new session at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
@@ -288,6 +291,8 @@ public sealed partial class MultiplayerManager : IDisposable
         DiagnosticLog.Info($"[Multiplayer] Joining session {SessionCode} at {relayUrl} as {MyPeerId} ({DisplayName}), build {PluginBuildInfo.ShortChecksum}.");
         relay = new RelayClient(peerSecret);
         WireRelay(relay);
+        helloAcknowledged = false;
+        helloRetryTimer = 0f;
         _ = ConnectAndHelloAsync(relayUrl, SessionCode);
     }
 
@@ -295,7 +300,7 @@ public sealed partial class MultiplayerManager : IDisposable
     {
         await relay!.ConnectAsync(relayUrl, code, relayAccessToken);
         DiagnosticLog.Info($"[Multiplayer] Connected to relay, socket ready -- sending Hello.");
-        await relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum));
+        await relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum, LocalClassJob));
     }
 
     // Disconnected captures the instance so an event from a replaced client can be told apart.
@@ -348,6 +353,7 @@ public sealed partial class MultiplayerManager : IDisposable
         hostEnemyLastLoggedStatuses.Clear();
         hostEnemyLastLoggedAnimationTimeline.Clear();
         hostEnemyLastLoggedAnimationState.Clear();
+        hostEnemyLastLoggedInstantCastSeq.Clear();
         hostRoleLastLoggedStatuses.Clear();
         hostRoleLastLoggedAnimationTimeline.Clear();
         hostTetherNetIds.Clear();
@@ -363,7 +369,8 @@ public sealed partial class MultiplayerManager : IDisposable
         peerRoleLastLoggedStatuses.Clear();
         peerRoleAnimationTimelineSeq.Clear();
         peerRolePlayedActionSeq.Clear();
-        peerRoleReconciledStatusIds.Clear();
+        peerRoleReconciledStatuses.Clear();
+        peerEnemyReconciledStatuses.Clear();
         peerEnemyStatusInstances.Clear();
         peerRoleStatusInstances.Clear();
         peerTethers.Clear();
@@ -475,7 +482,7 @@ public sealed partial class MultiplayerManager : IDisposable
         lastHostMessageMs = Environment.TickCount64;
         ConnectionError = null;
         // Re-registering with the host resumes a running scenario the same way a late join does.
-        if (!IsHost) _ = relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum));
+        if (!IsHost) _ = relay.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum, LocalClassJob));
         else foreach (var peerId in pendingRelayUnbans) _ = relay.ModerateAsync("unban", peerId);
         pendingRelayUnbans.Clear();
         LobbyChanged?.Invoke();
@@ -696,6 +703,47 @@ public sealed partial class MultiplayerManager : IDisposable
         BroadcastLobbyState();
     }
 
+    // A job only reaches the roster on a Hello, so a lobby job change needs re-announcing.
+    private byte announcedClassJob;
+
+    private void AnnounceOwnJobIfChanged()
+    {
+        var job = LocalClassJob;
+        if (job == 0 || job == announcedClassJob) return;
+        announcedClassJob = job;
+        if (IsHost)
+        {
+            Session.Jobs[MyPeerId] = job;
+            BroadcastLobbyState();
+            return;
+        }
+        _ = relay?.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum, job));
+    }
+
+    // A Hello is the peer's only way into the roster and can be lost; retried until a lobby
+    // state comes back naming us.
+    private const float HelloRetrySeconds = 2f;
+    private bool helloAcknowledged;
+    private float helloRetryTimer;
+
+    private void ResendHelloUntilAcknowledged(float deltaSeconds)
+    {
+        if (IsHost || helloAcknowledged) return;
+        helloRetryTimer += deltaSeconds;
+        if (helloRetryTimer < HelloRetrySeconds) return;
+        helloRetryTimer = 0f;
+        DiagnosticLog.Info($"[Multiplayer] No lobby state naming us yet -- re-sending Hello to session {SessionCode}.");
+        _ = relay?.SendAsync(new HelloMessage(MyPeerId, DisplayName, PluginBuildInfo.Version, PluginBuildInfo.Checksum, LocalClassJob));
+    }
+
+    // The host only learns our name from a Hello, so being in the roster is the acknowledgement.
+    private void NoteHelloAcknowledged()
+    {
+        if (helloAcknowledged || !Session.Names.ContainsKey(MyPeerId)) return;
+        helloAcknowledged = true;
+        DiagnosticLog.Info("[Multiplayer] Host's lobby state now names us -- Hello acknowledged.");
+    }
+
     private void BroadcastLobbyState()
     {
         LobbyChanged?.Invoke();
@@ -854,6 +902,7 @@ public sealed partial class MultiplayerManager : IDisposable
         hostEnemyLastLoggedStatuses.Clear();
         hostEnemyLastLoggedAnimationTimeline.Clear();
         hostEnemyLastLoggedAnimationState.Clear();
+        hostEnemyLastLoggedInstantCastSeq.Clear();
         hostRoleLastLoggedStatuses.Clear();
         hostRoleLastLoggedAnimationTimeline.Clear();
         hostTetherNetIds.Clear();
@@ -879,7 +928,7 @@ public sealed partial class MultiplayerManager : IDisposable
             DebugBotControl.Enabled = true;
         }
         running = true;
-        Plugin.GameInstance.RunScenarioAsHost(scenario, myRole, Session.SelectedAi, Session.SelectedWaymark, networkRoles, ClaimedRoleNames(), OnHostStartResolved);
+        Plugin.GameInstance.RunScenarioAsHost(scenario, myRole, Session.SelectedAi, Session.SelectedWaymark, networkRoles, ClaimedRoleSeats(), OnHostStartResolved);
         LobbyChanged?.Invoke();
     }
 
@@ -947,7 +996,8 @@ public sealed partial class MultiplayerManager : IDisposable
         peerRoleLastLoggedStatuses.Clear();
         peerRoleAnimationTimelineSeq.Clear();
         peerRolePlayedActionSeq.Clear();
-        peerRoleReconciledStatusIds.Clear();
+        peerRoleReconciledStatuses.Clear();
+        peerEnemyReconciledStatuses.Clear();
         peerEnemyStatusInstances.Clear();
         peerRoleStatusInstances.Clear();
         peerTethers.Clear();
@@ -966,7 +1016,7 @@ public sealed partial class MultiplayerManager : IDisposable
         replayClockSynced = false;
         StopDebugBotReplay();
         running = true;
-        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles, ClaimedRoleNames(), OnPeerStartResolved);
+        Plugin.GameInstance.RunScenarioAsPeer(scenario, myRole, Session.SelectedWaymark, networkRoles, ClaimedRoleSeats(), OnPeerStartResolved);
     }
 
     // Called from RunScenarioInternal's own callback, so snapshots and the debug-bot replay only
@@ -1032,8 +1082,11 @@ public sealed partial class MultiplayerManager : IDisposable
 
     // Names for the puppets: every role claimed by someone else, the host's included from a
     // peer's side.
-    private Dictionary<PartyRole, string> ClaimedRoleNames() =>
-        Session.ClaimedBy.Where(kv => kv.Value != MyPeerId).ToDictionary(kv => kv.Key, kv => Session.NameOf(kv.Value));
+    private Dictionary<PartyRole, NetworkSeat> ClaimedRoleSeats() =>
+        Session.ClaimedBy.Where(kv => kv.Value != MyPeerId)
+            .ToDictionary(kv => kv.Key, kv => new NetworkSeat(Session.NameOf(kv.Value), Session.JobOf(kv.Value)));
+
+    private static byte LocalClassJob => (byte)(Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId ?? 0);
 
     private string DescribeRoleOwner(PartyRole role, SimCharacter? member)
     {
@@ -1044,23 +1097,27 @@ public sealed partial class MultiplayerManager : IDisposable
         return "bot";
     }
 
-    // One line per status gained/lost/restacked; lastSeen is mutated in place.
-    private static void LogStatusChanges(string who, IReadOnlyList<(ushort StatusId, ushort Stacks, float RemainingTime)> current, Dictionary<ushort, ushort> lastSeen)
+    // Keyed by id and its ordinal, so a character holding the same id twice logs both.
+    private static void LogStatusChanges(string who, IReadOnlyList<(ushort StatusId, ushort Stacks, float RemainingTime)> current, Dictionary<(ushort Id, int Ordinal), ushort> lastSeen)
     {
-        var currentIds = new HashSet<ushort>();
+        var currentIds = new HashSet<(ushort Id, int Ordinal)>();
+        var ordinals = new Dictionary<ushort, int>();
         foreach (var (id, stacks, remaining) in current)
         {
-            currentIds.Add(id);
-            if (!lastSeen.TryGetValue(id, out var lastStacks))
-                DiagnosticLog.Info($"[Multiplayer] {who}: status {id} gained (stacks={stacks}, duration={remaining:F1}).");
+            var ordinal = ordinals.GetValueOrDefault(id);
+            ordinals[id] = ordinal + 1;
+            var key = (id, ordinal);
+            currentIds.Add(key);
+            if (!lastSeen.TryGetValue(key, out var lastStacks))
+                DiagnosticLog.Info($"[Multiplayer] {who}: status {id} gained (stacks={stacks}, duration={remaining:F1}, #{ordinal + 1}).");
             else if (lastStacks != stacks)
                 DiagnosticLog.Info($"[Multiplayer] {who}: status {id} stacks {lastStacks}->{stacks}.");
-            lastSeen[id] = stacks;
+            lastSeen[key] = stacks;
         }
-        foreach (var id in lastSeen.Keys.Where(id => !currentIds.Contains(id)).ToList())
+        foreach (var key in lastSeen.Keys.Where(k => !currentIds.Contains(k)).ToList())
         {
-            DiagnosticLog.Info($"[Multiplayer] {who}: status {id} lost.");
-            lastSeen.Remove(id);
+            DiagnosticLog.Info($"[Multiplayer] {who}: status {key.Id} lost.");
+            lastSeen.Remove(key);
         }
     }
 

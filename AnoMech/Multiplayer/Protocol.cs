@@ -56,6 +56,9 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(UmadP3LimitCutAiReplayStateMessage), "umadP3LimitCutAiReplayState")]
 [JsonDerivedType(typeof(UmadP1TeleTrouncingAiReplayStateMessage), "umadP1TeleTrouncingAiReplayState")]
 [JsonDerivedType(typeof(UmadP5FloodAiReplayStateMessage), "umadP5FloodAiReplayState")]
+[JsonDerivedType(typeof(UcobP5ExaflaresAiReplayStateMessage), "ucobP5ExaflaresAiReplayState")]
+[JsonDerivedType(typeof(UmadP5CelestriadAiReplayStateMessage), "umadP5CelestriadAiReplayState")]
+[JsonDerivedType(typeof(UltimateSuppressionAiReplayStateMessage), "ultimateSuppressionAiReplayState")]
 [JsonDerivedType(typeof(TopP5DeltaBeyondDefenseUpdateMessage), "topP5DeltaBeyondDefenseUpdate")]
 [JsonDerivedType(typeof(TopP5OmegaHelloWorld2UpdateMessage), "topP5OmegaHelloWorld2Update")]
 [JsonDerivedType(typeof(SelfMitigationMessage), "selfMitigation")]
@@ -74,7 +77,7 @@ internal interface IScenarioReplayStateMessage : IHostOnlyMessage;
 internal interface IScenarioMidRunUpdateMessage : IHostOnlyMessage;
 
 // Peer -> host on connect. Version/Checksum catch a build mismatch before it desyncs.
-public sealed record HelloMessage(Guid PeerId, string DisplayName, string Version, string Checksum) : MpMessage;
+public sealed record HelloMessage(Guid PeerId, string DisplayName, string Version, string Checksum, byte ClassJob = 0) : MpMessage;
 
 public sealed record PeerBuildInfo(string Version, string Checksum)
 {
@@ -89,6 +92,7 @@ public sealed record LobbyStateMessage(
     Dictionary<PartyRole, Guid> ClaimedBy,
     Dictionary<Guid, string> Names,
     Dictionary<Guid, PeerBuildInfo> Builds,
+    Dictionary<Guid, byte> Jobs,
     bool Started,
     int ScenarioIndex,
     int SelectedAi,
@@ -159,7 +163,7 @@ public sealed record EnemyState(
     IReadOnlyList<EnemyStatusState> Statuses, ushort? AnimationTimelineId, int AnimationTimelineSeq, IReadOnlyList<uint> NewLockonVfxIds,
     int? AnimationStateArg2, int? AnimationStateArg3, int AnimationStateSeq,
     float X, float Y, float Z, float Rotation,
-    bool IsCasting, int CastSeq, uint CastActionId, float CastSeconds, float CastOmenDelay,
+    bool IsCasting, int CastSeq, uint CastActionId, float CastSeconds, float CastOmenDelay, float CastOmenRotate,
     float? CastTargetX, float? CastTargetY, float? CastTargetZ,
     int? CastTargetEnemyNetId, PartyRole? CastTargetRole,
     int LastInstantCastSeq, uint LastInstantCastActionId,
@@ -313,6 +317,23 @@ public sealed record UmadP1TeleTrouncingAiReplayStateMessage(
 // read by the Ai.
 public sealed record UmadP5FloodAiReplayStateMessage(
     bool NeSwReversed, bool NwSeReversed, bool NeSwFirst, int StartQuadrant, bool RotationClockwise) : MpMessage, IScenarioReplayStateMessage;
+
+// The set's travel direction plus the order its six lanes fire in; everything else about the
+// pattern is derived from those two.
+public sealed record UcobP5ExaflaresAiReplayStateMessage(
+    float DirectionRadians, float[] LaneOrder) : MpMessage, IScenarioReplayStateMessage;
+
+// Elements and the Catastrophic Choice travel as indices into UmadP5CelestriadState's own fixed
+// orders; -1 is "free"/"none". Tower indices index AllTowers, which is fixed for a run.
+public sealed record UmadP5CelestriadAiReplayStateMessage(
+    int[] DoubleElement, Dictionary<PartyRole, int> PlayerDebuffElement,
+    int[][] SetActiveTowers, int[] AeroVariant) : MpMessage, IScenarioReplayStateMessage;
+
+// Who has what. The state's other fields are live SimCharacter handles the peer resolves from
+// its own party, and LightPillarPlacement is host-only (the Ai never reads it).
+public sealed record UltimateSuppressionAiReplayStateMessage(
+    PartyRole LightPillar, PartyRole[] MistralSongs, PartyRole[] Eruptions,
+    PartyRole Gaol, PartyRole FlamingCrush) : MpMessage, IScenarioReplayStateMessage;
 
 // InFirst is TopP6WaveCannon2Ai's entire read set.
 public sealed record TopP6WaveCannon2AiReplayStateMessage(bool InFirst) : MpMessage, IScenarioReplayStateMessage;

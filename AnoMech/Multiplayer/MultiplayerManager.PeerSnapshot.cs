@@ -111,6 +111,7 @@ public sealed partial class MultiplayerManager
             var placement = new Placement(netPosition, NetGuard.Rotation(e.Rotation));
             if (!SimAssets.Allow(SimAssetKind.BNpcBase, e.BNpcBaseId, $"enemy NetId {e.NetId}")) continue;
             seenEnemyIds.Add(e.NetId);
+            var freshlySpawned = !peerEnemies.ContainsKey(e.NetId);
             if (!peerEnemies.TryGetValue(e.NetId, out var enemy))
             {
                 // The template is resolved by name from this build's own captures, never from
@@ -127,15 +128,20 @@ public sealed partial class MultiplayerManager
                     else
                         DiagnosticLog.Warn($"[Multiplayer] Peer: enemy NetId {e.NetId} names unknown spawn template '{NetGuard.Clean(templateName)}' -- spawning the plain doppel.");
                 }
-                // ModelCharaId is always 0 (derived from the BNpcBase row): no scenario sets it,
-                // so on the wire it could only swap in a foreign model.
+                // A scenario can override the BNpcBase row's model (UCOB P5's Golden Bahamut), so
+                // this has to travel; the allowlist is what stops it naming a foreign one.
                 var config = new EnemySpawnConfig(
                     e.BNpcBaseId, e.NameId, e.Level, e.Targetable, Enum.IsDefined(e.EnemyList) ? e.EnemyList : EnemyListMode.Never, e.Visible,
                     placement,
-                    ModelCharaId: 0, NetGuard.Clamp(e.Scale, 0f, 100f), NetGuard.Clamp(e.HitboxRadius, 0f, 100f),
+                    ModelCharaId: e.ModelCharaId != 0
+                        && SimAssets.Allow(SimAssetKind.ModelChara, e.ModelCharaId, $"enemy NetId {e.NetId} model")
+                        ? e.ModelCharaId : 0,
+                    NetGuard.Clamp(e.Scale, 0f, 100f), NetGuard.Clamp(e.HitboxRadius, 0f, 100f),
                     e.InitialModeAttributeFlags,
                     NpcSpawnTemplate: template, PacketSpawnEnableDraw: enableDraw);
-                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of enemy NetId {e.NetId} -- BNpcBase {e.BNpcBaseId}, pos ({e.X:F2},{e.Y:F2},{e.Z:F2}), rot {e.Rotation:F2}, visible {e.Visible}{(template != null ? $", template {e.NpcSpawnTemplate}" : "")} -- spawning local doppel.");
+                DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of enemy NetId {e.NetId} -- BNpcBase {e.BNpcBaseId}, pos ({e.X:F2},{e.Y:F2},{e.Z:F2}), rot {e.Rotation:F2}, visible {e.Visible}"
+                    + $", cast {e.CastActionId}/seq {e.CastSeq}, instant {e.LastInstantCastActionId}/seq {e.LastInstantCastSeq}"
+                    + $"{(template != null ? $", template {e.NpcSpawnTemplate}" : "")} -- spawning local doppel.");
                 enemy = world.SpawnEnemy(config);
                 if (enemy == null)
                 {
@@ -170,20 +176,12 @@ public sealed partial class MultiplayerManager
             var enemyStatuses = NetGuard.Cap(e.Statuses, NetGuard.MaxStatusesPerEntity);
             if (!peerEnemyStatusInstances.TryGetValue(e.NetId, out var enemyInstances))
                 peerEnemyStatusInstances[e.NetId] = enemyInstances = new Dictionary<ushort, int>();
+            if (!peerEnemyReconciledStatuses.TryGetValue(e.NetId, out var enemyReconciled))
+                peerEnemyReconciledStatuses[e.NetId] = enemyReconciled = new HashSet<(ushort, GameObjectId)>();
             DropRecreatedStatuses(enemy, enemyStatuses, enemyInstances, _ => true, $"enemy NetId {e.NetId}");
-            var currentStatuses = enemy.ActiveStatusSnapshot;
-            foreach (var target in enemyStatuses)
-            {
-                if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
-                enemy.AddStatus(target.StatusId, duration: NetGuard.Clamp(target.RemainingTime, -1f, 3600f), stacks: target.Stacks, overrideStacks: true);
-            }
-            foreach (var current in currentStatuses)
-            {
-                if (enemyStatuses.Any(s => s.StatusId == current.StatusId)) continue;
-                enemy.RemoveStatus(current.StatusId);
-            }
+            ReconcileStatuses(enemy, enemyStatuses, enemyReconciled);
             if (!peerEnemyLastLoggedStatuses.TryGetValue(e.NetId, out var lastStatuses))
-                peerEnemyLastLoggedStatuses[e.NetId] = lastStatuses = new Dictionary<ushort, ushort>();
+                peerEnemyLastLoggedStatuses[e.NetId] = lastStatuses = new Dictionary<(ushort Id, int Ordinal), ushort>();
             LogStatusChanges($"Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId})",
                 enemyStatuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
             // Replayed through the real SimCast pipeline so the cast bar and omen match. Keyed
@@ -200,11 +198,17 @@ public sealed partial class MultiplayerManager
                 if (SimAssets.Allow(SimAssetKind.Action, e.CastActionId, $"enemy NetId {e.NetId} cast"))
                     enemy.Cast(e.CastActionId, targetLocation: targetLocation,
                         castSeconds: NetGuard.Clamp(e.CastSeconds, 0f, 600f),
-                        omenDelay: NetGuard.Clamp(e.CastOmenDelay, 0f, 60f), targetId: targetId);
+                        omenDelay: NetGuard.Clamp(e.CastOmenDelay, 0f, 60f),
+                        omenRotate: NetGuard.Clamp(e.CastOmenRotate, -MathF.Tau, MathF.Tau), targetId: targetId);
             }
-            if (e.LastInstantCastSeq > 0
-                && (!peerEnemyLastInstantCastSeq.TryGetValue(e.NetId, out var lastInstantSeq) || lastInstantSeq != e.LastInstantCastSeq))
+            var instantKnown = peerEnemyLastInstantCastSeq.TryGetValue(e.NetId, out var lastInstantSeq);
+            // NetIds are never reused, so a recorded seq here means state outlived its enemy.
+            if (freshlySpawned && instantKnown)
+                DiagnosticLog.Warn($"[Multiplayer] Peer: enemy NetId {e.NetId} arrived with a stale instant-cast seq {lastInstantSeq} already recorded -- its action {e.LastInstantCastActionId} will be dropped.");
+            if (e.LastInstantCastSeq > 0 && (!instantKnown || lastInstantSeq != e.LastInstantCastSeq))
             {
+                DiagnosticLog.Info($"[Multiplayer] Peer: enemy NetId {e.NetId} (BNpcBase {e.BNpcBaseId}) instant cast -> action {e.LastInstantCastActionId} "
+                    + $"(seq {e.LastInstantCastSeq}, native={e.LastInstantCastIsNativeEffect}, raw='{NetGuard.Clean(e.LastInstantCastRawPacket)}').");
                 peerEnemyLastInstantCastSeq[e.NetId] = e.LastInstantCastSeq;
                 enemy.SetPosition(placement); // same snap as above
                 var instantTargetLocation = NetGuard.TryPosition(e.LastInstantCastTargetX, e.LastInstantCastTargetY, e.LastInstantCastTargetZ);
@@ -357,6 +361,10 @@ public sealed partial class MultiplayerManager
                     continue;
                 }
                 peerEventObjects[o.NetId] = eo;
+                // CurrentState is only meaningful once something has written it; seeding stops
+                // the reconcile below stamping a never-written 0 over the spawn's TimelineState.
+                peerEventObjectState[o.NetId] = o.CurrentState;
+                if (o.CurrentState != 0) eo.SetState(o.CurrentState);
             }
             eo.SetPosition(eoPlacement);
             // A beat writes the state itself, so the plain SetState below stays quiet for it.
@@ -397,6 +405,39 @@ public sealed partial class MultiplayerManager
     // in place it would skip the engine's gain path, which is what applies a param-driven look
     // (Kefka's trance aura), so it is dropped here for the reconcile to add back. Ids the host
     // holds more than once are left to the plain reconcile.
+    // A status's identity is (id, source), not id. The host's source ids mean nothing here, so a
+    // duplicated id gets a local source per host instance; a unique one keeps the default source,
+    // which is also what matches slots the engine wrote.
+    private const ulong DuplicateStatusSourceBase = 0xE100_0000;
+
+    private static GameObjectId StatusSource(IReadOnlyList<EnemyStatusState> targets, EnemyStatusState status,
+        HashSet<(ushort Id, GameObjectId Source)> tracked)
+    {
+        var perInstance = (GameObjectId)(DuplicateStatusSourceBase | ((uint)status.Instance & 0xFFFFFF));
+        if (targets.Count(s => s.StatusId == status.StatusId) > 1) return perInstance;
+        // Sticky: switching the survivor of an expiring pair back would re-add it and flicker.
+        return tracked.Contains((status.StatusId, perInstance)) ? perInstance : default;
+    }
+
+    // Only what `tracked` holds is removed, so a peer's own statuses are left alone.
+    private static void ReconcileStatuses(SimCharacter character, IReadOnlyList<EnemyStatusState> targets,
+        HashSet<(ushort Id, GameObjectId Source)> tracked)
+    {
+        var wanted = new HashSet<(ushort Id, GameObjectId Source)>();
+        foreach (var target in targets)
+        {
+            var source = StatusSource(targets, target, tracked);
+            wanted.Add((target.StatusId, source));
+            if (character.FindStatus(target.StatusId, source) is { } held && held.Stacks == target.Stacks) continue;
+            character.AddStatus(target.StatusId, duration: NetGuard.Clamp(target.RemainingTime, -1f, 3600f),
+                stacks: target.Stacks, overrideStacks: true, sourceObject: source);
+        }
+        foreach (var stale in tracked.Where(s => !wanted.Contains(s)).ToList())
+            character.RemoveStatus(stale.Id, stale.Source);
+        tracked.Clear();
+        tracked.UnionWith(wanted);
+    }
+
     private static void DropRecreatedStatuses(SimCharacter character, IReadOnlyList<EnemyStatusState> targets,
         Dictionary<ushort, int> instances, Func<ushort, bool> mayDrop, string who)
     {
@@ -423,6 +464,7 @@ public sealed partial class MultiplayerManager
     {
         peerEnemies.Remove(netId);
         peerEnemyStatusInstances.Remove(netId);
+        peerEnemyReconciledStatuses.Remove(netId);
         peerEnemyModelState.Remove(netId);
         peerEnemyLastLoggedStatuses.Remove(netId);
         peerEnemyAnimationTimeline.Remove(netId);
@@ -551,27 +593,14 @@ public sealed partial class MultiplayerManager
                 }
             }
             var roleStatuses = NetGuard.Cap(r.Statuses, NetGuard.MaxStatusesPerEntity);
-            if (!peerRoleReconciledStatusIds.TryGetValue(r.Role, out var reconciledIds))
-                peerRoleReconciledStatusIds[r.Role] = reconciledIds = new HashSet<ushort>();
+            if (!peerRoleReconciledStatuses.TryGetValue(r.Role, out var reconciled))
+                peerRoleReconciledStatuses[r.Role] = reconciled = new HashSet<(ushort, GameObjectId)>();
             if (!peerRoleStatusInstances.TryGetValue(r.Role, out var roleInstances))
                 peerRoleStatusInstances[r.Role] = roleInstances = new Dictionary<ushort, int>();
-            DropRecreatedStatuses(member, roleStatuses, roleInstances, reconciledIds.Contains, $"role {r.Role}");
-            var currentStatuses = member.ActiveStatusSnapshot;
-            foreach (var target in roleStatuses)
-            {
-                // Tracked even when unchanged, so the removal loop still knows it is host-managed.
-                reconciledIds.Add(target.StatusId);
-                if (currentStatuses.Any(s => s.StatusId == target.StatusId && s.Stacks == target.Stacks)) continue;
-                member.AddStatus(target.StatusId, duration: NetGuard.Clamp(target.RemainingTime, -1f, 3600f), stacks: target.Stacks, overrideStacks: true);
-            }
-            foreach (var trackedId in reconciledIds.ToList())
-            {
-                if (roleStatuses.Any(s => s.StatusId == trackedId)) continue;
-                member.RemoveStatus(trackedId);
-                reconciledIds.Remove(trackedId);
-            }
+            DropRecreatedStatuses(member, roleStatuses, roleInstances, id => reconciled.Any(s => s.Id == id), $"role {r.Role}");
+            ReconcileStatuses(member, roleStatuses, reconciled);
             if (!peerRoleLastLoggedStatuses.TryGetValue(r.Role, out var lastStatuses))
-                peerRoleLastLoggedStatuses[r.Role] = lastStatuses = new Dictionary<ushort, ushort>();
+                peerRoleLastLoggedStatuses[r.Role] = lastStatuses = new Dictionary<(ushort Id, int Ordinal), ushort>();
             LogStatusChanges($"Peer: role {r.Role} ({DescribeRoleOwner(r.Role, member)})",
                 roleStatuses.Select(s => (s.StatusId, s.Stacks, s.RemainingTime)).ToList(), lastStatuses);
             if (r.NewLockonVfxIds.Count > 0)

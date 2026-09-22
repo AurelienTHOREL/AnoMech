@@ -16,6 +16,10 @@ public sealed unsafe class MapController : IDisposable
 
     // Layout instances forced inactive for the run's lifetime — see SuppressLayer.
     private readonly List<nint> suppressedLayerInstances = new();
+    // The engine brings layers up over several seconds, so one reading can't tell a slow load
+    // from one that never completes.
+    private int layerDumpFrame;
+    private static readonly int[] LayerDumpFrames = [60, 180, 360, 600, 1200];
 
     // Collider-deactivation state. Zone-load is async (resources stream in over
     // several frames), so each pending drop re-tries DisableSpawnAreaColliders
@@ -132,6 +136,7 @@ public sealed unsafe class MapController : IDisposable
         suppressedArenaSlots.Clear();
         effects.ForgetSuppressions();
         suppressedLayerInstances.Clear();
+        layerDumpFrame = int.MaxValue;
     }
 
     // Forces one native LGB layer's instances inactive for as long as the zone stays loaded.
@@ -140,13 +145,28 @@ public sealed unsafe class MapController : IDisposable
     // render in the same space and z-fight. A one-shot SetActive doesn't stick — the engine
     // reconciles it back within a frame or two — so this re-asserts every tick until Unload.
     public void SuppressLayer(ushort layerKey)
-        => suppressedLayerInstances.AddRange(LayoutQuery.CollectLayerInstances(layerKey));
+    {
+        var instances = LayoutQuery.CollectLayerInstances(layerKey);
+        suppressedLayerInstances.AddRange(instances);
+        DiagnosticLog.Info($"[MapController] Suppressed layer 0x{layerKey:X} -- {instances.Count} instances.");
+    }
 
     // Per-frame poll. Called from SimWorld.Tick.
     internal void Tick()
     {
         foreach (var ptr in suppressedLayerInstances)
             ((ILayoutInstance*)ptr)->SetActive(false);
+
+        if (IsInInstance && layerDumpFrame <= LayerDumpFrames[^1])
+        {
+            layerDumpFrame++;
+            if (Array.IndexOf(LayerDumpFrames, layerDumpFrame) >= 0)
+            {
+                var at = Plugin.ObjectTable.LocalPlayer?.Position;
+                var where = at is { } p ? $"({p.X:F1},{p.Y:F1},{p.Z:F1})" : "no player";
+                DiagnosticLog.Info($"[MapController] Active layout at frame {layerDumpFrame}, player {where}: {LayoutQuery.DescribeActiveLayers()}");
+            }
+        }
         zone.TickWeather();
         foreach (var slot in suppressedArenaSlots) effects.SilenceSlotSounds(slot);
 
@@ -237,6 +257,7 @@ public sealed unsafe class MapController : IDisposable
             else SetWeather(wid);               // restart/switch in a loaded zone: apply now
         }
         IsInInstance = true;
+        layerDumpFrame = 0;
         effects.Loaded = true;
         InstanceContentDirectorHelper.Commence();
         ArmBarrierDrop(target.PlayerPosition, 10f);

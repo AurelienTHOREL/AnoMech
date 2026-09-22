@@ -68,5 +68,9 @@ internal static class NetGuard
         return capped;
     }
 
+    // Written straight onto a BattleChara, whose sheet row the party list and nameplate resolve.
+    public static byte ClassJob(byte value) =>
+        value != 0 && Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.ClassJob>().HasRow(value) ? value : (byte)0;
+
     public static bool InRange(int index, int count) => index >= 0 && index < count;
 }

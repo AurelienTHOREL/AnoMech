@@ -47,9 +47,9 @@ internal static unsafe class PartyCreator
     private static readonly Random Rng = new();
 
     // networkRoles: slots held by other real participants, spawned as SimNetworkPuppet (position
-    // from the network, not AiManager); takes priority over `solo`. networkNames: the player's
-    // lobby name for the nameplate/party list; a network role with no name keeps the job name.
-    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, uint? tankMaxHealth = null, PartyRole? roleOverride = null, bool solo = false, IReadOnlySet<PartyRole>? networkRoles = null, IReadOnlyDictionary<PartyRole, string>? networkNames = null)
+    // from the network, not AiManager); takes priority over `solo`. networkSeats: their lobby
+    // name and job for the nameplate and party list, each falling back to the role preset's.
+    public static void Populate(SimParty party, SimPlayer player, uint playerJob, SimWorld world, uint? tankMaxHealth = null, PartyRole? roleOverride = null, bool solo = false, IReadOnlySet<PartyRole>? networkRoles = null, IReadOnlyDictionary<PartyRole, NetworkSeat>? networkSeats = null)
     {
         var presets = roleOverride is { } skip
             ? PartyPresets.ForRole(skip)
@@ -73,8 +73,12 @@ internal static unsafe class PartyCreator
             {
                 var angle0 = (i / (float)presets.Count) * MathF.Tau;
                 var localPos0 = new Vector3(MathF.Sin(angle0) * RingRadius, 0f, MathF.Cos(angle0) * RingRadius);
-                var puppetPreset = networkNames?.GetValueOrDefault(role) is { Length: > 0 } playerName
-                    ? preset with { Name = playerName }
+                var puppetPreset = networkSeats?.GetValueOrDefault(role) is { } seat
+                    ? preset with
+                    {
+                        Name = seat.Name.Length > 0 ? seat.Name : preset.Name,
+                        ClassJob = seat.ClassJob != 0 ? seat.ClassJob : preset.ClassJob,
+                    }
                     : preset;
                 var puppet = SpawnPuppet(puppetPreset, world, role, new Placement(localPos0, MathF.Atan2(-localPos0.X, -localPos0.Z)), itemSheet, tankMaxHealth);
                 if (puppet != null) party.SetSlot(role, puppet);

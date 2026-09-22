@@ -410,6 +410,7 @@ public sealed unsafe partial class ZoneSession : IDisposable
         // A tripped stay never reaches the inn reload: the client would be shown a zone the
         // server doesn't have it in.
         if (tripReason is { } tripped) Die(tripped);
+        if (guardArmed) AnoMech.Core.DiagnosticLog.Info(StateSnapshot($"revert starting (dispose={dispose})"));
 
         // We need to wait before calling DisableFirewall(), so we'll set the Occupied condition to be sure the Player doesn't do anything in the meantime.
         var condition = Conditions.Instance();
@@ -439,6 +440,7 @@ public sealed unsafe partial class ZoneSession : IDisposable
         IsActive = false;
         Plugin.Log.Information("[ZoneSession] Reverted to inn.");
         LogStaySummary();
+        if (guardArmed) AnoMech.Core.DiagnosticLog.Info(StateSnapshot("inn reload done"));
 
         // If this is getting called on Dispose(), then these Tasks will not be properly executed, so we'll gate them to be safe
         if (!dispose)
@@ -450,7 +452,10 @@ public sealed unsafe partial class ZoneSession : IDisposable
             ThreadingTask.Delay(1000).ContinueWith(_ => Plugin.Framework.Run(() =>
             {
                 // The Player could do something like jump, so to be extremely sure we are where we are supposed to, we set the Position and Rotation again.
+                var beforeRestore = Plugin.ObjectTable.LocalPlayer?.Position;
                 SetLocalPlayerPosition(savedPosition, savedRotation);
+                var afterRestore = Plugin.ObjectTable.LocalPlayer?.Position;
+                AnoMech.Core.DiagnosticLog.Info($"[ZoneGuard] Position re-asserted to {savedPosition.X:F2},{savedPosition.Y:F2},{savedPosition.Z:F2}: was {Describe(beforeRestore)}, now {Describe(afterRestore)}.");
                 condition->Occupied = false;
 
                 // TODO: this is here because of Suppression. Either define it as normal behaviour, or add an OnLeave method on Scenarios
@@ -479,7 +484,7 @@ public sealed unsafe partial class ZoneSession : IDisposable
             // This skips all safety delays, so if possible, don't disable the plugin while being in a Scenario
             SetLocalPlayerPosition(sessionSave.Position, sessionSave.Rotation);
             condition->Occupied = false;
-            LiftFirewallOrDie("on plugin unload");
+            LiftFirewallOrDie("on plugin unload", mayRetry: false);
             Plugin.Framework.Run(OpenSocialForPartyResync);
         }
     }
@@ -1035,7 +1040,7 @@ public sealed unsafe partial class ZoneSession : IDisposable
             var opcode = *(ushort*)a2;
             if (opcode == heartbeatOpcode)
                 return sendPacketHook.Original(a1, a2, a3, a4);
-            heldOutbound[opcode] = heldOutbound.GetValueOrDefault(opcode) + 1;
+            heldOutbound.AddOrUpdate(opcode, 1, (_, held) => held + 1);
         }
         catch (Exception e)
         {
@@ -1068,7 +1073,7 @@ public sealed unsafe partial class ZoneSession : IDisposable
             if (!safeMode || Plugin.Config.ZoneDownOpcodes.Contains(incomingOpcode))
                 receivePacketHook.Original(a1, a2, a3);
             else
-                heldInbound++;
+                System.Threading.Interlocked.Increment(ref heldInbound);
         }
         catch (Exception e)
         {
@@ -1114,8 +1119,12 @@ public sealed unsafe partial class ZoneSession : IDisposable
         }
         else
         {
-            // The 1s lift after a Revert may still be pending; its checks run here instead.
-            if (guardArmed) LiftFirewallOrDie("on plugin unload");
+            // The 1s lift after a Revert may still be pending, position re-assert included.
+            if (guardArmed)
+            {
+                SetLocalPlayerPosition(armedPosition, armedRotation);
+                LiftFirewallOrDie("on plugin unload during the post-revert wait", mayRetry: false);
+            }
             DisableFirewall(); // To be sure the Hooks are disabled before calling Dispose
         }
 

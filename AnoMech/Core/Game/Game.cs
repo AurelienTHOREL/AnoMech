@@ -186,22 +186,22 @@ public sealed class Game : IDisposable
         Plugin.Framework.Run(() => { RunScenarioInternal(p.Scenario, p.RoleOverride, p.SelectedAi, p.SelectedWaymark, null, null, isPeer: false); });
     }
 
-    // Multiplayer host: RunScenario with `networkRoles` spawned as SimNetworkPuppet, named
-    // after their players (`networkNames`).
-    public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Action<string?> resolved)
+    // Multiplayer host: RunScenario with `networkRoles` spawned as SimNetworkPuppet, wearing
+    // their players' names and jobs (`networkSeats`).
+    public void RunScenarioAsHost(IScenario scenario, PartyRole roleOverride, int selectedAi, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, NetworkSeat> networkSeats, Action<string?> resolved)
     {
         // Auto-restart is a solo affordance: a host silently rerunning would desync the session,
         // and a stale lastRun would rerun the wrong scenario entirely.
         lastRun = null;
-        RunResolved(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkNames, isPeer: false), resolved);
+        RunResolved(() => RunScenarioInternal(scenario, roleOverride, selectedAi, selectedWaymark, networkRoles, networkSeats, isPeer: false), resolved);
     }
 
     // Multiplayer peer: same zone/party/waymarks, but never zone/phase/scenario.Run; every
     // other slot is a puppet driven by the host's snapshots.
-    public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, string> networkNames, Action<string?> resolved)
+    public void RunScenarioAsPeer(IScenario scenario, PartyRole roleOverride, int selectedWaymark, IReadOnlySet<PartyRole> networkRoles, IReadOnlyDictionary<PartyRole, NetworkSeat> networkSeats, Action<string?> resolved)
     {
         lastRun = null;
-        RunResolved(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkNames, isPeer: true), resolved);
+        RunResolved(() => RunScenarioInternal(scenario, roleOverride, null, selectedWaymark, networkRoles, networkSeats, isPeer: true), resolved);
     }
 
     // `resolved` runs in the same deferred callback as the start, with why it was refused, or
@@ -238,7 +238,7 @@ public sealed class Game : IDisposable
     }
 
     // Null once the run is up, else why it was refused.
-    private string? RunScenarioInternal(IScenario scenario, PartyRole? roleOverride, int? selectedAi, int selectedWaymark, IReadOnlySet<PartyRole>? networkRoles, IReadOnlyDictionary<PartyRole, string>? networkNames, bool isPeer)
+    private string? RunScenarioInternal(IScenario scenario, PartyRole? roleOverride, int? selectedAi, int selectedWaymark, IReadOnlySet<PartyRole>? networkRoles, IReadOnlyDictionary<PartyRole, NetworkSeat>? networkSeats, bool isPeer)
     {
         var solo = selectedAi is null;
         var phase = scenario.Phase;
@@ -303,7 +303,7 @@ public sealed class Game : IDisposable
         World.ScenarioOrigin = zone.Origin;
         World.Map.ArmColliderDrops(zone.ColliderRemovalPoints.Select(World.Coordinates.ToGlobal));
         World.PlaceWaymarks(ResolveWaymarks(zone, selectedWaymark));
-        World.CreateParty(player.ClassJob.RowId, scenario.TankMaxHealth, roleOverride, solo, networkRoles, networkNames);
+        World.CreateParty(player.ClassJob.RowId, scenario.TankMaxHealth, roleOverride, solo, networkRoles, networkSeats);
         // Client-asset setup a peer needs too (see IZone.RunClientSetup).
         zone.RunClientSetup(World);
         phase.RunClientSetup(World);

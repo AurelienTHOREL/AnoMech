@@ -222,6 +222,7 @@ public sealed unsafe class SimEnemy : SimNpc
     public GameObjectId? CastTargetId => cast.TargetId;
     public float CastTotalSeconds => cast.Total;
     public float CastOmenDelay => cast.OmenDelay;
+    public float CastOmenRotate => cast.OmenRotate;
     public int LastInstantCastSeq => cast.LastInstantCastSeq;
     public uint LastInstantCastActionId => cast.LastInstantCastActionId;
     public Vector3? LastInstantCastTargetLocation => cast.LastInstantCastTargetLocation;

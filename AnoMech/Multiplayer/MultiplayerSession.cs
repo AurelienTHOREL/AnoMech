@@ -13,6 +13,8 @@ public sealed class MultiplayerSession
     public Dictionary<PartyRole, Guid> ClaimedBy { get; private set; } = new();
     public Dictionary<Guid, string> Names { get; private set; } = new();
     public Dictionary<Guid, PeerBuildInfo> Builds { get; private set; } = new();
+    // Each player's real job; their puppet carries it instead of the seat preset's.
+    public Dictionary<Guid, byte> Jobs { get; private set; } = new();
     public bool Started { get; set; }
 
     // Indices into Game.Scenarios and that scenario's AiStrats/WaymarkPresets; -1 = the host
@@ -42,6 +44,7 @@ public sealed class MultiplayerSession
         Names = msg.Names.Take(NetGuard.MaxSessionPeers).ToDictionary(kv => kv.Key, kv => NetGuard.Clean(kv.Value));
         Builds = msg.Builds.Take(NetGuard.MaxSessionPeers).ToDictionary(kv => kv.Key,
             kv => new PeerBuildInfo(NetGuard.Clean(kv.Value.Version), NetGuard.Clean(kv.Value.Checksum)));
+        Jobs = msg.Jobs.Take(NetGuard.MaxSessionPeers).ToDictionary(kv => kv.Key, kv => NetGuard.ClassJob(kv.Value));
         Started = msg.Started;
         ScenarioIndex = msg.ScenarioIndex;
         SelectedAi = msg.SelectedAi;
@@ -56,11 +59,14 @@ public sealed class MultiplayerSession
 
     public LobbyStateMessage ToMessage() => new(
         HostId, new Dictionary<PartyRole, Guid>(ClaimedBy), new Dictionary<Guid, string>(Names),
-        new Dictionary<Guid, PeerBuildInfo>(Builds), Started, ScenarioIndex, SelectedAi, SelectedWaymark,
+        new Dictionary<Guid, PeerBuildInfo>(Builds), new Dictionary<Guid, byte>(Jobs), Started, ScenarioIndex, SelectedAi, SelectedWaymark,
         new Dictionary<string, ushort>(TankBusterPlan), new List<string>(ScenarioSettings), ScenarioSettingsJson);
 
     public PartyRole? RoleOf(Guid peerId) =>
         ClaimedBy.Where(kv => kv.Value == peerId).Select(kv => (PartyRole?)kv.Key).FirstOrDefault();
+
+    // 0 = unknown, leaving the seat preset's job.
+    public byte JobOf(Guid peerId) => Jobs.GetValueOrDefault(peerId);
 
     public string NameOf(Guid peerId) => Names.GetValueOrDefault(peerId, "Player") is { Length: > 0 } name ? name : "Player";
 }

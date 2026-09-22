@@ -197,6 +197,7 @@ public sealed partial class MultiplayerManager
                 var build = new PeerBuildInfo(NetGuard.Clean(hello.Version), NetGuard.Clean(hello.Checksum));
                 Session.Names[hello.PeerId] = NetGuard.Clean(hello.DisplayName);
                 Session.Builds[hello.PeerId] = build;
+                Session.Jobs[hello.PeerId] = NetGuard.ClassJob(hello.ClassJob);
                 DiagnosticLog.Info($"[Multiplayer] Hello from {hello.PeerId} ({Session.NameOf(hello.PeerId)}), build {build.Version} ({build.ShortChecksum}), mismatch={IsVersionMismatched(hello.PeerId)}.");
                 BroadcastLobbyState();
                 break;
@@ -290,6 +291,7 @@ public sealed partial class MultiplayerManager
 
             case LobbyStateMessage lobby when !IsHost:
                 Session.ApplyLobbyState(lobby);
+                NoteHelloAcknowledged();
                 ApplyHostScenarioSettings();
                 LobbyChanged?.Invoke();
                 // A late join or mid-fight rejoin never gets a StartMessage; OnStartReceived is

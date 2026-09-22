@@ -29,6 +29,7 @@ public sealed unsafe class SimCast : ISimObject
     private float elapsed;
     private float total;
     private float omenDelay;
+    private float omenRotate;
     // Retail resolves an NPC action ~0.3s after its bar fills: callers pass the real bar as
     // castTime and that gap as fireDelay, counted on our own clock since the engine may clear
     // CastInfo once the bar completes.
@@ -67,6 +68,9 @@ public sealed unsafe class SimCast : ISimObject
     // Sampled for peers; the ActorCast packet is the only thing that controls when the omen
     // fades in.
     public float OmenDelay => omenDelay;
+    // Sampled for peers: folded into the native cast rotation, so the actor's facing doesn't
+    // carry it and a peer would draw the omen unrotated.
+    public float OmenRotate => omenRotate;
 
     // Bumped per telegraphed cast. A peer dedupes on this changing rather than on IsCasting's
     // rising edge, which compared two independent clocks and replayed a cast twice.
@@ -172,6 +176,7 @@ public sealed unsafe class SimCast : ISimObject
         this.animationVariation = animationVariation;
         ActionId = actionId;
         this.omenDelay = omenDelay;
+        this.omenRotate = omenRotate;
         this.fireDelay = fireDelay ?? 0;
         fireDelayElapsed = 0f;
 

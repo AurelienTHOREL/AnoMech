@@ -248,7 +248,13 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
 
     public void RemoveStatus(ushort statusId)
     {
-        if (FindStatus(statusId) is not {} status) return;
+        RemoveStatus(statusId, default);
+    }
+
+    // Source-aware: an id the character holds twice (two appliers) needs the right one named.
+    public void RemoveStatus(ushort statusId, GameObjectId sourceObject)
+    {
+        if (FindStatus(statusId, sourceObject) is not {} status) return;
         Core.DiagnosticLog.Info($"[SimCharacter] RemoveStatus: {DiagnosticName} loses status {statusId}.");
         status.Despawn();
     }

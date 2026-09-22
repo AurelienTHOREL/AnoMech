@@ -136,6 +136,9 @@ public sealed partial class MultiplayerManager
 
         if (relay is not { IsConnected: true }) return;
 
+        AnnounceOwnJobIfChanged();
+        ResendHelloUntilAcknowledged(deltaSeconds);
+
         if (IsHost)
         {
             pingTimer += deltaSeconds;
