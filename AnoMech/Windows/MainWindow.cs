@@ -18,13 +18,23 @@ namespace AnoMech.Windows;
 
 public unsafe class MainWindow : Window, IDisposable
 {
+    private const float ScenarioButtonExtraPadding = 6f;
+    private const float SetupDropdownWidth = 180f;
+
     private readonly Plugin plugin;
-    private bool _leftPanelOpen = true;
+    private readonly TitleBarButton autoCollapseButton;
+    private IZone? _openZone;
+    internal ScenarioPanelWindow ScenarioPanel { get; }
+    internal Vector2 ScenarioPanelAnchor { get; private set; }
+    internal float ScenarioPanelHeight { get; private set; }
+    internal bool IsActuallyCollapsed { get; private set; }
+    private float _windowChromeHeight;
     internal IScenario? SelectedScenario => _selectedScenario;
     private IScenario? _selectedScenario;
 
     internal PartyRole? SelectedRoleOverride => _roleOverride;
     private PartyRole? _roleOverride;
+    private bool _soloMode;
 
     // Index into the selected scenario's AiStrats; reset to the first strat whenever the
     // selected scenario changes. Passed to RunScenario as selectedAi on a (non-solo) Start.
@@ -32,11 +42,11 @@ public unsafe class MainWindow : Window, IDisposable
     internal int SelectedStrat => _selectedStrat;
     private int _selectedStrat;
 
-    // Index into the selected scenario's WaymarkPresets; reset to the first preset when the
-    // selected scenario changes. Passed to RunScenario as selectedWaymark on Start. Ignored
-    // by scenarios that declare no presets.
+    // Index into the selected zone's WaymarkPresets. Remembered per zone so switching between
+    // scenarios in the same encounter keeps the chosen layout.
     internal int SelectedWaymark => _selectedWaymark;
     private int _selectedWaymark;
+    private readonly Dictionary<IZone, int> _waymarkMemory = new();
 
     // The region/group label currently selected in the strat picker, for scenarios that
     // declare StratGroups. Null until a grouped scenario is drawn (then it snaps to the
@@ -70,21 +80,39 @@ public unsafe class MainWindow : Window, IDisposable
     public MainWindow(Plugin plugin)
         : base(TitleWithVersion())
     {
+        var uiScale = ImGuiHelpers.GlobalScale;
         SizeConstraints = new WindowSizeConstraints
         {
-            MinimumSize = new Vector2(220, 80),
+            MinimumSize = new Vector2(220, 80) * uiScale,
             MaximumSize = new Vector2(float.MaxValue, float.MaxValue)
         };
         Flags |= ImGuiWindowFlags.AlwaysAutoResize;
 
         this.plugin = plugin;
+        ScenarioPanel = new ScenarioPanelWindow(this);
         IsOpen = false;
+        RestoreSelectedScenario();
+
+        autoCollapseButton = new TitleBarButton
+        {
+            Icon = FontAwesomeIcon.CompressAlt,
+            IconOffset = new Vector2(1f, 1f),
+            Priority = 1,
+            Click = _ =>
+            {
+                Plugin.Config.AutoCollapseWhileRunning = !Plugin.Config.AutoCollapseWhileRunning;
+                Plugin.Config.Save();
+            },
+            ShowTooltip = () => ImGui.SetTooltip(
+                $"Auto-collapse while running: {(Plugin.Config.AutoCollapseWhileRunning ? "On" : "Off")}"),
+        };
+        TitleBarButtons.Add(autoCollapseButton);
 
         // Small gear in the title bar opens the settings window (same toggle as /anomech config).
         TitleBarButtons.Add(new TitleBarButton
         {
             Icon = FontAwesomeIcon.Cog,
-            IconOffset = new Vector2(2f, 1f),
+            IconOffset = new Vector2(2f, 1f) * uiScale,
             Click = _ => plugin.ToggleConfigUi(),
             ShowTooltip = () => ImGui.SetTooltip("Settings"),
         });
@@ -96,22 +124,64 @@ public unsafe class MainWindow : Window, IDisposable
     public void Dispose() { }
 
     private bool _wasInInstance;
+    private bool _wasScenarioActive;
+    private bool _wasScenarioMistake;
+    private bool _wasScenarioFailed;
+    private bool _wasScenarioSucceeded;
+    private bool _clearCollapsedRequest;
 
-    // While the fake-zone instance is loaded, pin the window open and uncollapsible
-    // so the user can always reach Reset/Leave/God-mode without re-opening it.
+    // The window is collapsible while a scenario runs, and expands again when the run ends.
+    // Outside a run, fake-zone sessions keep it expanded so the next action is visible.
     public override void PreOpenCheck()
     {
+        if (_clearCollapsedRequest)
+        {
+            Collapsed = null;
+            CollapsedCondition = ImGuiCond.None;
+            _clearCollapsedRequest = false;
+        }
+
+        var scenarioActive = plugin.Game.IsScenarioActive;
+        var scenarioMistake = plugin.Game.HasScenarioMistake;
+        var scenarioFailed = plugin.Game.HasScenarioFailed;
+        var scenarioSucceeded = plugin.Game.HasScenarioSucceeded;
+        if (scenarioActive && !_wasScenarioActive)
+        {
+            if (Plugin.Config.AutoCollapseWhileRunning)
+                RequestCollapsed(true);
+        }
+        if (scenarioMistake && !_wasScenarioMistake)
+        {
+            RequestCollapsed(false);
+        }
+        else if (scenarioFailed && !_wasScenarioFailed)
+        {
+            RequestCollapsed(false);
+        }
+        else if (scenarioSucceeded && !_wasScenarioSucceeded)
+        {
+            RequestCollapsed(false);
+        }
+        else if (!scenarioActive && _wasScenarioActive)
+        {
+            RequestCollapsed(false);
+        }
+
         var inInstance = plugin.Game.World.Map.IsInInstance;
         if (inInstance)
         {
             IsOpen = true;
             ShowCloseButton = false;
             RespectCloseHotkey = false;
-            Flags |= ImGuiWindowFlags.NoCollapse;
+            if (scenarioActive)
+                Flags &= ~ImGuiWindowFlags.NoCollapse;
+            else
+                Flags |= ImGuiWindowFlags.NoCollapse;
             if (!_wasInInstance)
             {
-                Collapsed = false;
-                CollapsedCondition = ImGuiCond.Always;
+                ScenarioPanel.Close();
+                if (!scenarioActive)
+                    RequestCollapsed(false);
             }
         }
         else
@@ -122,86 +192,165 @@ public unsafe class MainWindow : Window, IDisposable
             if (_wasInInstance)
                 CollapsedCondition = ImGuiCond.FirstUseEver;
         }
+
+        _wasScenarioActive = scenarioActive;
+        _wasScenarioMistake = scenarioMistake;
+        _wasScenarioFailed = scenarioFailed;
+        _wasScenarioSucceeded = scenarioSucceeded;
         _wasInInstance = inInstance;
+    }
+
+    private void RequestCollapsed(bool collapsed)
+    {
+        Collapsed = collapsed;
+        CollapsedCondition = ImGuiCond.Always;
+        _clearCollapsedRequest = true;
+    }
+
+    public override void PreDraw()
+    {
+        autoCollapseButton.IconColor = Plugin.Config.AutoCollapseWhileRunning
+            ? StyleColor(ImGuiCol.Text)
+            : StyleColor(ImGuiCol.TextDisabled);
+
+        var uiScale = ImGuiHelpers.GlobalScale;
+        var minimumHeight = 80f;
+        if (ScenarioPanel.RequestedOpen && ScenarioPanel.NaturalHeight > 0f)
+            minimumHeight = Math.Max(minimumHeight, (_windowChromeHeight + ScenarioPanel.NaturalHeight) / uiScale);
+        SizeConstraints = new WindowSizeConstraints
+        {
+            MinimumSize = new Vector2(220f, minimumHeight),
+            MaximumSize = new Vector2(float.MaxValue, float.MaxValue)
+        };
+    }
+
+    public override void PostDraw()
+    {
+        var window = ImGuiP.FindWindowByName(WindowName);
+        IsActuallyCollapsed = !window.IsNull && window.Collapsed;
     }
 
     public override void Draw()
     {
-        var leftWidth = _leftPanelOpen ? ScenarioPanelWidth() : 30f * ImGuiHelpers.GlobalScale;
-
-        if (ImGui.BeginTable("##layout", 2, ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.SizingFixedFit))
-        {
-            ImGui.TableSetupColumn("##left", ImGuiTableColumnFlags.WidthFixed, leftWidth);
-            ImGui.TableSetupColumn("##right", ImGuiTableColumnFlags.WidthStretch);
-            ImGui.TableNextRow();
-            ImGui.TableSetColumnIndex(0);
-            DrawScenariosPanel();
-            ImGui.TableSetColumnIndex(1);
-            DrawMainContent();
-            ImGui.EndTable();
-        }
+        var windowPos = ImGui.GetWindowPos();
+        var contentTop = windowPos.Y + ImGui.GetFrameHeight();
+        ScenarioPanelAnchor = new Vector2(windowPos.X, contentTop);
+        _windowChromeHeight = contentTop - windowPos.Y;
+        ScenarioPanelHeight = windowPos.Y + ImGui.GetWindowSize().Y - contentTop;
+        DrawMainContent();
     }
 
     // Size the left panel to the widest scenario label so names never clip as scenarios are added.
-    private float ScenarioPanelWidth()
+    internal float ScenarioPanelWindowWidth()
     {
         var style = ImGui.GetStyle();
         var widest = 0f;
         foreach (var zone in plugin.Game.Zones)
         {
-            widest = Math.Max(widest, ImGui.CalcTextSize(zone.Name).X);
+            widest = Math.Max(widest, ImGui.CalcTextSize(zone.Name).X + style.IndentSpacing);
             foreach (var phase in plugin.Game.PhasesOf(zone))
                 foreach (var scenario in plugin.Game.ScenariosOf(phase))
-                    widest = Math.Max(widest, ImGui.CalcTextSize(DisplayName(scenario)).X);
+                    widest = Math.Max(widest, ImGui.CalcTextSize(DisplayName(scenario)).X + style.IndentSpacing);
         }
-        var measured = widest + style.FramePadding.X * 2 + style.CellPadding.X * 2;
-        return Math.Max(180f * ImGuiHelpers.GlobalScale, measured);
+        var measured = widest
+            + style.FramePadding.X * 2
+            + style.CellPadding.X * 2
+            + style.ScrollbarSize
+            + ScenarioButtonExtraPadding * 2 * ImGuiHelpers.GlobalScale;
+        var contentWidth = Math.Max(180f * ImGuiHelpers.GlobalScale, measured);
+        return contentWidth + style.WindowPadding.X * 2;
     }
 
-    private void DrawScenariosPanel()
+    internal void DrawScenariosPanel()
     {
-        if (_leftPanelOpen)
-        {
-            ImGui.TextUnformatted("Scenarios");
-            ImGui.SameLine();
-            if (ImGui.SmallButton("<##collapse")) _leftPanelOpen = false;
-            ImGui.Separator();
+        ImGui.TextUnformatted("Scenarios");
+        ImGui.Separator();
 
-            foreach (var zone in plugin.Game.Zones)
-            {
-                if (!ImGui.CollapsingHeader(zone.Name, ImGuiTreeNodeFlags.DefaultOpen)) continue;
-                ImGui.Indent();
-                foreach (var phase in plugin.Game.PhasesOf(zone))
-                    foreach (var scenario in plugin.Game.ScenariosOf(phase))
-                    {
-                        var selected = _selectedScenario == scenario;
-                        if (selected) ImGui.PushStyleColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.ButtonActive));
-                        // Zone-qualified: two zones can hold same-named scenarios (UMAD and UCOB
-                        // both have a P5 "Exaflares"), and a shared ImGui id makes the second
-                        // button unclickable.
-                        ImGui.PushID(FullName(scenario));
-                        if (ImGui.Button(DisplayName(scenario), new Vector2(-1, 0)))
-                            SelectScenario(scenario);
-                        ImGui.PopID();
-                        if (selected) ImGui.PopStyleColor();
-                    }
-                ImGui.Unindent();
-            }
-        }
-        else
+        foreach (var zone in plugin.Game.Zones)
         {
-            if (ImGui.Button(">##expand")) _leftPanelOpen = true;
+            var shouldOpen = _openZone == zone;
+            ImGui.SetNextItemOpen(shouldOpen, ImGuiCond.Always);
+            var headerColor = BlendColor(
+                StyleColor(ImGuiCol.WindowBg),
+                StyleColor(ImGuiCol.Header),
+                0.72f);
+            ImGui.PushStyleColor(ImGuiCol.Header, headerColor);
+            var open = ImGui.CollapsingHeader($"{zone.Name}###scenario-zone-{zone.GetType().FullName}");
+            ImGui.PopStyleColor();
+            var sectionRight = ImGui.GetItemRectMax().X;
+            if (open != shouldOpen) _openZone = open ? zone : null;
+            if (!open) continue;
+            ImGui.Indent();
+            var buttonPadding = ImGui.GetStyle().FramePadding;
+            buttonPadding.X += ScenarioButtonExtraPadding * ImGuiHelpers.GlobalScale;
+            ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, buttonPadding);
+            ImGui.PushStyleVar(ImGuiStyleVar.ButtonTextAlign, new Vector2(0f, 0.5f));
+            foreach (var phase in plugin.Game.PhasesOf(zone))
+                foreach (var scenario in plugin.Game.ScenariosOf(phase))
+                {
+                    var selected = _selectedScenario == scenario;
+                    if (selected) PushSelectedScenarioStyle();
+                    // Zone-qualified: two zones can hold same-named scenarios (UMAD and UCOB
+                    // both have a P5 "Exaflares"), and a shared ImGui id makes the second
+                    // button unclickable.
+                    ImGui.PushID(FullName(scenario));
+                    var buttonWidth = sectionRight - ImGui.GetCursorScreenPos().X;
+                    var clicked = ImGui.Button(DisplayName(scenario), new Vector2(buttonWidth, 0));
+                    if (selected)
+                    {
+                        var min = ImGui.GetItemRectMin();
+                        var max = ImGui.GetItemRectMax();
+                        var accentWidth = 3f * ImGuiHelpers.GlobalScale;
+                        ImGui.GetWindowDrawList().AddRectFilled(
+                            min,
+                            new Vector2(min.X + accentWidth, max.Y),
+                            ImGui.GetColorU32(ImGuiCol.ButtonActive));
+                        ImGui.PopStyleColor(3);
+                    }
+                    ImGui.PopID();
+                    if (clicked) SelectScenario(scenario);
+                }
+            ImGui.PopStyleVar(2);
+            ImGui.Unindent();
+        }
+    }
+
+    private void RestoreSelectedScenario()
+    {
+        if (string.IsNullOrEmpty(Plugin.Config.LastSelectedScenario)) return;
+        foreach (var scenario in plugin.Game.Scenarios)
+        {
+            if (!string.Equals(
+                    FullName(scenario),
+                    Plugin.Config.LastSelectedScenario,
+                    StringComparison.Ordinal))
+                continue;
+            SelectScenario(scenario, persist: false);
+            return;
         }
     }
 
     // Select a scenario and reset its per-scenario UI state (strat, waymark, remembered region).
-    private void SelectScenario(IScenario scenario)
+    private void SelectScenario(IScenario scenario, bool persist = true)
     {
+        if (_selectedScenario is { } previousScenario)
+            _waymarkMemory[previousScenario.Phase.Zone] = _selectedWaymark;
+
         _selectedScenario = scenario;
+        _openZone = scenario.Phase.Zone;
+        _soloMode = false;
         _selectedStrat = 0;
-        _selectedWaymark = 0;
+        _selectedWaymark = _waymarkMemory.GetValueOrDefault(scenario.Phase.Zone);
+        if (_selectedWaymark < 0 || _selectedWaymark >= scenario.Phase.Zone.WaymarkPresets.Count)
+            _selectedWaymark = 0;
         // Restore the last region picked for this scenario; null self-heals to its first region when drawn.
         _selectedStratGroup = _stratGroupMemory.GetValueOrDefault(scenario);
+
+        if (persist)
+        {
+            Plugin.Config.LastSelectedScenario = FullName(scenario);
+            Plugin.Config.Save();
+        }
     }
 
     // Distinct, ordered region labels from the strats' IScenarioAi.Group; empty = ungrouped.
@@ -217,57 +366,291 @@ public unsafe class MainWindow : Window, IDisposable
     {
         if (_selectedScenario == null)
         {
+            DrawScenarioPanelToggle();
+            ImGui.SameLine();
             ImGui.TextDisabled("Select a scenario");
             return;
         }
 
         var game = plugin.Game;
 
-        ImGui.TextUnformatted(FullName(_selectedScenario));
-        ImGui.Separator();
-        DrawLocationHint();
-
-        DrawRoleSelector();
-        DrawStratSelector();
-        DrawWaymarkSelector();
-
         var inInn = ZoneSession.IsInInn();
         var busy = ZoneSession.IsPlayerBusy();
         var envReady = inInn && !busy;
         var hasStrat = HasStartableStrat();
-        var canStart = envReady && hasStrat;
-        ImGui.BeginDisabled(!canStart);
-        if (ImGui.Button("Start")) game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
-        ImGui.EndDisabled();
-        if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        var soloMode = _selectedScenario.SupportsSolo && _soloMode;
+        var canStart = envReady && (soloMode || hasStrat);
+
+        DrawScenarioHeader(game);
+        DrawPrimaryActions(game, canStart, inInn, busy, soloMode);
+        DrawSoloOption(game);
+        DrawLocationHint();
+        DrawRunOptions(game);
+
+        ImGui.Spacing();
+        if (ImGui.TreeNodeEx("Setup###scenario-setup-v3",
+                ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.FramePadding))
         {
-            ImGui.SetTooltip(!inInn
-                ? "Scenarios can only be started from an inn."
-                : busy
-                    ? "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.)."
-                    : "No strat available for this region yet.");
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Reset")) game.Reset();
-        if (game.World.Map.IsInInstance)
-        {
-            ImGui.SameLine();
-            if (ImGui.Button("Leave")) game.Leave();
+            if (SettingsGrid.Begin("##scenario-setup-grid"))
+            {
+                DrawRoleSelector();
+                DrawStratSelector();
+                DrawWaymarkSelector();
+                SettingsGrid.End();
+            }
+            ImGui.TreePop();
         }
 
-        if (_selectedScenario.SupportsSolo)
+        ImGui.Spacing();
+        if (ImGui.TreeNodeEx("Scenario settings###scenario-config-v3",
+                ImGuiTreeNodeFlags.FramePadding))
         {
-            ImGui.BeginDisabled(!envReady);
-            if (ImGui.Button("Start Solo")) game.RunScenario(_selectedScenario, _roleOverride, selectedAi: null, _selectedWaymark);
+            _selectedScenario.DrawSettings();
+            ImGui.TreePop();
+        }
+
+#if DEBUG
+        ImGui.Spacing();
+        if (ImGui.TreeNodeEx("Debug###debug-v3",
+                ImGuiTreeNodeFlags.FramePadding))
+        {
+            debugMenu.DrawSpeedControl();
+            debugMenu.DrawDebugContent();
+            ImGui.TreePop();
+        }
+#endif
+    }
+
+    private void DrawScenarioHeader(AnoMech.Core.Game.Game game)
+    {
+        var uiScale = ImGuiHelpers.GlobalScale;
+        var contentStart = ImGui.GetCursorScreenPos();
+        var contentWidth = ImGui.GetContentRegionAvail().X;
+        var rowHeight = ImGui.GetFrameHeight();
+        var scenario = _selectedScenario!;
+
+        string statusLabel;
+        Vector4 statusColor;
+        if (game.Paused)
+        {
+            statusLabel = "Paused";
+            statusColor = new Vector4(1f, 0.65f, 0.25f, 1f);
+        }
+        else if (game.IsScenarioActive)
+        {
+            statusLabel = "Running";
+            statusColor = new Vector4(0.35f, 0.85f, 0.45f, 1f);
+        }
+        else
+        {
+            statusLabel = "Idle";
+            statusColor = StyleColor(ImGuiCol.TextDisabled);
+        }
+
+        DrawScenarioPanelToggle();
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{scenario.Phase.Zone.Name} —");
+        ImGui.SameLine(0f, 4f * uiScale);
+        ImGui.TextUnformatted(DisplayName(scenario));
+
+        var minimumStatusX = ImGui.GetItemRectMax().X + 12f * uiScale;
+        DrawStatusOverlay(
+            statusLabel,
+            statusColor,
+            contentStart.X + contentWidth,
+            minimumStatusX,
+            contentStart.Y,
+            rowHeight);
+
+        var dividerColor = StyleColor(ImGuiCol.TextDisabled);
+        dividerColor.W *= 0.35f;
+        var dividerY = contentStart.Y + rowHeight;
+        ImGui.GetWindowDrawList().AddLine(
+            new Vector2(ImGui.GetWindowPos().X, dividerY),
+            new Vector2(ImGui.GetWindowPos().X + ImGui.GetWindowSize().X, dividerY),
+            ImGui.GetColorU32(dividerColor),
+            1f * uiScale);
+        ImGui.SetCursorScreenPos(new Vector2(
+            contentStart.X,
+            dividerY + ImGui.GetStyle().ItemSpacing.Y));
+    }
+
+    private void DrawScenarioPanelToggle()
+    {
+        if (DrawQuietIconButton(
+                "scenario-panel-toggle",
+                FontAwesomeIcon.Columns,
+                active: ScenarioPanel.RequestedOpen))
+            ScenarioPanel.ToggleRequested();
+    }
+
+    private static bool DrawQuietIconButton(string id, FontAwesomeIcon icon, bool active = false)
+    {
+        var button = StyleColor(ImGuiCol.Button);
+        if (active)
+        {
+            var activeColor = StyleColor(ImGuiCol.ButtonActive);
+            button = BlendColor(button, activeColor, 0.72f);
+            button.W = MathF.Max(button.W, activeColor.W * 0.9f);
+        }
+        else
+        {
+            button.W *= 0.42f;
+        }
+        var hovered = StyleColor(ImGuiCol.ButtonHovered);
+        if (active)
+            hovered = BlendColor(hovered, StyleColor(ImGuiCol.ButtonActive), 0.55f);
+        else
+            hovered.W *= 0.78f;
+        ImGui.PushStyleColor(ImGuiCol.Button, button);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, hovered);
+        if (active)
+        {
+            var border = AdjustColor(StyleColor(ImGuiCol.ButtonActive), 1.18f);
+            border.W = 0.9f;
+            ImGui.PushStyleColor(ImGuiCol.Border, border);
+            ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f * ImGuiHelpers.GlobalScale);
+        }
+        ImGui.PushStyleVar(
+            ImGuiStyleVar.FramePadding,
+            new Vector2(5f, 2f) * ImGuiHelpers.GlobalScale);
+        var clicked = ImGuiComponents.IconButton(id, icon);
+        ImGui.PopStyleVar(active ? 2 : 1);
+        ImGui.PopStyleColor(active ? 3 : 2);
+        return clicked;
+    }
+
+    private void DrawPrimaryActions(
+        AnoMech.Core.Game.Game game,
+        bool canStart,
+        bool inInn,
+        bool busy,
+        bool soloMode)
+    {
+        var active = game.IsScenarioActive;
+        var showLeave = game.World.Map.IsInInstance;
+        var uiScale = ImGuiHelpers.GlobalScale;
+        var actionHeight = 32f * uiScale;
+        if (active)
+        {
+            if (DrawSemanticButton(
+                    "Stop",
+                    new Vector2(140f * uiScale, actionHeight),
+                    new Vector4(0.45f, 0.14f, 0.16f, 0.92f)))
+                game.Reset();
+        }
+        else
+        {
+            ImGui.BeginDisabled(!canStart);
+            if (DrawSemanticButton(
+                    "Start",
+                    new Vector2(140f * uiScale, actionHeight),
+                    new Vector4(0.18f, 0.40f, 0.24f, 0.92f)))
+                game.RunScenario(
+                    _selectedScenario!,
+                    _roleOverride,
+                    selectedAi: soloMode ? null : _selectedStrat,
+                    _selectedWaymark);
             ImGui.EndDisabled();
-            if (!envReady && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             {
                 ImGui.SetTooltip(!inInn
                     ? "Scenarios can only be started from an inn."
-                    : "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.).");
+                    : busy
+                        ? "Cannot start while you are busy (cutscene, NPC event, crafting, trading, zoning, etc.)."
+                        : "No strat available for this region yet.");
             }
         }
 
+        if (showLeave)
+        {
+            ImGui.SameLine();
+            if (DrawSemanticButton(
+                    "Leave",
+                    new Vector2(140f * uiScale, actionHeight),
+                    new Vector4(0.45f, 0.14f, 0.16f, 0.92f)))
+                game.Leave();
+        }
+    }
+
+    private static void DrawStatusOverlay(
+        string label,
+        Vector4 color,
+        float right,
+        float minimumX,
+        float top,
+        float height)
+    {
+        var uiScale = ImGuiHelpers.GlobalScale;
+        var radius = 3f * uiScale;
+        var diameter = radius * 2f;
+        var gap = 4f * uiScale;
+        var textSize = ImGui.CalcTextSize(label);
+        var fullWidth = diameter + gap + textSize.X;
+        var x = right - fullWidth;
+        var drawLabel = x >= minimumX;
+        if (!drawLabel)
+            x = right - diameter;
+        if (x < minimumX) return;
+
+        var drawList = ImGui.GetWindowDrawList();
+        drawList.AddCircleFilled(
+            new Vector2(x + radius, top + height * 0.5f),
+            radius,
+            ImGui.GetColorU32(color));
+        if (drawLabel)
+            drawList.AddText(
+                new Vector2(x + diameter + gap, top + (height - textSize.Y) * 0.5f),
+                ImGui.GetColorU32(color),
+                label);
+    }
+
+    private static bool DrawSemanticButton(string label, Vector2 size, Vector4 color)
+    {
+        ImGui.PushStyleColor(ImGuiCol.Button, color);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, AdjustColor(color, 1.16f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, AdjustColor(color, 0.84f));
+        var clicked = ImGui.Button(label, size);
+        ImGui.PopStyleColor(3);
+        return clicked;
+    }
+
+    private static void PushSelectedScenarioStyle()
+    {
+        var button = StyleColor(ImGuiCol.Button);
+        var hovered = StyleColor(ImGuiCol.ButtonHovered);
+        var active = StyleColor(ImGuiCol.ButtonActive);
+        ImGui.PushStyleColor(ImGuiCol.Button, BlendColor(button, active, 0.52f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, BlendColor(hovered, active, 0.62f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, active);
+    }
+
+    private static Vector4 StyleColor(ImGuiCol color) => *ImGui.GetStyleColorVec4(color);
+
+    private static Vector4 BlendColor(Vector4 from, Vector4 to, float amount) =>
+        Vector4.Lerp(from, to, amount);
+
+    private static Vector4 AdjustColor(Vector4 color, float factor) => new(
+        Math.Clamp(color.X * factor, 0f, 1f),
+        Math.Clamp(color.Y * factor, 0f, 1f),
+        Math.Clamp(color.Z * factor, 0f, 1f),
+        color.W);
+
+    private void DrawSoloOption(AnoMech.Core.Game.Game game)
+    {
+        if (!_selectedScenario!.SupportsSolo) return;
+        ImGui.BeginDisabled(game.IsScenarioActive);
+        ImGui.Checkbox("Solo", ref _soloMode);
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(game.IsScenarioActive
+                ? "Stop the current scenario before changing the run mode."
+                : "Run without simulated party members or party AI.");
+    }
+
+    private static void DrawRunOptions(AnoMech.Core.Game.Game game)
+    {
+        ImGui.Spacing();
         var god = game.GodMode;
         if (ImGui.Checkbox("God mode", ref god)) game.GodMode = god;
         ImGui.SameLine();
@@ -277,28 +660,6 @@ public unsafe class MainWindow : Window, IDisposable
             ImGui.SetTooltip("Restart the same scenario immediately after a successful run. A death turns this back off.");
         ImGui.SameLine();
         ImGui.TextDisabled($"Streak: {game.MechanicStreak}");
-
-#if DEBUG
-        debugMenu.DrawSpeedControl();
-#endif
-
-        if (game.Paused) ImGui.TextDisabled("(scenario paused — press Reset to clear)");
-
-        ImGui.Spacing();
-        if (ImGui.CollapsingHeader("Scenario config", ImGuiTreeNodeFlags.DefaultOpen))
-        {
-            ImGui.Indent();
-            _selectedScenario.DrawSettings();
-            ImGui.Unindent();
-        }
-
-#if DEBUG
-        ImGui.Spacing();
-        if (ImGui.CollapsingHeader("Debug"))
-        {
-            debugMenu.DrawDebugContent();
-        }
-#endif
     }
 
     // Drawn below the strat picker for scenarios that declare WaymarkPresets. _selectedWaymark
@@ -308,26 +669,27 @@ public unsafe class MainWindow : Window, IDisposable
     {
         if (_selectedScenario is null) return;
         var presets = _selectedScenario.Phase.Zone.WaymarkPresets;
-        if (presets.Count == 0) return;
+        if (presets.Count <= 1) return;
         if (_selectedWaymark < 0 || _selectedWaymark >= presets.Count) _selectedWaymark = 0;
 
         var labels = new string[presets.Count];
         for (var i = 0; i < presets.Count; i++) labels[i] = presets[i].Name;
 
-        ImGui.TextUnformatted("Waymarks:");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(180 * ImGuiHelpers.GlobalScale);
-        if (ImGui.Combo("##waymarks", ref _selectedWaymark, labels, labels.Length)
-            && plugin.Game.World.Map.IsInInstance)
-            plugin.Game.World.PlaceWaymarks(presets[_selectedWaymark].Markers);
+        SettingsGrid.Row("Waymarks:");
+        ImGui.SetNextItemWidth(SetupDropdownWidth * ImGuiHelpers.GlobalScale);
+        if (ImGui.Combo("##waymarks", ref _selectedWaymark, labels, labels.Length))
+        {
+            _waymarkMemory[_selectedScenario.Phase.Zone] = _selectedWaymark;
+            if (plugin.Game.World.Map.IsInInstance)
+                plugin.Game.World.PlaceWaymarks(presets[_selectedWaymark].Markers);
+        }
     }
 
     private void DrawRoleSelector()
     {
         var idx = _roleOverride is { } role ? (int)role + 1 : 0;
-        ImGui.TextUnformatted("Select your Role:");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(120 * ImGuiHelpers.GlobalScale);
+        SettingsGrid.Row("Role:");
+        ImGui.SetNextItemWidth(SetupDropdownWidth * ImGuiHelpers.GlobalScale);
         if (ImGui.Combo("##role", ref idx, RoleLabels, RoleLabels.Length))
             _roleOverride = idx == 0 ? null : (PartyRole)(idx - 1);
     }
@@ -350,9 +712,8 @@ public unsafe class MainWindow : Window, IDisposable
         _selectedStrat = Math.Clamp(_selectedStrat, 0, strats.Count - 1);
         var labels = new string[strats.Count];
         for (var i = 0; i < strats.Count; i++) labels[i] = strats[i].Name;
-        ImGui.TextUnformatted("Select Strat:");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(280 * ImGuiHelpers.GlobalScale);
+        SettingsGrid.Row("Strategy:");
+        ImGui.SetNextItemWidth(SetupDropdownWidth * ImGuiHelpers.GlobalScale);
         ImGui.Combo("##strat", ref _selectedStrat, labels, labels.Length);
     }
 
@@ -364,10 +725,10 @@ public unsafe class MainWindow : Window, IDisposable
         if (!GroupsContain(groups, _selectedStratGroup))
             _selectedStratGroup = groups[0];
 
-        ImGui.TextUnformatted("Region:");
+        SettingsGrid.Row("Region:");
         for (var i = 0; i < groups.Count; i++)
         {
-            ImGui.SameLine();
+            if (i > 0) ImGui.SameLine();
             var group = groups[i];
             var selected = _selectedStratGroup == group;
             if (selected) ImGui.PushStyleColor(ImGuiCol.Button, ImGui.GetColorU32(ImGuiCol.ButtonActive));
@@ -385,8 +746,7 @@ public unsafe class MainWindow : Window, IDisposable
         for (var i = 0; i < strats.Count; i++)
             if (strats[i].Group == _selectedStratGroup) filtered.Add(i);
 
-        ImGui.TextUnformatted("Select Strat:");
-        ImGui.SameLine();
+        SettingsGrid.Row("Strategy:");
         if (filtered.Count == 0)
         {
             _selectedStrat = -1;
@@ -398,7 +758,7 @@ public unsafe class MainWindow : Window, IDisposable
         var localIdx = filtered.IndexOf(_selectedStrat);
         var labels = new string[filtered.Count];
         for (var i = 0; i < filtered.Count; i++) labels[i] = strats[filtered[i]].Name;
-        ImGui.SetNextItemWidth(280 * ImGuiHelpers.GlobalScale);
+        ImGui.SetNextItemWidth(SetupDropdownWidth * ImGuiHelpers.GlobalScale);
         if (ImGui.Combo("##strat", ref localIdx, labels, labels.Length))
             _selectedStrat = filtered[localIdx];
     }

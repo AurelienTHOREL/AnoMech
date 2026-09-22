@@ -56,6 +56,12 @@ public sealed class Game : IDisposable
     // Set by Game.Kill once the post-first-death freeze timer fires. While true,
     // Tick is a no-op so scenario events, scheduler, and world all stop.
     public bool Paused { get; set; }
+    public bool IsScenarioActive => activeScenario is not null;
+    public bool HasScenarioMistake => lastMistakeElapsed is not null;
+    public bool HasScenarioFailed => deathOccurredThisRun;
+    public bool HasScenarioSucceeded => mechanicResultReported
+        && !deathOccurredThisRun
+        && lastMistakeElapsed is null;
 
     // When true, Game.Kill still posts the chat line for learning but skips every
     // gameplay side effect (HP=0, KO timeline, stun hooks, freeze timer).

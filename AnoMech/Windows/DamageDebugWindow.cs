@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Windowing;
@@ -121,18 +122,20 @@ internal sealed class DamageDebugWindow : Window, IDisposable
             RebuildTexture();
         }
 
+        var uiScale = ImGuiHelpers.GlobalScale;
+        var canvasSize = Res * uiScale;
         var origin = ImGui.GetCursorScreenPos();
-        if (tex != null) ImGui.Image(tex.Handle, new Vector2(Res, Res));
-        else ImGui.Dummy(new Vector2(Res, Res));
+        if (tex != null) ImGui.Image(tex.Handle, new Vector2(canvasSize, canvasSize));
+        else ImGui.Dummy(new Vector2(canvasSize, canvasSize));
 
         var dl = ImGui.GetWindowDrawList();
         Vector2 ToCanvas(Vector3 l) => origin + new Vector2(
-            (l.X + HalfExtent) / (2f * HalfExtent) * Res,
-            (l.Z + HalfExtent) / (2f * HalfExtent) * Res);
+            (l.X + HalfExtent) / (2f * HalfExtent) * canvasSize,
+            (l.Z + HalfExtent) / (2f * HalfExtent) * canvasSize);
 
         // Arena ring at the 20y TOP radius for orientation.
         var ring = ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.35f));
-        dl.AddCircle(ToCanvas(Vector3.Zero), TopConstants.Geometry.ArenaRadius / HalfExtent * (Res / 2f), ring);
+        dl.AddCircle(ToCanvas(Vector3.Zero), TopConstants.Geometry.ArenaRadius / HalfExtent * (canvasSize / 2f), ring);
 
         // Party members: while frozen, show positions snapshotted at the freeze so the
         // dots stay put with the frozen heatmap; live otherwise.
@@ -140,18 +143,18 @@ internal sealed class DamageDebugWindow : Window, IDisposable
         if (frozen)
         {
             frozenPositions ??= CapturePartyPositions();
-            foreach (var p in frozenPositions) dl.AddCircleFilled(ToCanvas(p), 3f, dot);
+            foreach (var p in frozenPositions) dl.AddCircleFilled(ToCanvas(p), 3f * uiScale, dot);
         }
         else
         {
             frozenPositions = null;
             foreach (var m in plugin.Game.World.Party.AllMembers())
-                dl.AddCircleFilled(ToCanvas(m.Position), 3f, dot);
+                dl.AddCircleFilled(ToCanvas(m.Position), 3f * uiScale, dot);
         }
 
         // Most-recent AOE source.
         if (sourceRemaining > 0f && lastSource is { } s)
-            dl.AddCircleFilled(ToCanvas(s), 4f, ImGui.GetColorU32(new Vector4(1f, 1f, 0f, 1f)));
+            dl.AddCircleFilled(ToCanvas(s), 4f * uiScale, ImGui.GetColorU32(new Vector4(1f, 1f, 0f, 1f)));
     }
 
     // Auto-freeze hook for the wipe sequence (Game.Kill). Snapshots the heatmap as-is

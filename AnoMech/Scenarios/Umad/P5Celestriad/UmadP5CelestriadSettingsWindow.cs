@@ -1,5 +1,6 @@
 using System;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 
 namespace AnoMech.Scenarios.Umad.P5Celestriad;
 
@@ -38,7 +39,7 @@ public sealed class UmadP5CelestriadSettingsWindow
     {
         SettingsGrid.Row(label);
         var idx = current;
-        ImGui.SetNextItemWidth(140);
+        ImGui.SetNextItemWidth(140 * ImGuiHelpers.GlobalScale);
         if (ImGui.Combo(id, ref idx, labels, labels.Length))
             set(idx);
     }
