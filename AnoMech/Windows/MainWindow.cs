@@ -20,6 +20,12 @@ public unsafe class MainWindow : Window, IDisposable
 {
     private readonly Plugin plugin;
     private bool _leftPanelOpen = true;
+
+    // The scenarios column's height with every zone open caps the window; the right column
+    // scrolls past it. Measured, so it follows the scenario list and the UI scale.
+    private float _scenarioPanelFullHeight;
+    private bool _allZonesOpen;
+    private Vector2 _contentSize;
     internal IScenario? SelectedScenario => _selectedScenario;
     private IScenario? _selectedScenario;
 
@@ -122,14 +128,35 @@ public unsafe class MainWindow : Window, IDisposable
             ImGui.TableSetupColumn("##right", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableNextRow();
             ImGui.TableSetColumnIndex(0);
+            var top = ImGui.GetCursorPosY();
             DrawScenariosPanel();
+            if (_leftPanelOpen && _allZonesOpen)
+                _scenarioPanelFullHeight = ImGui.GetCursorPosY() - top;
             ImGui.TableSetColumnIndex(1);
-            DrawMainContent();
+            DrawMainContentColumn();
             ImGui.EndTable();
         }
     }
 
     // Size the left panel to the widest scenario label so names never clip as scenarios are added.
+    // The child takes last frame's measured content size, capped at the scenarios column's full
+    // height, so the window auto-fits the content until the cap and scrolls past it. A child
+    // sized "remaining" would collapse inside an auto-resize window, hence the explicit width.
+    private void DrawMainContentColumn()
+    {
+        var cap = _scenarioPanelFullHeight > 0f ? _scenarioPanelFullHeight : float.MaxValue;
+        var scrolling = _contentSize.Y > cap;
+        var size = new Vector2(
+            _contentSize.X + (scrolling ? ImGui.GetStyle().ScrollbarSize : 0f),
+            Math.Min(_contentSize.Y, cap));
+        ImGui.BeginChild("##content", size, false, ImGuiWindowFlags.None);
+        DrawMainContent();
+        // The size ImGui's own auto-fit uses: a nested table (SettingsGrid) reports its width
+        // only here and clamps CursorMaxPos to its outer rect, so a group would under-measure.
+        _contentSize = ImGuiP.GetCurrentWindow().ContentSizeIdeal;
+        ImGui.EndChild();
+    }
+
     private float ScenarioPanelWidth()
     {
         var style = ImGui.GetStyle();
@@ -154,9 +181,14 @@ public unsafe class MainWindow : Window, IDisposable
             if (ImGui.SmallButton("<##collapse")) _leftPanelOpen = false;
             ImGui.Separator();
 
+            _allZonesOpen = true;
             foreach (var zone in plugin.Game.Zones)
             {
-                if (!ImGui.CollapsingHeader(zone.Name, ImGuiTreeNodeFlags.DefaultOpen)) continue;
+                if (!ImGui.CollapsingHeader(zone.Name, ImGuiTreeNodeFlags.DefaultOpen))
+                {
+                    _allZonesOpen = false;
+                    continue;
+                }
                 ImGui.Indent();
                 var mpWindowOpen = plugin.MultiplayerWindow.IsOpen;
                 var mpConnected = plugin.Multiplayer.IsConnected;
