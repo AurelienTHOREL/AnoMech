@@ -142,6 +142,9 @@ internal static class DiagnosticLog
     private static string? logDir;
     private static bool initialized;
 
+    // Null when disk logging is disabled; other debug captures live under the same folder.
+    internal static string? LogDirectory => logDir;
+
     // Called once from Plugin's constructor; the only synchronous work is creating a directory.
     public static void Initialize()
     {
@@ -156,7 +159,7 @@ internal static class DiagnosticLog
                 Plugin.Log.Warning("[DiagnosticLog] No plugin assembly directory -- disk logging disabled, in-memory buffer still works.");
                 return;
             }
-            logDir = Path.Combine(baseDir, "logs");
+            logDir = Path.Combine(baseDir, "anomech-logs");
             Directory.CreateDirectory(logDir);
         }
         catch (Exception e)

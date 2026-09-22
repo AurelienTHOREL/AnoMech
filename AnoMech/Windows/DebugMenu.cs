@@ -103,9 +103,9 @@ internal sealed unsafe class DebugMenu
 
         try
         {
-            var baseDir = Plugin.PluginInterface.AssemblyLocation.DirectoryName;
-            if (baseDir == null) { DiagnosticLog.Warn("[DebugMenu] No plugin assembly directory -- can't start position log."); return; }
-            var dir = System.IO.Path.Combine(baseDir, "logs", "captures");
+            var logDir = DiagnosticLog.LogDirectory;
+            if (logDir == null) { DiagnosticLog.Warn("[DebugMenu] Disk logging is disabled -- can't start position log."); return; }
+            var dir = System.IO.Path.Combine(logDir, "captures");
             Directory.CreateDirectory(dir);
             positionLogPath = System.IO.Path.Combine(dir, $"positions-{DateTime.Now:yyyyMMdd-HHmmss}.csv");
             positionLogWriter = new StreamWriter(positionLogPath) { AutoFlush = false };
