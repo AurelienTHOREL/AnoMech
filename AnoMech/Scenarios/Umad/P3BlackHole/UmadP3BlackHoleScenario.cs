@@ -28,7 +28,8 @@ public sealed class UmadP3BlackHoleScenario : IScenario
 
     public IReadOnlyList<IScenarioAi> AiStrats =>
     [
-        new UmadP3BlackHoleAi(),
+        new UmadP3BlackHoleAi(UmadP3BlackHoleAi.TetherOrder.DpsSupportAccretion),
+        new UmadP3BlackHoleAi(UmadP3BlackHoleAi.TetherOrder.SupportDpsAccretion),
     ];
 
     private UmadP3BlackHoleState state = null!;
