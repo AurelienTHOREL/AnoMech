@@ -25,8 +25,9 @@ using Constants = UmadP1TeleTrouncingConstants;
 // them through SimNetworkPuppet's pending network moves.
 public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
 {
-    public string Name => "Tele-trouncing (WIP)";
+    public string Name => "Tele-trouncing";
     public IPhase Phase => UmadZone.P1;
+    public float BgmSecondsAtStart => Constants.BgmSecondsAtStart;
     public bool SupportsSolo => true;
     public bool SupportsMultiplayer => true;
     public IReadOnlyList<IScenarioAi> AiStrats => [new UmadP1TeleTrouncingAi()];
@@ -158,6 +159,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
         // first tick.
         foreach (var staleArrow in activeArrows.ToArray()) RemoveArrow(staleArrow);
         arrowPushLock.Clear();
+        arrowDwell.Clear();
         confusedWaitTimer.Clear();
         meleeDwellTimer.Clear();
         confusedChaseLastTarget.Clear();
@@ -312,7 +314,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
         world.Events.Add(14.42f, () => SpawnArrowBursts(first: true));
         world.Events.Add(15.29f, SpawnArrowObjects);
         world.Events.Add(17.43f, () => SpawnArrowBursts(first: false));
-        world.Events.Add(18.50f, SpawnArrowObjects);
+        world.Events.Add(18.32f, SpawnArrowObjects);
 
         // [15.67s] Graven Image (2.7s bar, resolves 18.66s); the tethers appear as it lands.
         world.Events.Add(15.67f, () => kefka?.Cast(
@@ -392,11 +394,15 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
         // Flagrant Fire III, 0.79s after the thunder lines.
         world.Events.Add(42.19f, ResolveFire);
 
-        // Arrow-soak failure: Kefka's lethal Light of Judgment once the whole mechanic has
-        // resolved. The cast start isn't from a capture (no failed-arrows pull on hand); it lands
-        // before the boss goes untargetable.
-        world.Events.Add(43.20f, StartArrowSoakPunishment);
-        world.Events.Add(48.20f, ResolveArrowSoakPunishment);
+        // We just gonna add a fake lethal raidwide here to pretend we wipe here if arrows are not
+        // soaked by the time confused runs out. The failure line is the real P1-end 0x05, pulled
+        // forward to 1s after the fire so nobody waits for the wipe.
+        world.Events.Add(ConfusedChaseEnd, JudgeArrowSoaks);
+        world.Events.Add(43.19f, PlayFailedP1EndLine);
+        world.Events.Add(44.19f, StartArrowSoakPunishment);
+        world.Events.Add(44.69f, ResolveArrowSoakPunishment);
+        world.Events.Add(44.47f, PlayFireLine);
+        world.Events.Add(52.67f, PlayP1EndLine);
 
         // [52.68s] Boss goes untargetable; the P2 actors spawn 2.2s later in the real fight.
         world.Events.Add(52.68f, EndP1);
@@ -411,19 +417,11 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
     {
         ActionTimelinePreload.Preload(ThunderFireTimelines, "UmadP1TeleTrouncing");
 
-        // Slot-0 (platform floor) catch-up, real AddEffect values: SetSharedTimelineState is
-        // diff-based, so walk the real sequence default -> 0x8 -> 0x20 in two beats. 2.0s clears
-        // the client's own post-zone-load resync (~1s). No catch-up DirectorUpdates: every one
-        // tried played Kefka voice lines from other mechanics.
-        instanceWorld.Events.Add(2.0f, () => instanceWorld.Map.AddEffect(packetFlags: 0x00080004U, index: (byte)0x00, broadcast: false));
-        instanceWorld.Events.Add(2.6f, () => instanceWorld.Map.AddEffect(packetFlags: 0x00200010U, index: (byte)0x00, broadcast: false));
+        instanceWorld.Events.Add(3f, () => instanceWorld.Map.LogArena("3s"));
+        instanceWorld.Events.Add(10f, () => instanceWorld.Map.LogArena("10s"));
 
-        // Real DirectorUpdates inside the window: between the debuff resolve and the first
-        // burst, ~1.65s after Mystery Magic's resolve, and at the P1->P2 hand-off. The cluster
-        // from pull-relative 203.92s on is that pull's wipe sequence, not a transition.
-        instanceWorld.Events.Add(13.96f, () => instanceWorld.Map.DirectorUpdate(0x80000027U, 0x3U, 0x2U, 0x1BDBU, 0x400250DCU, broadcast: false));
-        instanceWorld.Events.Add(42.91f, () => instanceWorld.Map.DirectorUpdate(0x80000027U, 0xCU, 0x2U, 0x1BDBU, 0x400250DCU, broadcast: false));
-        instanceWorld.Events.Add(51.11f, () => instanceWorld.Map.DirectorUpdate(0x80000027U, 0x8U, 0x2U, 0x1BDBU, 0x400250DCU, broadcast: false));
+        // Kefka's later lines depend on the arrow outcome, so the host schedules them in Run.
+        instanceWorld.Events.Add(15.58f, () => instanceWorld.Map.DirectorUpdate(0x80000027U, 0x3U, 0x2U, 0x1BDBU, 0x400250DCU, broadcast: false));
     }
 
     public MpMessage? BuildReplayStateMessage()
@@ -462,22 +460,14 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
                 obstacles.Add(new CircleObstacle(new Vector2(eo.Position.X, eo.Position.Z), ArrowTriggerRadius));
     }
 
-    // Stepping into a teleporter snaps you to its centre, then carries you a fixed distance in
-    // its facing (Bind, 1.00s, mid-slide). Checked every frame, since a bot or the real player
-    // can wander in at any time. Radius 2 is BossMod's own P1Arrow forbidden circle.
     private const float ArrowTriggerRadius = 2.0f;
     // Two arrows collide once their hitboxes touch.
     private const float ArrowCollideDistance = ArrowTriggerRadius * 2f;
 
-    // The push is not one motion: ~0.52s stationary at the teleport target, then a ~0.33s slide
-    // of ~6y (Step), then stationary again until Bind expires.
     private const float ArrowPushDistance = 6f; // == UmadP1TeleTrouncingState.Step
-    private const float ArrowPushHoldDelay = 0.52f;
-    private const float ArrowPushDuration = 0.334f;
-
-    // Bind's own duration. An extra second on top stretched the catch-to-catch cadence to ~2.0s
-    // against the real ~1.0s.
     private const float ArrowBindDuration = 1.000f;
+    private const float ArrowTriggerDwell = 0.35f;
+    private readonly Dictionary<(SimEventObject Arrow, PartyRole Role), float> arrowDwell = [];
 
     // A fresh arrow spawns under whoever's debuff just expired, who would retrigger it at once.
     // 3.00s is the real gap between the wave-1 and wave-2 expiries: the most that is still
@@ -495,8 +485,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
     // apply-to-expiry span.
     private const float ConfusedChaseStart = 29.09f;
     private const float ConfusedChaseEnd = 29.09f + 6.000f;
-    // Explicit design requirement: a walk, never a sprint (Follow takes a flat speed).
-    private const float ConfusedChaseSpeed = 6.5f; // AiManager.RunSpeed
+    private const float ConfusedChaseSpeed = 6f;
     private readonly Dictionary<PartyRole, float> arrowPushLock = [];
 
     // FFXIV's standard melee engagement range; ActionTimeline row 112 is "battle/auto_attack1",
@@ -505,11 +494,10 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
     private const float AutoAttackRange = 2.0f;
     public const ushort AutoAttackTimelineId = 112;
 
-    // From the user's description of the failure state, not a capture. ConfusedWaitDuration is a
-    // full freeze seeded when Confused first applies and after each kill; MeleeDwellDuration is
-    // continuous in-range time against the current target before the kill lands, so a chase
-    // that only closes the gap at the last moment can fail to land it.
+    // UNVERIFIED, from the user's description rather than a capture. The post-carry wait is what
+    // keeps a completed chain harmless: its last carry lands with ~1.5s of Confused left.
     private const float ConfusedWaitDuration = 1.000f;
+    private const float PostCarryWaitDuration = 2.000f;
     private readonly Dictionary<PartyRole, float> confusedWaitTimer = [];
     private const float MeleeDwellDuration = 1.000f;
     private readonly Dictionary<PartyRole, float> meleeDwellTimer = [];
@@ -598,7 +586,6 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
         statueCatchUpReadyAt = elapsed + 0.5f;   // let the beat's timeline start before polling it
     }
 
-    // The phase applies the haze hold at load (UmadZone.P1Haze); the settings knob toggles it live.
     private bool hazeHoldApplied;
 
     private void TickHazeHold()
@@ -620,9 +607,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
             var remaining = arrowPushLock[role] - delta;
             if (remaining > 0f) { arrowPushLock[role] = remaining; continue; }
             arrowPushLock.Remove(role);
-            // Being carried by an arrow doesn't count as able to walk (user's call), so the
-            // freeze applies to this transition too.
-            confusedWaitTimer[role] = ConfusedWaitDuration;
+            confusedWaitTimer[role] = PostCarryWaitDuration;
         }
 
         if (activeArrows.Count == 0) return;
@@ -660,7 +645,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
             if (lifespan <= 0f)
             {
                 NoteArrowSoakFailure($"the arrow at ({arrow.Position.X:F1},{arrow.Position.Z:F1}) expired unused at t={elapsed:F2}s ({ArrowLifespanAfterSpawn:F2}s after it spawned)");
-                RemoveArrow(arrow);
+                RetireArrow(arrow);
                 continue;
             }
             arrowLifespan[arrow] = lifespan;
@@ -674,13 +659,17 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
             foreach (var role in state.Debuffs.Keys)
             {
                 if (party.Get(role) is not { } member) continue;
-                // Arrows sit one push-distance apart, so a push routinely lands on the next arrow;
-                // gating on the full Bind lock (not just IsEasedMoving) gives the real ~1.0s
-                // catch-to-catch cadence. The arrow stays live, just not eligible.
-                if (arrowPushLock.GetValueOrDefault(role) > 0f) continue;
                 var dx = member.Position.X - arrow.Position.X;
                 var dz = member.Position.Z - arrow.Position.Z;
-                if (dx * dx + dz * dz > ArrowTriggerRadius * ArrowTriggerRadius) continue;
+                if (dx * dx + dz * dz > ArrowTriggerRadius * ArrowTriggerRadius)
+                {
+                    arrowDwell.Remove((arrow, role));
+                    continue;
+                }
+                // Counts through a carry, so a ride ending on the next arrow fires it as Bind lifts.
+                var dwell = arrowDwell.GetValueOrDefault((arrow, role)) + delta;
+                arrowDwell[(arrow, role)] = dwell;
+                if (dwell < ArrowTriggerDwell || arrowPushLock.GetValueOrDefault(role) > 0f) continue;
                 // Logged unconditionally with positions, so an early trigger can be checked
                 // against the knockback's own logged spots.
                 var confused = member.HasStatus(Constants.StatusId.Confused);
@@ -690,7 +679,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
                 if (confused) arrowsSoakedByConfused++;
                 else NoteArrowSoakFailure($"{role} used the arrow at ({arrow.Position.X:F1},{arrow.Position.Z:F1}) at t={elapsed:F2}s while not Confused");
                 UseArrow(role, member, arrow);
-                RemoveArrow(arrow);
+                RetireArrow(arrow);
                 break;
             }
         }
@@ -702,6 +691,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
         activeArrows.Remove(arrow);
         arrowGrace.Remove(arrow);
         arrowLifespan.Remove(arrow);
+        foreach (var key in arrowDwell.Keys.Where(k => k.Arrow == arrow).ToArray()) arrowDwell.Remove(key);
     }
 
     private bool ArrowSoakFailed => arrowSoakFailures.Count > 0 || arrowsSoakedByConfused < arrowsPlaced;
@@ -712,9 +702,7 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
         DiagnosticLog.Warn($"[UmadP1TeleTrouncing] Arrow-soak failure {arrowSoakFailures.Count}: {what}.");
     }
 
-    // Nothing on a clean set, otherwise Light of Judgment with the reasons printed. Every arrow
-    // has resolved by now (the last expire ~36.8s).
-    private void StartArrowSoakPunishment()
+    private void JudgeArrowSoaks()
     {
         var summary = $"{arrowsSoakedByConfused}/{arrowsPlaced} arrows soaked by Confused players";
         if (!ArrowSoakFailed)
@@ -722,11 +710,29 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
             DiagnosticLog.Info($"[UmadP1TeleTrouncing] Arrow soaks passed: {summary}.");
             return;
         }
-        var reasons = string.Join("; ", arrowSoakFailures);
-        DiagnosticLog.Warn($"[UmadP1TeleTrouncing] Arrow soaks FAILED ({summary}): {reasons} -- Kefka casts Light of Judgment.");
-        world.Announce($"Not all arrows were soaked by confused players ({summary}): {reasons}.");
-        kefka?.Cast(UmadConstants.ActionId.LightOfJudgment_Enrage, castSeconds: Constants.CastBar.Long, fireDelay: Constants.CastBar.FireDelay,
-            animationLock: Constants.AnimationLock.LightOfJudgment, targetId: kefka?.GameObjectId);
+        DiagnosticLog.Warn($"[UmadP1TeleTrouncing] Arrow soaks FAILED ({summary}): {string.Join("; ", arrowSoakFailures)}.");
+    }
+
+    private void PlayFireLine()
+    {
+        if (!ArrowSoakFailed) world.Map.DirectorUpdate(0x80000027U, 0xCU, 0x2U, 0x1BDBU, 0x400250DCU);
+    }
+
+    private void PlayFailedP1EndLine()
+    {
+        if (ArrowSoakFailed) world.Map.DirectorUpdate(0x80000027U, 0x5U, 0x2U, 0x1BDBU, 0x400250DCU);
+    }
+
+    private void PlayP1EndLine()
+    {
+        if (!ArrowSoakFailed) world.Map.DirectorUpdate(0x80000027U, 0xDU, 0x2U, 0x1BDBU, 0x400250DCU);
+    }
+
+    private void StartArrowSoakPunishment()
+    {
+        if (!ArrowSoakFailed) return;
+        var summary = $"{arrowsSoakedByConfused}/{arrowsPlaced} arrows soaked by Confused players";
+        world.Announce($"Not all arrows were soaked by confused players ({summary}): {string.Join("; ", arrowSoakFailures)}.");
     }
 
     private void ResolveArrowSoakPunishment()
@@ -737,14 +743,32 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
             if (party.Get(role) is { } member && member.IsAlive())
                 member.Die("Not all arrows were soaked by confused players");
         }
+        kefka?.SetTargetable(false);
+        kefka?.SetVisible(false);
     }
 
-    // The real TelePortent flips to EventState 7 and is never despawned, but SetState(7) hides
-    // nothing in this engine (the arrow stayed visible in-game), so Despawn.
+    // Collisions and resets only: a used or expired arrow is retired, not removed.
     private void RemoveArrow(SimEventObject arrow)
     {
         UntrackArrow(arrow);
         arrow.Despawn();
+    }
+
+    private void RetireArrow(SimEventObject arrow)
+    {
+        UntrackArrow(arrow);
+        switch (settingsWindow.Overrides.ArrowSoak)
+        {
+            case ArrowSoakMode.SetSharedTimelineState:
+                arrow.PlayBeat(Constants.EObjState.TelePortentUsed, 0, PropBeatMode.SetSharedTimelineState);
+                break;
+            case ArrowSoakMode.Despawn:
+                arrow.Despawn();
+                break;
+            default:
+                arrow.DirectorEObjMod(Constants.EObjState.TelePortentUsed);
+                break;
+        }
     }
 
     // Confused roles chase their live nearest ally every tick (party.Find.Closest excludes the
@@ -849,24 +873,15 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
         }
     }
 
-    // Reads arrow.Position before RemoveArrow despawns it. The push is scheduled
-    // ArrowPushHoldDelay later (Events.Add is already relative to now). arrowPushLock covers
-    // hold+slide so Follow doesn't resume mid-hold. Follow(null) is load-bearing: TickFollow
-    // re-issues the old follow every tick and PushInDirectionEased reads the position when it
-    // fires, so the push origin drifted off the arrow's centre.
+    // Follow(null) first, or TickFollow re-issues the chase under the carry.
     private void UseArrow(PartyRole role, SimCharacter member, SimEventObject arrow)
     {
         member.Follow(null);
-        var snap = new Placement(arrow.Position, member.Rotation);
-        if (member is ISimPartyMember pm) pm.TeleportTo(snap);
-        else member.SetPosition(snap);
         member.AddStatus(Constants.StatusId.Bind, ArrowBindDuration);
         arrowPushLock[role] = ArrowBindDuration;
         var heading = arrow.Rotation;
-        world.Events.Add(ArrowPushHoldDelay, () =>
-        {
-            if (member.IsAlive()) (member as ISimPartyMember)?.PushInDirectionEased(heading, ArrowPushDistance, ArrowPushDuration);
-        });
+        var destination = arrow.Position + new Vector3(MathF.Sin(heading), 0f, MathF.Cos(heading)) * ArrowPushDistance;
+        (member as ISimPartyMember)?.CarryTo(destination, settingsWindow.Overrides.ArrowCarry);
     }
 
     // Heading as SimCast's facing calc: south=0, increasing clockwise toward east (north matches
@@ -917,10 +932,16 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
     {
         foreach (var placement in pendingArrowPlacements.Values)
         {
+            // ActorControl 106 routes by entity id; an arrow left at 0 never receives it.
             var arrow = world.SpawnEventObject(new EventObjectSpawnConfig
             {
                 EObjId = Constants.EObjId.TelePortent,
                 Placement = placement,
+                TargetableStatus = 5,
+                EventId = Constants.EObjId.PropEventId,
+                EntityId = Constants.Spawn.TelePortentEntityIdBase + (uint)arrowsPlaced,
+                Arg2 = ((uint)(Constants.Spawn.TelePortentArg2Serial + arrowsPlaced) << 16) | 0x3U,
+                HideAtState = (ushort)Constants.EObjState.TelePortentUsed,
             });
             if (arrow == null)
             {
@@ -1172,12 +1193,9 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
             var confused = UmadP1TeleTrouncingState.IsDps(role) == state.DpsGetsConfused;
             if (party.Get(role) is not { } member || !member.IsAlive()) continue;
             member.AddStatus(confused ? Constants.StatusId.Confused : Constants.StatusId.Sleep, 6.000f);
-            if (confused)
-            {
-                // The initial freeze before this role's first walk.
-                confusedWaitTimer[role] = ConfusedWaitDuration;
-            }
-            else
+            // No freeze on apply: confused players walk at once, and a freeze pushed the last arrow
+            // past its expiry.
+            if (!confused)
             {
                 // Otherwise a slept doppel stands in its normal idle.
                 member.PlayActionTimeline(SleepPoseTimelineId);
@@ -1373,8 +1391,12 @@ public sealed class UmadP1TeleTrouncingScenario : IMultiplayerReplayable
     private void EndP1()
     {
         thunderReals.Clear();
-        kefka?.SetTargetable(false);
-        kefka?.SetVisible(false);
+        // A failed set keeps Kefka up for the deaths; ResolveArrowSoakPunishment hides him.
+        if (!ArrowSoakFailed)
+        {
+            kefka?.SetTargetable(false);
+            kefka?.SetVisible(false);
+        }
         confusedStatue?.SetVisible(false);
         sleepStatue?.SetVisible(false);
         // The EObj slots are released a beat later by DespawnGazeProps so the animation plays.

@@ -151,6 +151,9 @@ public static class UmadP3LimitCutConstants
         public const float LimitBreakSeconds = 8f;
     }
 
+    // The real track starts 116.67s before the Umbra Smash cast.
+    public const float BgmSecondsAtStart = 108.67f;
+
     // Offsets from the Umbra Smash cast start. Scenario time = these + UmbraCastAt.
     public static class Timing
     {

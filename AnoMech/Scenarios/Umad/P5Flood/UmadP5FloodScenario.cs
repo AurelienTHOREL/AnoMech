@@ -21,15 +21,16 @@ namespace AnoMech.Scenarios.Umad.P5Flood;
 // Exaflares in the real fight. Kefka casts FloodCast (a pure windup) while two crossing diagonal
 // lines each march across the arena through 4 fixed points over 4 ticks (~1.02s apart), one
 // diagonal per tick, alternating; each tick also lands ChaoticFlood, a 6y stack on a random
-// non-tank. Flood happens before P5's arena has visibly changed (MapEffect slots 0x14-0x21
-// still uniform 0x00010001), hence its own UmadZone.P5Flood phase.
+// non-tank.
 //
 // Multiplayer: the waves and the stack fire as NativeActionEffects, which peers replay field
 // for field (EnemyState.LastInstantCastIsNativeEffect); the RawPacket delivery knob is host-only.
 public sealed class UmadP5FloodScenario : IMultiplayerReplayable
 {
     public string Name => "Flood";
-    public IPhase Phase => UmadZone.P5Flood;
+    public IPhase Phase => UmadZone.P5;
+    // The real track starts 39.83s before the Flood cast.
+    public float BgmSecondsAtStart => 39.53f;
     public bool SupportsSolo => true;
     public bool SupportsMultiplayer => true;
     public IReadOnlyList<IScenarioAi> AiStrats => [new UmadP5FloodAi()];

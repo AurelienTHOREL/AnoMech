@@ -8,8 +8,10 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
 {
     public UmadP1TeleTrouncingStateOverrides Overrides { get; } = new();
 
-    // Index-aligned with PropBeatMode.
+    // Index-aligned with PropBeatMode, ArrowSoakMode and CarryMode.
     private static readonly string[] BeatModeLabels = ["ActorControl 413", "PlayAnimation", "SetSharedTimelineState"];
+    private static readonly string[] SoakModeLabels = ["ActorControl 106", "SetSharedTimelineState", "Despawn"];
+    private static readonly string[] CarryModeLabels = ["ActorControl 241", "ActorControl 241, self-targeted", "Sim slide"];
 
     // fireAppear/fireWindUp: fire the statue beats right now (null while no run is active), so
     // the props can be exercised without waiting out the timeline each time.
@@ -28,6 +30,7 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
             DrawThunderOffset();
             DrawPropKnobs();
             DrawPropBeatRow(fireAppear, fireWindUp);
+            DrawArrowRows();
             DrawHazeRow();
             SettingsGrid.End();
         }
@@ -48,8 +51,24 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
         ImGui.EndDisabled();
     }
 
+    private void DrawArrowRows()
+    {
+        SettingsGrid.Row("Arrow soak (debug):");
+        var soakIdx = (int)Overrides.ArrowSoak;
+        SettingsGrid.ItemWidth(170);
+        if (ImGui.Combo("##arrowsoak", ref soakIdx, SoakModeLabels, SoakModeLabels.Length))
+            Overrides.ArrowSoak = (ArrowSoakMode)soakIdx;
+        SettingsGrid.Row("Arrow carry (debug):");
+        var carryIdx = (int)Overrides.ArrowCarry;
+        SettingsGrid.ItemWidth(170);
+        if (ImGui.Combo("##arrowcarry", ref carryIdx, CarryModeLabels, CarryModeLabels.Length))
+            Overrides.ArrowCarry = (AnoMech.Core.Native.CarryMode)carryIdx;
+    }
+
     private void ResetAll()
     {
+        Overrides.ArrowSoak = ArrowSoakMode.SetSharedTimelineState;
+        Overrides.ArrowCarry = AnoMech.Core.Native.CarryMode.Native;
         Overrides.DpsGetsDifferent = null;
         Overrides.GazeInverted = null;
         Overrides.FireIsStack = null;
@@ -61,14 +80,18 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
         Overrides.PropsForceActive = false;
         Overrides.PropsStaticVfxTest = false;
         Overrides.PropsBeatMode = PropBeatMode.ActorControl;
-        Overrides.HoldHaze = true;
+        Overrides.HoldHaze = false;
+        UmadZone.SuppressP1Scenery = false;
     }
 
     private void DrawHazeRow()
     {
-        SettingsGrid.Row("Zone haze (debug):");
+        SettingsGrid.Row("Zone (debug):");
         var haze = Overrides.HoldHaze;
         if (ImGui.Checkbox("Hold P1 haze##holdhaze", ref haze)) Overrides.HoldHaze = haze;
+        ImGui.SameLine();
+        var scenery = UmadZone.SuppressP1Scenery;
+        if (ImGui.Checkbox("Deactivate scenery SGs##scenerysg", ref scenery)) UmadZone.SuppressP1Scenery = scenery;
     }
 
     private void DrawPropKnobs()

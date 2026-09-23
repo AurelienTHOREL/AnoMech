@@ -301,19 +301,23 @@ public unsafe class MainWindow : Window, IDisposable
         ImGui.SameLine();
         DrawResetLeaveButtons();
 
-        var blocked = ZoneSession.StartBlockedReason();
-        var envReady = blocked == null;
+        var blocked = ZoneSession.StartBlockedReason(out var settling);
+        var waiting = game.StartWaitingOn;
+        var envReady = (blocked == null || settling != null) && waiting == null;
         var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
         if (_selectedScenario.SupportsSolo)
         {
             ImGui.BeginDisabled(!envReady || mpBlocked);
-            if (ImGui.Button("Start Solo")) game.RunScenario(_selectedScenario, _roleOverride, selectedAi: null, _selectedWaymark);
+            if (ImGui.Button($"{(waiting != null ? "Waiting to start..." : "Start Solo")}###startSolo"))
+                game.RunScenario(_selectedScenario, _roleOverride, selectedAi: null, _selectedWaymark);
             ImGui.EndDisabled();
             if ((!envReady || mpBlocked) && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             {
                 ImGui.SetTooltip(mpBlocked
                     ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
-                    : $"Cannot start: {blocked}.");
+                    : waiting != null
+                        ? $"Waiting for {waiting} to settle before starting..."
+                        : $"Cannot start: {blocked}.");
             }
         }
 
@@ -399,22 +403,26 @@ public unsafe class MainWindow : Window, IDisposable
     internal void DrawSoloStartButton()
     {
         if (_selectedScenario == null) return;
-        var blocked = ZoneSession.StartBlockedReason();
+        var blocked = ZoneSession.StartBlockedReason(out var settling);
+        var waiting = plugin.Game.StartWaitingOn;
         var hasStrat = HasStartableStrat();
         // The solo path bypasses MultiplayerManager: a host would run the fight without a
         // StartMessage, a peer would start a second independent simulation.
         var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
-        var canStart = blocked == null && hasStrat && !mpBlocked;
+        var canStart = (blocked == null || settling != null) && waiting == null && hasStrat && !mpBlocked;
         ImGui.BeginDisabled(!canStart);
-        if (ImGui.Button("Start")) plugin.Game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
+        if (ImGui.Button($"{(waiting != null ? "Waiting to start..." : "Start")}###start"))
+            plugin.Game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
         ImGui.EndDisabled();
         if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
             ImGui.SetTooltip(mpBlocked
                 ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
-                : blocked != null
-                    ? $"Cannot start: {blocked}."
-                    : "No strat available for this region yet.");
+                : waiting != null
+                    ? $"Waiting for {waiting} to settle before starting..."
+                    : blocked != null
+                        ? $"Cannot start: {blocked}."
+                        : "No strat available for this region yet.");
         }
     }
 

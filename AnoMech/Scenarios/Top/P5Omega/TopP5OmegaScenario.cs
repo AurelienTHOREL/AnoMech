@@ -359,7 +359,7 @@ public sealed class TopP5OmegaScenario : IMultiplayerReplayable
 
     public MpMessage? BuildReplayStateMessage()
         => LastState is { } s ? new TopP5OmegaAiReplayStateMessage(
-            s.HelloWorldTargets.List, s.DoubleDynamicTargets.List, s.MonitorTargets.List,
+            s.HelloWorldTargets.List, s.DoubleDynamicTargets.List, s.MonitorTargets.List, s.HelloWorld1JumpOrder.List,
             s.AttackDirections.Select(d => d.RadiansFromNorth).ToArray(), s.OmegaAttacks.ToArray(),
             s.BettleSpawnDirection.RadiansFromNorth, s.FirstWaveCannonFront, s.MonitorSide == MonitorSide.Left)
         : null;
@@ -368,7 +368,8 @@ public sealed class TopP5OmegaScenario : IMultiplayerReplayable
     {
         if (message is not TopP5OmegaAiReplayStateMessage msg) return null;
         var shadowState = TopP5OmegaState.FromNetworkReplay(
-            replayWorld.Party, msg.HelloWorldTargets, msg.DoubleDynamicTargets, msg.MonitorTargets, msg.AttackDirectionsRadians,
+            replayWorld.Party, msg.HelloWorldTargets, msg.DoubleDynamicTargets, msg.MonitorTargets, msg.HelloWorld1JumpOrder,
+            msg.AttackDirectionsRadians,
             msg.OmegaAttacks, msg.BettleSpawnDirectionRadians, msg.FirstWaveCannonFront, msg.MonitorIsLeft);
         ((IScenarioAi<TopP5OmegaState>)AiStrats[aiIndex]).Run(shadowState, replayWorld);
         return shadowState;

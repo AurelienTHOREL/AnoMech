@@ -26,6 +26,8 @@ internal class Movement(SimCharacter parent)
     private float? easeDuration;
     private float easeElapsed;
     private Vector3 easeStart;
+    private float easeDelay;
+    private bool easeOut;
 
     private SimCharacter? followTarget;
     private bool followForced;
@@ -167,6 +169,17 @@ internal class Movement(SimCharacter parent)
         easeElapsed = 0f;
     }
 
+    public void Carry(Vector3 destination, float delaySeconds, float durationSeconds)
+    {
+        var start = parent.Position;
+        InternalMoveTo(destination, 0f, tl: KnockbackTimelineId, baseOverride: false, faceTravel: false, avoid: false);
+        easeStart = start;
+        easeDuration = MathF.Max(0.01f, durationSeconds);
+        easeElapsed = 0f;
+        easeDelay = MathF.Max(0f, delaySeconds);
+        easeOut = true;
+    }
+
     // Shared move entry for MoveTo (locomotion) and Knockback (one-shot action).
     // `baseOverride` selects the animation mechanism in StartAnim: true for a
     // looping locomotion clip (run/walk), false for a one-shot action timeline
@@ -189,6 +202,8 @@ internal class Movement(SimCharacter parent)
         this.avoid = avoid;
         // A stale ease must not carry onto a fixed-speed move.
         easeDuration = null;
+        easeDelay = 0f;
+        easeOut = false;
         var sameAnim = animActive && timelineId == tl;
         timelineId = tl;
         timelineBaseOverride = baseOverride;
@@ -218,9 +233,10 @@ internal class Movement(SimCharacter parent)
         // Eased moves have their own path: the fixed-speed branch would treat speed 0 as "arrived".
         if (easeDuration is { } duration)
         {
+            if (easeDelay > 0f) { easeDelay -= deltaSeconds; return; }
             easeElapsed += deltaSeconds;
             var t = Math.Clamp(easeElapsed / duration, 0f, 1f);
-            var eased = t * t * (3f - 2f * t); // smoothstep
+            var eased = easeOut ? 1f - (1f - t) * (1f - t) * (1f - t) : t * t * (3f - 2f * t);
             var next = Vector3.Lerp(easeStart, dest, eased);
             parent.SetPosition(new Placement(next, parent.Rotation));
             if (t >= 1f) Stop();

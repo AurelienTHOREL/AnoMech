@@ -61,6 +61,11 @@ public sealed partial class MultiplayerManager
                 _ = relay!.SendAsync(new PushMessage(role, push.Heading, push.Distance, push.Speed, push.DurationSeconds));
                 puppet.ClearPendingNetworkPush();
             }
+            if (puppet.PendingNetworkCarry is { } carry)
+            {
+                _ = relay!.SendAsync(new CarryMessage(role, carry.Destination.X, carry.Destination.Y, carry.Destination.Z, (int)carry.Mode));
+                puppet.ClearPendingNetworkCarry();
+            }
         }
 
         var liveEnemies = world.Children.OfType<SimEnemy>().Where(e => e.IsActive).ToList();
@@ -209,7 +214,8 @@ public sealed partial class MultiplayerManager
                 eo.Position.X, eo.Position.Y, eo.Position.Z, eo.Rotation, eo.LayoutId,
                 eventId, eoConfig?.EntityId ?? 0u, eoConfig?.TargetableStatus ?? 1, eoConfig?.Arg2 ?? 0u, eoConfig?.MuteSound ?? false,
                 eo.LastAnimation?.State, eo.LastAnimation?.Bitmask, eo.AnimationSeq,
-                eo.LastBeatMode, eoConfig?.ForceSharedGroupActive ?? false, eo.FadeOutSeq));
+                eo.LastBeatMode, eoConfig?.ForceSharedGroupActive ?? false, eo.FadeOutSeq,
+                eo.LastDirectorState, eo.DirectorModSeq, eoConfig?.HideAtState ?? (ushort)0));
         }
 
         return relay!.SendAsync(new WorldSnapshotMessage(enemies, tethers, eventObjects));

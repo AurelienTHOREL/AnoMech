@@ -892,14 +892,19 @@ public sealed unsafe class SimEnemy : SimNpc
             DiagnosticLog.Info($"[SimEnemy.ReconcileVisibility] {DisplayName} (BNpcBase {BNpcBaseId}, goid {GameObjectId}) first tick: desiredVisible={desiredVisible} currentVisible={currentVisible} DrawObject={(chara == null ? "no BattleChara" : chara->DrawObject == null ? "null" : "present")}.");
         }
 
+        var obj = BattleCharaPtr;
+        // A model still streaming when it was hidden shows itself again once its load completes,
+        // so a hidden enemy is checked against the live flag every tick.
+        var reshown = !desiredVisible && currentVisible == desiredVisible
+                      && obj != null && obj->DrawObject != null && obj->DrawObject->IsVisible;
+
         // One explicit native write on the first tick regardless of agreement: currentVisible's
         // initial true is an assumption, and a peer's reconstructed doppel was hidden despite it.
-        if (!firstTick && desiredVisible == currentVisible)
+        if (!firstTick && desiredVisible == currentVisible && !reshown)
         {
             return;
         }
 
-        var obj = BattleCharaPtr;
         if (obj == null || obj->DrawObject == null)
         {
             return;
@@ -908,8 +913,17 @@ public sealed unsafe class SimEnemy : SimNpc
         obj->DrawObject->IsVisible = desiredVisible;
         currentVisible = desiredVisible;
 
+        if (reshown)
+        {
+            if (!loggedReshown)
+                DiagnosticLog.Info($"[SimEnemy.ReconcileVisibility] {DisplayName} (BNpcBase {BNpcBaseId}, goid {GameObjectId}) was shown again by the engine while hidden -- hid it again at pos {Position}.");
+            loggedReshown = true;
+            return;
+        }
         DiagnosticLog.Info($"[SimEnemy.ReconcileVisibility] {DisplayName} (BNpcBase {BNpcBaseId}, goid {GameObjectId})'s visibility was set to {desiredVisible} at pos {Position}");
     }
+
+    private bool loggedReshown;
 
     // Authoritative draw state (DrawObject.Flags bits 0 and 3, set by Enable/DisableDraw).
     // False during the async model-load window where DrawObject is still null.

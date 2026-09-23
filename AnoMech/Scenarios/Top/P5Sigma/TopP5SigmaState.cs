@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
@@ -39,6 +40,10 @@ namespace AnoMech.Scenarios.Top.P5Sigma
         // choose different hand-bait targets than the host's bots did.
         public RoleList HandBait { get; }
 
+        // The other four, in the order TopP5SigmaAi marks and places them; resolved here for the
+        // same reason as HandBait.
+        public RoleList HelloWorldJumpOrder { get; }
+
         public readonly Tower?[] Towers;
 
         public int FirstMissing;
@@ -70,6 +75,8 @@ namespace AnoMech.Scenarios.Top.P5Sigma
             }.Build(party);
 
             HandBait = DynamisTargets.Random(rng, 2, HelloWorldTargets.List);
+            HelloWorldJumpOrder = new RoleList(party, Enum.GetValues<PartyRole>())
+                .Random(rng, 4, HelloWorldTargets.List.Concat(HandBait.List).ToArray());
 
             Towers = (GlitchType == GlitchType.Mid ? MidGlitchTowers : FarGlitchTowers)
                      .Select(t => t == null ? t : t with { Position = AdjustedNorthA.Apply(t.Position) })
@@ -83,8 +90,9 @@ namespace AnoMech.Scenarios.Top.P5Sigma
         // chosen is carried as a bool.
         private TopP5SigmaState(
             SimParty party, PartyRole[] order, PartyRole[] dynamisTargets, PartyRole[] helloWorldTargets,
-            PartyRole[] handBait, float newNorthARadians, float newNorthBRadians, bool towerNorthFlipped,
-            bool glitchIsFar, bool spinnerIsClockwise, bool omegaFIsStaff, int firstMissing, int secondMissing)
+            PartyRole[] handBait, PartyRole[] helloWorldJumpOrder, float newNorthARadians, float newNorthBRadians,
+            bool towerNorthFlipped, bool glitchIsFar, bool spinnerIsClockwise, bool omegaFIsStaff, int firstMissing,
+            int secondMissing)
         {
             Order = new RoleList(party, order);
             WaveCannonTargets = RoleList.Empty();
@@ -97,6 +105,7 @@ namespace AnoMech.Scenarios.Top.P5Sigma
             OmegaFAttack = omegaFIsStaff ? OmegaAttack.Staff : OmegaAttack.Legs;
             HelloWorldTargets = new RoleList(party, helloWorldTargets);
             HandBait = new RoleList(party, handBait);
+            HelloWorldJumpOrder = new RoleList(party, helloWorldJumpOrder);
             Towers = [];
             FirstMissing = firstMissing;
             SecondMissing = secondMissing;
@@ -104,10 +113,12 @@ namespace AnoMech.Scenarios.Top.P5Sigma
 
         public static TopP5SigmaState FromNetworkReplay(
             SimParty party, PartyRole[] order, PartyRole[] dynamisTargets, PartyRole[] helloWorldTargets,
-            PartyRole[] handBait, float newNorthARadians, float newNorthBRadians, bool towerNorthFlipped,
-            bool glitchIsFar, bool spinnerIsClockwise, bool omegaFIsStaff, int firstMissing, int secondMissing)
-            => new(party, order, dynamisTargets, helloWorldTargets, handBait, newNorthARadians, newNorthBRadians,
-                   towerNorthFlipped, glitchIsFar, spinnerIsClockwise, omegaFIsStaff, firstMissing, secondMissing);
+            PartyRole[] handBait, PartyRole[] helloWorldJumpOrder, float newNorthARadians, float newNorthBRadians,
+            bool towerNorthFlipped, bool glitchIsFar, bool spinnerIsClockwise, bool omegaFIsStaff, int firstMissing,
+            int secondMissing)
+            => new(party, order, dynamisTargets, helloWorldTargets, handBait, helloWorldJumpOrder, newNorthARadians,
+                   newNorthBRadians, towerNorthFlipped, glitchIsFar, spinnerIsClockwise, omegaFIsStaff, firstMissing,
+                   secondMissing);
 
 
         // MidGlitch: 6 towers on the 22.5°-offset inner ring at radius 17, rotated so the two

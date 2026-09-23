@@ -284,7 +284,8 @@ public sealed class Plugin : IDalamudPlugin
 
     private void StartSelectedScenario(bool solo)
     {
-        if (ZoneSession.StartBlockedReason() is { } blocked)
+        // A settle only delays the start; Game.RunScenario waits it out.
+        if (ZoneSession.StartBlockedReason(out var settling) is { } blocked && settling == null)
         {
             Log.Warning($"Cannot start a scenario: {blocked}.");
             return;

@@ -1,10 +1,21 @@
+using AnoMech.Core.Native;
 using AnoMech.Core.SimObjects;
 
 namespace AnoMech.Scenarios.Umad.P1TeleTrouncing;
 
+public enum ArrowSoakMode
+{
+    DirectorEObjMod,
+    SetSharedTimelineState,
+    Despawn,
+}
+
 // null/default leaves the field randomized at scenario start.
 public sealed class UmadP1TeleTrouncingStateOverrides
 {
+    // 106 through the dispatcher leaves our arrows untouched: the director never registered them.
+    public ArrowSoakMode ArrowSoak { get; set; } = ArrowSoakMode.SetSharedTimelineState;
+    public CarryMode ArrowCarry { get; set; } = CarryMode.Native;
     // true = DPS gets the "different" arrow pairs; false = supports do.
     public bool? DpsGetsDifferent { get; set; }
 
@@ -32,7 +43,5 @@ public sealed class UmadP1TeleTrouncingStateOverrides
     // ActorControl is the real server packet through the client's own dispatcher.
     public PropBeatMode PropsBeatMode { get; set; } = PropBeatMode.ActorControl;
 
-    // Hold the zone's fog at its load value (UmadZone.P1Haze) for the whole phase, as the real
-    // P1 does.
-    public bool HoldHaze { get; set; } = true;
+    public bool HoldHaze { get; set; } = false;
 }

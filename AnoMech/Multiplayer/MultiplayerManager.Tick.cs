@@ -197,6 +197,9 @@ public sealed partial class MultiplayerManager
             return;
         }
 
+        if (IsHost) RetryWaitingStart();
+        else AnswerStartCheck(deltaSeconds);
+
         if (!running) return;
 
         if (IsHost)

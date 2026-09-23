@@ -64,6 +64,9 @@ public class EventObjectSpawnConfig
     // attached and after every beat.
     public bool ForceSharedGroupActive { get; init; } = false;
 
+    // For a prop whose SGB has no timeline for that state (the teleporters).
+    public ushort HideAtState { get; init; } = 0;
+
     public unsafe SpawnObjectPacket ToPacket(Coordinates coordinates)
     {
         var objectIndex = sbyte.Max(-1, ObjectIndex);
@@ -273,6 +276,24 @@ public unsafe class SimEventObject : ISimObject, IPositioned
         PacketDispatcher.HandleActorControlPacket(obj->EntityId, 607, obj->EntityId, 1, 0, 100, 0, 0, 0, 0, 0xE0000000, false);
     }
 
+    public uint LastDirectorState { get; private set; }
+    public int DirectorModSeq { get; private set; }
+
+    public void DirectorEObjMod(uint state)
+    {
+        LastDirectorState = state;
+        DirectorModSeq++;
+        if (obj == null) return;
+        var eo = (EventObject*)obj;
+        var before = eo->SharedTimelineState;
+        PacketDispatcher.HandleActorControlPacket(obj->EntityId, 106, state, 0, 0, 0, 0, 0, 0, 0, 0xE0000000, false);
+        animCheckFrames = 0;
+        if (MuteSound) Native.LayoutInstanceDiagnostics.SilenceSounds(eo->SharedGroupLayoutInstance);
+        DiagnosticLog.Info(
+            $"[SimEventObject] {DisplayName} DirectorEObjMod({state}) entity=0x{obj->EntityId:X} EventId=0x{(uint)obj->EventId:X}: "
+            + $"SharedTimelineState 0x{before:X} -> 0x{eo->SharedTimelineState:X} -- SG: {LayoutInstanceDiagnostics.Describe(eo->SharedGroupLayoutInstance)}");
+    }
+
     public void PlayBeat(uint state, uint bitmask, PropBeatMode mode)
     {
         LastAnimation = (state, bitmask);
@@ -306,11 +327,13 @@ public unsafe class SimEventObject : ISimObject, IPositioned
             DiagnosticLog.Warn($"[SimEventObject.PlayAnimation] {DisplayName} {mode}(0x{state:X},0x{bitmask:X}) threw ({e.GetType().Name}); falling back to SetState.");
             EventObjectHelper.SetState(obj, (ushort)state);
         }
+        var hidden = SpawnConfig is { HideAtState: > 0 } config && config.HideAtState == state
+            && Native.LayoutInstanceDiagnostics.Deactivate(eo->SharedGroupLayoutInstance);
         // The SGB timeline turns the Sound children back on; mute them again right after.
         if (MuteSound) Native.LayoutInstanceDiagnostics.SilenceSounds(eo->SharedGroupLayoutInstance);
         DiagnosticLog.Info(
             $"[SimEventObject.PlayAnimation] {DisplayName} {mode}(0x{state:X},0x{bitmask:X}) entity=0x{obj->EntityId:X} -> "
-            + $"SharedTimelineState=0x{eo->SharedTimelineState:X} -- SG: {LayoutInstanceDiagnostics.Describe(eo->SharedGroupLayoutInstance)}");
+            + $"SharedTimelineState=0x{eo->SharedTimelineState:X}{(hidden ? " (SharedGroup switched off)" : "")} -- SG: {LayoutInstanceDiagnostics.Describe(eo->SharedGroupLayoutInstance)}");
     }
 
     private void EnsureSharedGroupActive(string when)

@@ -303,11 +303,9 @@ public sealed partial class MultiplayerManager
                 OnStartReceived(start.Clock);
                 break;
             case StartCheckMessage when !IsHost:
-            {
-                var reason = CheckOwnStartReadiness();
-                _ = relay?.SendAsync(new StartCheckResponseMessage(MyPeerId, reason == null, reason));
+                startCheckReplyWaited = 0f;
+                AnswerStartCheck(0f);
                 break;
-            }
             case StartCheckResponseMessage resp when IsHost:
                 DiagnosticLog.Info($"[Multiplayer] StartCheck reply from {Session.NameOf(resp.PeerId)}: ready={resp.Ready}{(resp.Reason is { } r ? $" ({NetGuard.Clean(r)})" : "")}.");
                 // A duplicate/stale reply, or the timeout already gave up on this peer.
@@ -342,6 +340,9 @@ public sealed partial class MultiplayerManager
                 break;
             case PushMessage push when !IsHost:
                 OnPushReceived(push);
+                break;
+            case CarryMessage carry when !IsHost:
+                OnCarryReceived(carry);
                 break;
             case FollowMessage follow when !IsHost:
                 OnFollowReceived(follow);

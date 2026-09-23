@@ -352,6 +352,7 @@ public sealed partial class MultiplayerManager
                     Arg2 = o.Arg2,
                     MuteSound = o.MuteSound,
                     ForceSharedGroupActive = o.ForceSharedGroupActive,
+                    HideAtState = o.HideAtState,
                 };
                 DiagnosticLog.Info($"[Multiplayer] Peer: first snapshot of event object NetId {o.NetId} -- EObj 0x{o.EObjId:X}, pos ({o.X:F2},{o.Y:F2},{o.Z:F2}), state {o.CurrentState} -- spawning local copy.");
                 eo = world.SpawnEventObject(config);
@@ -389,6 +390,13 @@ public sealed partial class MultiplayerManager
                 DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) fading out (seq {o.FadeOutSeq}).");
                 eo.FadeOut();
             }
+            if (o.DirectorModSeq > 0 && o.DirectorState <= ushort.MaxValue
+                && peerEventObjectDirectorSeq.GetValueOrDefault(o.NetId) != o.DirectorModSeq)
+            {
+                peerEventObjectDirectorSeq[o.NetId] = o.DirectorModSeq;
+                DiagnosticLog.Info($"[Multiplayer] Peer: event object NetId {o.NetId} (EObj 0x{o.EObjId:X}) director state {o.DirectorState} (seq {o.DirectorModSeq}).");
+                eo.DirectorEObjMod(o.DirectorState);
+            }
         }
         foreach (var staleId in peerEventObjects.Keys.Where(id => !seenEventObjectIds.Contains(id)).ToList())
         {
@@ -398,6 +406,7 @@ public sealed partial class MultiplayerManager
             peerEventObjectState.Remove(staleId);
             peerEventObjectAnimationSeq.Remove(staleId);
             peerEventObjectFadeSeq.Remove(staleId);
+            peerEventObjectDirectorSeq.Remove(staleId);
         }
     }
 
@@ -654,6 +663,14 @@ public sealed partial class MultiplayerManager
         if (!PeerInRun) return;
         if (!NetGuard.TryPosition(msg.X, msg.Y, msg.Z, out var position)) return;
         OwnMember(msg.Role, "Teleport")?.TeleportTo(new Placement(position, NetGuard.Rotation(msg.Rotation)));
+    }
+
+    private void OnCarryReceived(CarryMessage msg)
+    {
+        if (!PeerInRun) return;
+        if (!NetGuard.TryPosition(msg.X, msg.Y, msg.Z, out var destination)) return;
+        var mode = NetGuard.InRange(msg.Mode, 3) ? (Core.Native.CarryMode)msg.Mode : Core.Native.CarryMode.Native;
+        OwnMember(msg.Role, "Carry")?.CarryTo(destination, mode);
     }
 
     private void OnPushReceived(PushMessage msg)

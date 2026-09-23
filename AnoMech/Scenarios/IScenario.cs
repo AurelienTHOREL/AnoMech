@@ -30,6 +30,9 @@ public interface IScenario
     // pool; null = the generic doppel HP.
     uint? TankMaxHealth => null;
 
+    // How far into the phase's track the real fight is when this scenario starts.
+    float BgmSecondsAtStart => 0f;
+
     void Run(SimWorld world, int? selectedAi);
     void Tick(float delta, float elapsed) { }
 

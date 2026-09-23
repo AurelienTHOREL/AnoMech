@@ -62,6 +62,7 @@ public sealed partial class MultiplayerManager : IDisposable
     private readonly Dictionary<int, ushort> peerEventObjectState = new();
     private readonly Dictionary<int, int> peerEventObjectAnimationSeq = new();
     private readonly Dictionary<int, int> peerEventObjectFadeSeq = new();
+    private readonly Dictionary<int, int> peerEventObjectDirectorSeq = new();
     // Engine-state seqs applied per NetId (see ActorEngineState): re-issuing an unchanged mode
     // or hold restarts it.
     private readonly Dictionary<int, (int Mode, int Hold, int Direct, int ForceLoad)> peerEnemyEngineSeqs = new();
@@ -127,6 +128,11 @@ public sealed partial class MultiplayerManager : IDisposable
     private float startCheckTimer;
     public bool IsStartCheckPending => pendingStartResponses != null;
     public string? StartCheckFailureReason { get; private set; }
+    // What the host's own Start is waiting to settle before it runs.
+    public string? StartWaitingOn { get; private set; }
+    // A settling peer answers once settled, inside the host's StartCheckTimeoutSeconds.
+    private const float StartCheckReplyMaxWaitSeconds = 4f;
+    private float? startCheckReplyWaited;
 
     // ---- Debug: bot-controlled host or peer ---------------------------------
     // Testing aid: the user's own role is driven by the bot AI, so one developer can fill a
@@ -378,6 +384,7 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEventObjectState.Clear();
         peerEventObjectAnimationSeq.Clear();
         peerEventObjectFadeSeq.Clear();
+        peerEventObjectDirectorSeq.Clear();
         peerEnemyEngineSeqs.Clear();
         peerEnemyModelHidden.Clear();
         peerLastSeenMs.Clear();
@@ -394,6 +401,8 @@ public sealed partial class MultiplayerManager : IDisposable
         pendingStartResponses = null;
         startCheckFailures.Clear();
         StartCheckFailureReason = null;
+        StartWaitingOn = null;
+        startCheckReplyWaited = null;
         startCheckTimer = 0f;
         debugBotControlled = false;
         aiReplayStateSent = false;
@@ -784,9 +793,11 @@ public sealed partial class MultiplayerManager : IDisposable
     // The preconditions RunScenarioInternal enforces, checked up front so a failure is reported
     // instead of a silent no-op. A claimed tank role must be on a tank job: bot mitigation picks
     // ability ids off the seat's job.
-    private string? CheckOwnStartReadiness()
+    private string? CheckOwnStartReadiness() => CheckOwnStartReadiness(out _);
+
+    private string? CheckOwnStartReadiness(out string? settling)
     {
-        if (ZoneSession.StartBlockedReason() is { } blocked) return blocked;
+        if (ZoneSession.StartBlockedReason(out settling) is { } blocked) return blocked;
         if (MyClaimedRole is { } role && role.IsTank())
         {
             var jobId = Plugin.ObjectTable.LocalPlayer?.ClassJob.RowId ?? 0;
@@ -844,14 +855,24 @@ public sealed partial class MultiplayerManager : IDisposable
         }
         if (IsStartCheckPending) return;
 
-        if (CheckOwnStartReadiness() is { } ownReason)
+        if (CheckOwnStartReadiness(out var settling) is { } ownReason)
         {
+            if (settling != null)
+            {
+                if (StartWaitingOn == null) DiagnosticLog.Info($"[Multiplayer] Start waiting for {settling} to settle.");
+                StartWaitingOn = settling;
+                StartCheckFailureReason = null;
+                LobbyChanged?.Invoke();
+                return;
+            }
+            StartWaitingOn = null;
             StartCheckFailureReason = $"You cannot start: {ownReason}.";
             DiagnosticLog.Info($"[Multiplayer] Cannot start: {ownReason}.");
             LobbyChanged?.Invoke();
             return;
         }
 
+        StartWaitingOn = null;
         StartCheckFailureReason = null;
         RunEndReason = null;
         startCheckFailures.Clear();
@@ -869,6 +890,36 @@ public sealed partial class MultiplayerManager : IDisposable
         LobbyChanged?.Invoke();
 
         if (pendingStartResponses.Count == 0) FinishStartCheck();
+    }
+
+    // Anything but a settle in the way surfaces through StartScenario's own refusal.
+    private void RetryWaitingStart()
+    {
+        if (StartWaitingOn is not { } waitingOn) return;
+        if (ZoneSession.StartBlockedReason(out var settling) != null && settling != null)
+        {
+            if (settling == waitingOn) return;
+            StartWaitingOn = settling;
+            LobbyChanged?.Invoke();
+            return;
+        }
+        StartWaitingOn = null;
+        StartScenario();
+    }
+
+    private void AnswerStartCheck(float deltaSeconds)
+    {
+        if (startCheckReplyWaited is not { } waited) return;
+        waited += deltaSeconds;
+        var reason = CheckOwnStartReadiness(out var settling);
+        if (settling != null && waited < StartCheckReplyMaxWaitSeconds)
+        {
+            if (startCheckReplyWaited == 0f) DiagnosticLog.Info($"[Multiplayer] Start check: waiting for {settling} to settle before answering.");
+            startCheckReplyWaited = waited;
+            return;
+        }
+        startCheckReplyWaited = null;
+        _ = relay?.SendAsync(new StartCheckResponseMessage(MyPeerId, reason == null, reason));
     }
 
     private void FinishStartCheck()
@@ -1005,6 +1056,7 @@ public sealed partial class MultiplayerManager : IDisposable
         peerEventObjectState.Clear();
         peerEventObjectAnimationSeq.Clear();
         peerEventObjectFadeSeq.Clear();
+        peerEventObjectDirectorSeq.Clear();
         peerEnemyEngineSeqs.Clear();
         peerEnemyModelHidden.Clear();
         peerEnteredInstance = false;

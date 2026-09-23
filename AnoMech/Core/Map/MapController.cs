@@ -168,7 +168,7 @@ public sealed unsafe class MapController : IDisposable
             }
         }
         zone.TickWeather();
-        foreach (var slot in suppressedArenaSlots) effects.SilenceSlotSounds(slot);
+        foreach (var slot in suppressedArenaSlots) effects.KeepSlotSuppressed(slot);
 
         for (int i = pendingColliderDrops.Count - 1; i >= 0; i--)
         {
@@ -298,16 +298,18 @@ public sealed unsafe class MapController : IDisposable
 
     public static bool IsReplayableDirectorCategory(uint category) => ReplayableDirectorCategories.Contains(category);
 
-    // Replay a single MapEffect state change. packetFlags: high16=State, low8=Flags. Queued for
+    // Replay a single MapEffect state change (packetFlags as in MapEffects). Queued for
     // retry if the zone isn't ready yet; a peer whose zone load lags the host's would otherwise
     // silently lose it. broadcast: false for RunInstanceEvents calls, which host and peer both
     // run locally.
     public void AddEffect(uint packetFlags, byte index, bool broadcast = true)
     {
         if (!InSim(nameof(AddEffect))) return;
-        if (!effects.Apply(packetFlags, index) && TryReserveRetrySlot(pendingEffects.Count, "MapEffect"))
+        // Behind a pending call for the same slot, or it would land first and be overwritten.
+        var behind = pendingEffects.Exists(p => p.Index == index);
+        if ((behind || !effects.Apply(packetFlags, index)) && TryReserveRetrySlot(pendingEffects.Count, "MapEffect"))
         {
-            DiagnosticLog.Warn($"[MapEffect] packetFlags=0x{packetFlags:X8} index=0x{index:X} not ready yet -- queued for retry.");
+            DiagnosticLog.Warn($"[MapEffect] packetFlags=0x{packetFlags:X8} index=0x{index:X} {(behind ? "queued behind an earlier call for the same slot" : "not ready yet -- queued for retry")}.");
             pendingEffects.Add(new PendingMapEffect { PacketFlags = packetFlags, Index = index, FramesLeft = BarrierDropMaxFrames });
         }
         if (broadcast) EffectApplied?.Invoke(packetFlags, index);
@@ -326,6 +328,13 @@ public sealed unsafe class MapController : IDisposable
         suppressedArenaSlots.Add(index); // Tick re-silences its Sound children every frame
         if (!effects.SuppressSlot(index) && TryReserveRetrySlot(pendingEffects.Count, "SuppressSlot"))
             pendingEffects.Add(new PendingMapEffect { PacketFlags = SuppressSentinel, Index = index, FramesLeft = BarrierDropMaxFrames });
+    }
+
+    public void LogArena(string label)
+    {
+        if (!InSim(nameof(LogArena))) return;
+        effects.LogAllSlots(label);
+        DiagnosticLog.Info($"[MapController] {label} live VFX and lights: {LayoutQuery.DescribeLiveEffects()}");
     }
 
     // A different phase starting in the loaded zone: suppression outlives a restart (only a

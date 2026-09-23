@@ -23,6 +23,7 @@ public sealed class UmadP3LimitCutScenario : IMultiplayerReplayable
 {
     public string Name => "Limit Cut";
     public IPhase Phase => UmadZone.P3;
+    public float BgmSecondsAtStart => Constants.BgmSecondsAtStart;
     public bool SupportsSolo => true;
     public bool SupportsMultiplayer => true;
     public uint? TankMaxHealth => UmadConstants.Tunables.RealTankMaxHealth;

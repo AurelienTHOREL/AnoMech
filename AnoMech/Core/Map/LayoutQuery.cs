@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using FFXIVClientStructs.FFXIV.Client.LayoutEngine;
+using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using FFXIVClientStructs.FFXIV.Client.LayoutEngine.Group;
 using LuminaEObj = Lumina.Excel.Sheets.EObj;
 using LuminaExportedSG = Lumina.Excel.Sheets.ExportedSG;
@@ -60,6 +61,48 @@ internal static unsafe class LayoutQuery
             }
         }
         return result;
+    }
+
+    public static string DescribeLiveEffects()
+    {
+        var lw = LayoutWorld.Instance();
+        if (lw == null || lw->ActiveLayout == null) return "no active layout";
+        var counts = new Dictionary<string, (int Count, SortedSet<string> Where)>();
+        void Add(string effect, string where)
+        {
+            if (!counts.TryGetValue(effect, out var entry)) entry = (0, new SortedSet<string>());
+            entry.Where.Add(where);
+            counts[effect] = (entry.Count + 1, entry.Where);
+        }
+        foreach (var layerKv in lw->ActiveLayout->Layers)
+        {
+            var layer = layerKv.Item2.Value;
+            if (layer == null) continue;
+            foreach (var instKv in layer->Instances)
+            {
+                var inst = instKv.Item2.Value;
+                if (inst == null) continue;
+                var found = new List<string>();
+                Native.LayoutInstanceDiagnostics.CollectLiveEffects(inst, 3, found);
+                foreach (var effect in found) Add(effect, $"layer 0x{layerKv.Item1:X}");
+            }
+        }
+        var eobjs = EventObjectManager.Instance();
+        if (eobjs != null)
+        {
+            for (var i = 0; i < 40; i++)
+            {
+                var go = eobjs->EventObjects[i].Value;
+                if (go == null || go->SharedGroupLayoutInstance == null) continue;
+                var found = new List<string>();
+                Native.LayoutInstanceDiagnostics.CollectLiveEffects((ILayoutInstance*)go->SharedGroupLayoutInstance, 3, found);
+                foreach (var effect in found) Add(effect, $"EObj 0x{go->BaseId:X}");
+            }
+        }
+        var parts = new List<string>();
+        foreach (var (effect, entry) in counts) parts.Add($"{entry.Count}x {effect} in {string.Join(",", entry.Where)}");
+        parts.Sort(StringComparer.Ordinal);
+        return $"{parts.Count} distinct -- " + string.Join(" | ", parts);
     }
 
     // Which layers the engine actually brought up has no other signal.

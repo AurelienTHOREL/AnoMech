@@ -383,7 +383,7 @@ public sealed class TopP5SigmaScenario : IMultiplayerReplayable
 
     public MpMessage? BuildReplayStateMessage()
         => LastState is { } s ? new TopP5SigmaAiReplayStateMessage(
-            s.Order.List, s.DynamisTargets.List, s.HelloWorldTargets.List, s.HandBait.List,
+            s.Order.List, s.DynamisTargets.List, s.HelloWorldTargets.List, s.HandBait.List, s.HelloWorldJumpOrder.List,
             s.NewNorthA.RadiansFromNorth, s.NewNorthB.RadiansFromNorth, s.TowerNorthFlipped,
             s.GlitchType == GlitchType.Far, s.SpinnerRotation == Rotation.Clockwise, s.OmegaFAttack == OmegaAttack.Staff,
             s.FirstMissing, s.SecondMissing)
@@ -393,7 +393,7 @@ public sealed class TopP5SigmaScenario : IMultiplayerReplayable
     {
         if (message is not TopP5SigmaAiReplayStateMessage msg) return null;
         var shadowState = TopP5SigmaState.FromNetworkReplay(
-            replayWorld.Party, msg.Order, msg.DynamisTargets, msg.HelloWorldTargets, msg.HandBait,
+            replayWorld.Party, msg.Order, msg.DynamisTargets, msg.HelloWorldTargets, msg.HandBait, msg.HelloWorldJumpOrder,
             msg.NewNorthARadians, msg.NewNorthBRadians, msg.TowerNorthFlipped,
             msg.GlitchIsFar, msg.SpinnerIsClockwise, msg.OmegaFIsStaff, msg.FirstMissing, msg.SecondMissing);
         ((IScenarioAi<TopP5SigmaState>)AiStrats[aiIndex]).Run(shadowState, replayWorld);

@@ -151,6 +151,86 @@ internal static unsafe class LayoutInstanceDiagnostics
         return true;
     }
 
+    public static string DescribeLive(uint layoutId)
+    {
+        var world = LayoutWorld.Instance();
+        if (world == null || layoutId == 0) return "no SharedGroup";
+        var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
+        if (instance == null) return "SharedGroup not loaded";
+        var live = new List<string>();
+        CollectLive(instance, 3, live);
+        return $"SG active={instance->IsActive} \"{PrimaryPath(instance)}\" live[{live.Count}]=[{string.Join("; ", live)}]";
+    }
+
+    public static void CollectLiveEffects(ILayoutInstance* inst, int depth, List<string> into)
+    {
+        if (inst == null || !inst->IsActive) return;
+        if (inst->Id.Type == InstanceType.Vfx) { into.Add(DescribeVfx(inst)); return; }
+        if (inst->Id.Type == InstanceType.Light) { into.Add(DescribeLight(inst)); return; }
+        if (depth <= 0 || inst->Id.Type != InstanceType.SharedGroup) return;
+        var sg = (SharedGroupLayoutInstance*)inst;
+        var count = sg->Instances.Instances.Count;
+        for (var i = 0; i < count && i < 16; i++)
+        {
+            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
+            if (child != null) CollectLiveEffects(child->Instance, depth - 1, into);
+        }
+    }
+
+    private static void CollectLive(ILayoutInstance* sgInstance, int depth, List<string> into)
+    {
+        var sg = (SharedGroupLayoutInstance*)sgInstance;
+        var count = sg->Instances.Instances.Count;
+        for (var i = 0; i < count && i < 16; i++)
+        {
+            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
+            var inst = child != null ? child->Instance : null;
+            if (inst == null || !inst->IsActive) continue;
+            if (inst->Id.Type == InstanceType.SharedGroup && depth > 0) { CollectLive(inst, depth - 1, into); continue; }
+            into.Add(inst->Id.Type switch
+            {
+                InstanceType.Vfx => DescribeVfx(inst),
+                InstanceType.Light => DescribeLight(inst),
+                _ => $"{inst->Id.Type} \"{PrimaryPath(inst)}\"",
+            });
+        }
+    }
+
+    private static string DescribeVfx(ILayoutInstance* inst)
+    {
+        var vfx = (FFXIVClientStructs.FFXIV.Client.LayoutEngine.Layer.VfxLayoutInstance*)inst;
+        var c = vfx->Color;
+        return $"Vfx \"{PrimaryPath(inst)}\" rgba=({c.R},{c.G},{c.B},{c.A}) drawn={vfx->GraphicsObject != null}";
+    }
+
+    private static string DescribeLight(ILayoutInstance* inst)
+    {
+        var light = (FFXIVClientStructs.FFXIV.Client.LayoutEngine.Layer.LightLayoutInstance*)inst;
+        var c = light->Color;
+        return $"Light {light->LightType} rgb=({c.X:F2},{c.Y:F2},{c.Z:F2}) w={c.W:F2} drawn={light->GraphicsObject != null}";
+    }
+
+    private static string PrimaryPath(ILayoutInstance* inst)
+    {
+        var path = inst->GetPrimaryPath();
+        return path.HasValue ? path.ToString() : "";
+    }
+
+    // Children too: a Vfx child keeps rendering with its SharedGroup inactive.
+    public static bool Deactivate(SharedGroupLayoutInstance* sg)
+    {
+        if (sg == null) return false;
+        var wasOn = ((ILayoutInstance*)sg)->IsActive;
+        var count = sg->Instances.Instances.Count;
+        for (var i = 0; i < count && i < 16; i++)
+        {
+            var child = (ChildNodeInstance*)sg->Instances.Instances[i].Value;
+            if (child != null && child->Instance != null && child->Instance->IsActive) wasOn = true;
+        }
+        SetActiveRecursive((ILayoutInstance*)sg, false, 3);
+        return wasOn;
+    }
+
     private static void SetActiveRecursive(ILayoutInstance* inst, bool active, int depth)
     {
         if (inst == null) return;
@@ -201,15 +281,16 @@ internal static unsafe class LayoutInstanceDiagnostics
         return changed;
     }
 
-    // SilenceSounds for an arena slot resolved by LayoutId; false until its SGB resolves.
-    public static bool SilenceSlotSounds(uint layoutId)
+    public static bool KeepSuppressed(uint layoutId)
     {
         var world = LayoutWorld.Instance();
         if (world == null) return false;
         var instance = world->GetLayoutInstance(InstanceType.SharedGroup, layoutId);
         if (instance == null) return false;
+        var reactivated = instance->IsActive;
+        if (reactivated) SetActiveRecursive(instance, false, 3);
         SilenceSoundsRecursive((SharedGroupLayoutInstance*)instance, depth: 3);
-        return true;
+        return reactivated;
     }
 
     // The instance and all direct children report fully loaded.

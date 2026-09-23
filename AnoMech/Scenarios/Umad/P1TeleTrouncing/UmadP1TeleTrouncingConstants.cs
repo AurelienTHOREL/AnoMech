@@ -86,6 +86,9 @@ public static class UmadP1TeleTrouncingConstants
     // Flagrant Fire III carries.
     public const float MagicVulnerabilityUpSeconds = 0.96f;
 
+    // The real track starts at the pull, 19.32s before the cast.
+    public const float BgmSecondsAtStart = 17.73f;
+
     // Headmarkers during Mystery Magic (BossMod's IconID values): the lie/truth orbs ride on
     // Kefka, the stack/spread marker on the targeted player(s).
     public static class LockonId
@@ -150,6 +153,18 @@ public static class UmadP1TeleTrouncingConstants
     {
         public const uint Kefka = 7131;
         public const uint GravenImage = 7132;
+    }
+
+    public static class Spawn
+    {
+        public const int TelePortentArg2Serial = 0x50;
+        // Clear of the statue props' 0x4000EB80-8A.
+        public const uint TelePortentEntityIdBase = 0x4000EB90u;
+    }
+
+    public static class EObjState
+    {
+        public const uint TelePortentUsed = 7;
     }
 
     public static class EObjId

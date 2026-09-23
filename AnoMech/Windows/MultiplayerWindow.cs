@@ -562,6 +562,8 @@ public class MultiplayerWindow : Window, IDisposable
         {
             if (mp.IsStartCheckPending)
                 ImGui.TextColored(new Vector4(1f, 0.85f, 0.3f, 1f), "Checking everyone's ready...");
+            else if (mp.StartWaitingOn is { } waitingOn)
+                ImGui.TextColored(new Vector4(1f, 0.85f, 0.3f, 1f), $"Waiting for {waitingOn} to settle before starting...");
             else if (mp.StartCheckFailureReason is { } startFail)
                 ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), startFail);
 
@@ -574,7 +576,7 @@ public class MultiplayerWindow : Window, IDisposable
             var claimedPeerIds = mp.Session.ClaimedBy.Values.ToHashSet();
             var everyoneHasClaimed = mp.Session.Names.Keys.All(claimedPeerIds.Contains);
             var canStart = stable && mp.MyClaimedRole != null && !anyMismatch && !mp.IsStartCheckPending
-                           && hasStrat && everyoneHasClaimed && conflicts.Count == 0;
+                           && mp.StartWaitingOn == null && hasStrat && everyoneHasClaimed && conflicts.Count == 0;
             if (conflicts.Count > 0)
                 ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f),
                                   $"Can't start: {conflicts.Count} impossible setting{(conflicts.Count == 1 ? "" : "s")} in Scenario settings.");
@@ -592,6 +594,8 @@ public class MultiplayerWindow : Window, IDisposable
                             ? $"The fight can't produce these settings together:\n{string.Join("\n", conflicts)}"
                             : anyMismatch
                             ? "One or more players are on a different plugin build -- everyone needs to match before starting."
+                            : mp.StartWaitingOn is { } waiting
+                            ? $"Waiting for {waiting} to settle before starting..."
                             : mp.IsStartCheckPending
                                 ? "Waiting for players to confirm they're ready..."
                                 : mp.MyClaimedRole == null

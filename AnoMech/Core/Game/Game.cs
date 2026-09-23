@@ -180,10 +180,40 @@ public sealed class Game : IDisposable
     public void RunScenario(IScenario scenario, PartyRole? roleOverride = null, int? selectedAi = 0, int selectedWaymark = 0)
         => RunScenario(new RunScenarioParams(scenario, roleOverride, selectedAi, selectedWaymark));
 
+    // What a solo Start is waiting to settle before it runs.
+    public string? StartWaitingOn { get; private set; }
+    private RunScenarioParams? waitingStart;
+
     private void RunScenario(RunScenarioParams p)
     {
+        if (ZoneSession.StartBlockedReason(out var settling) != null && settling != null)
+        {
+            if (waitingStart == null) AnoMech.Core.DiagnosticLog.Info($"[Game] Start waiting for {settling} to settle.");
+            waitingStart = p;
+            StartWaitingOn = settling;
+            return;
+        }
+        waitingStart = null;
+        StartWaitingOn = null;
         lastRun = p;
         Plugin.Framework.Run(() => { RunScenarioInternal(p.Scenario, p.RoleOverride, p.SelectedAi, p.SelectedWaymark, null, null, isPeer: false); });
+    }
+
+    private void RetryWaitingStart()
+    {
+        if (waitingStart is not { } waiting) return;
+        if (ZoneSession.StartBlockedReason(out var settling) != null && settling != null)
+        {
+            StartWaitingOn = settling;
+            return;
+        }
+        RunScenario(waiting);
+    }
+
+    private void CancelWaitingStart()
+    {
+        waitingStart = null;
+        StartWaitingOn = null;
     }
 
     // Multiplayer host: RunScenario with `networkRoles` spawned as SimNetworkPuppet, wearing
@@ -344,10 +374,11 @@ public sealed class Game : IDisposable
         // Reconcile BGM to the new scenario. Bgm.Play is idempotent, so switching
         // between same-track scenarios (e.g. the P5 phases) keeps playing without
         // restarting the song; a different track swaps; suppressed/no-track reverts.
+        AnoMech.Core.DiagnosticLog.Info($"[Bgm] Suppress scenario BGM: {(Plugin.Config.SuppressBgm ? "on" : "off")}.");
         if (Plugin.Config.SuppressBgm || phase.Bgm == 0)
             Bgm.Reset();
         else
-            Bgm.Play(phase.Bgm);
+            Bgm.Play(phase.Bgm, scenario.BgmSecondsAtStart);
 
         Plugin.ChatGui.Print(new XivChatEntry
         {
@@ -378,6 +409,8 @@ public sealed class Game : IDisposable
 
     public void Tick(float deltaSeconds)
     {
+        Bgm.Tick(deltaSeconds);
+        RetryWaitingStart();
         if (Paused) return;
         lastEventTick = Stopwatch.GetTimestamp();
         Events.Tick(deltaSeconds * EventTimeScale);
@@ -519,6 +552,7 @@ public sealed class Game : IDisposable
 
     public void Reset() => Plugin.Framework.Run(() =>
     {
+        CancelWaitingStart();
         if (activeScenario is not null)
             TeleportPlayerToSpawnIfOutsideArena();
         ResetInternal();
@@ -560,6 +594,7 @@ public sealed class Game : IDisposable
         AnoMech.Core.DiagnosticLog.RotateNow();
         Plugin.Framework.Run(() =>
         {
+            CancelWaitingStart();
             ResetInternal();
             Plugin.UserActions.OnSessionEnd();   // restore the job gauge captured at session start
             Bgm.Reset();

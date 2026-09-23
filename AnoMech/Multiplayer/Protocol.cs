@@ -28,6 +28,7 @@ namespace AnoMech.Multiplayer;
 [JsonDerivedType(typeof(KnockbackMessage), "knockback")]
 [JsonDerivedType(typeof(TeleportMessage), "teleport")]
 [JsonDerivedType(typeof(PushMessage), "push")]
+[JsonDerivedType(typeof(CarryMessage), "carry")]
 [JsonDerivedType(typeof(FollowMessage), "follow")]
 [JsonDerivedType(typeof(SpawnOmenMessage), "spawnOmen")]
 [JsonDerivedType(typeof(EndMessage), "end")]
@@ -201,7 +202,8 @@ public sealed record EventObjectState(
     float X, float Y, float Z, float Rotation, uint LayoutId,
     uint EventId = 0, uint EntityId = 0, byte TargetableStatus = 1, uint Arg2 = 0, bool MuteSound = false,
     uint? AnimationState = null, uint? AnimationBitmask = null, int AnimationSeq = 0,
-    PropBeatMode AnimationMode = PropBeatMode.ActorControl, bool ForceSharedGroupActive = false, int FadeOutSeq = 0);
+    PropBeatMode AnimationMode = PropBeatMode.ActorControl, bool ForceSharedGroupActive = false, int FadeOutSeq = 0,
+    uint DirectorState = 0, int DirectorModSeq = 0, ushort HideAtState = 0);
 
 // Full-state, so a dropped frame costs one tick of staleness, not a wrong reconstruction.
 public sealed record WorldSnapshotMessage(
@@ -224,6 +226,7 @@ public sealed record KnockbackMessage(PartyRole Role, float SourceX, float Sourc
 // TargetRole releases the follow.
 public sealed record TeleportMessage(PartyRole Role, float X, float Y, float Z, float Rotation) : MpMessage, IHostOnlyMessage;
 public sealed record PushMessage(PartyRole Role, float Heading, float Distance, float Speed, float DurationSeconds) : MpMessage, IHostOnlyMessage;
+public sealed record CarryMessage(PartyRole Role, float X, float Y, float Z, int Mode = 0) : MpMessage, IHostOnlyMessage;
 public sealed record FollowMessage(PartyRole Role, PartyRole? TargetRole, int? TargetEnemyNetId, float Speed) : MpMessage, IHostOnlyMessage;
 
 // One per SimWorld.OmenSpawned. Path is checked against SimAssets on receipt: it is the one
@@ -333,7 +336,7 @@ public sealed record UmadP5CelestriadAiReplayStateMessage(
 // its own party, and LightPillarPlacement is host-only (the Ai never reads it).
 public sealed record UltimateSuppressionAiReplayStateMessage(
     PartyRole LightPillar, PartyRole[] MistralSongs, PartyRole[] Eruptions,
-    PartyRole Gaol, PartyRole FlamingCrush) : MpMessage, IScenarioReplayStateMessage;
+    PartyRole Gaol, PartyRole FlamingCrush, int[] SuppressionSpotOrder) : MpMessage, IScenarioReplayStateMessage;
 
 // InFirst is TopP6WaveCannon2Ai's entire read set.
 public sealed record TopP6WaveCannon2AiReplayStateMessage(bool InFirst) : MpMessage, IScenarioReplayStateMessage;
@@ -348,13 +351,15 @@ public sealed record TopP2PartySynergyAiReplayStateMessage(
 // static instance (see TopP5SigmaState.FromNetworkReplay).
 public sealed record TopP5SigmaAiReplayStateMessage(
     PartyRole[] Order, PartyRole[] DynamisTargets, PartyRole[] HelloWorldTargets, PartyRole[] HandBait,
+    PartyRole[] HelloWorldJumpOrder,
     float NewNorthARadians, float NewNorthBRadians, bool TowerNorthFlipped, bool GlitchIsFar,
     bool SpinnerIsClockwise, bool OmegaFIsStaff, int FirstMissing, int SecondMissing) : MpMessage, IScenarioReplayStateMessage;
 
 // The subset TopP5OmegaAi reads. MonitorSide travels as a bool; MonitorTargets is the host's
 // already-resolved pick.
 public sealed record TopP5OmegaAiReplayStateMessage(
-    PartyRole[] HelloWorldTargets, PartyRole[] DoubleDynamicTargets, PartyRole[] MonitorTargets, float[] AttackDirectionsRadians,
+    PartyRole[] HelloWorldTargets, PartyRole[] DoubleDynamicTargets, PartyRole[] MonitorTargets,
+    PartyRole[] HelloWorld1JumpOrder, float[] AttackDirectionsRadians,
     OmegaAttack[] OmegaAttacks, float BettleSpawnDirectionRadians, bool FirstWaveCannonFront,
     bool MonitorIsLeft) : MpMessage, IScenarioReplayStateMessage;
 

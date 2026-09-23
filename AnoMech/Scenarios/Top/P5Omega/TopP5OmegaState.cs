@@ -20,6 +20,9 @@ public sealed class TopP5OmegaState
     public RoleList DoubleDynamicTargets { get; }
     // Resolved here, not in the Ai: a peer's replay would re-roll it and disagree with the host.
     public RoleList MonitorTargets { get; }
+    // The four outside HelloWorldTargets[0..1] and MonitorTargets, in first Hello World jump
+    // order; resolved here for the same reason.
+    public RoleList HelloWorld1JumpOrder { get; }
 
     public IReadOnlyList<Direction> AttackDirections { get; }
     public IReadOnlyList<OmegaAttack> OmegaAttacks { get; } 
@@ -62,6 +65,8 @@ public sealed class TopP5OmegaState
             if (overrides is { SecondFAttack: not null, SecondMAttack: not null }) break;
         }
         OmegaAttacks = [firstFAttack, firstMAttack, secondFAttack, secondMAttack];
+        HelloWorld1JumpOrder = new RoleList(party, Enum.GetValues<PartyRole>())
+            .Random(rng, 4, MonitorTargets[0], MonitorTargets[1], HelloWorldTargets[0], HelloWorldTargets[1]);
     }
 
     private OmegaAttack RandomFAttack() => rng.NextObj(OmegaAttack.Legs, OmegaAttack.Staff);
@@ -93,12 +98,13 @@ public sealed class TopP5OmegaState
     // the static instance.
     private TopP5OmegaState(
         SimParty party, PartyRole[] helloWorldTargets, PartyRole[] doubleDynamicTargets, PartyRole[] monitorTargets,
-        float[] attackDirectionsRadians, OmegaAttack[] omegaAttacks, float bettleSpawnDirectionRadians,
-        bool firstWaveCannonFront, bool monitorIsLeft)
+        PartyRole[] helloWorld1JumpOrder, float[] attackDirectionsRadians, OmegaAttack[] omegaAttacks,
+        float bettleSpawnDirectionRadians, bool firstWaveCannonFront, bool monitorIsLeft)
     {
         HelloWorldTargets = new RoleList(party, helloWorldTargets);
         DoubleDynamicTargets = new RoleList(party, doubleDynamicTargets);
         MonitorTargets = new RoleList(party, monitorTargets);
+        HelloWorld1JumpOrder = new RoleList(party, helloWorld1JumpOrder);
         AttackDirections = attackDirectionsRadians.Select(r => new Direction(r)).ToList();
         OmegaAttacks = omegaAttacks;
         BettleSpawnDirection = new Direction(bettleSpawnDirectionRadians);
@@ -108,10 +114,10 @@ public sealed class TopP5OmegaState
 
     public static TopP5OmegaState FromNetworkReplay(
         SimParty party, PartyRole[] helloWorldTargets, PartyRole[] doubleDynamicTargets, PartyRole[] monitorTargets,
-        float[] attackDirectionsRadians, OmegaAttack[] omegaAttacks, float bettleSpawnDirectionRadians,
-        bool firstWaveCannonFront, bool monitorIsLeft)
-        => new(party, helloWorldTargets, doubleDynamicTargets, monitorTargets, attackDirectionsRadians, omegaAttacks,
-               bettleSpawnDirectionRadians, firstWaveCannonFront, monitorIsLeft);
+        PartyRole[] helloWorld1JumpOrder, float[] attackDirectionsRadians, OmegaAttack[] omegaAttacks,
+        float bettleSpawnDirectionRadians, bool firstWaveCannonFront, bool monitorIsLeft)
+        => new(party, helloWorldTargets, doubleDynamicTargets, monitorTargets, helloWorld1JumpOrder,
+               attackDirectionsRadians, omegaAttacks, bettleSpawnDirectionRadians, firstWaveCannonFront, monitorIsLeft);
 
     // Resolved live at t=46s and broadcast via TopP5OmegaHelloWorld2UpdateMessage.
     public PartyRole[]? HelloWorld2;

@@ -251,14 +251,16 @@ public sealed unsafe class SimPlayer(Coordinates coordinates) : SimCharacter(coo
     // locked out the way a bot doppel has no input.
     private const ushort StatusIdConfused = 0x503;
     private const ushort StatusIdSleep = 0x131E;
+    private const ushort StatusIdBind = 0x9D6;
 
     private void SyncInputLock()
     {
         var hooks = Plugin.PlayerInputHooks;
         var asleep = !Dead && HasStatus(StatusIdSleep);
         var confused = !Dead && HasStatus(StatusIdConfused);
+        var bound = !Dead && HasStatus(StatusIdBind);
         var incapacitated = asleep || confused;
-        hooks.ZeroMovement = Dead || Movement.IsMoving || incapacitated;
+        hooks.ZeroMovement = Dead || Movement.IsMoving || incapacitated || bound;
         hooks.DisableAllActions = Dead || incapacitated;
         // A knockback slide still lets you turn, so this isn't folded into ZeroMovement.
         hooks.ZeroRotation = Dead || incapacitated;

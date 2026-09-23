@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Party;
+using AnoMech.Core.Native;
 
 namespace AnoMech.Core.SimObjects;
 
@@ -47,9 +48,12 @@ public interface ISimPartyMember : ISimObject, IPositioned
     // -- see Movement.PushInDirectionEased's own doc comment for why this exists separately.
     void PushInDirectionEased(float heading, float distance, float durationSeconds);
 
-    // A scripted snap (Umad P1's teleporter), as opposed to SetPosition's engine-side use;
-    // SimNetworkPuppet hands it to the owning peer.
+    // A scripted snap, as opposed to SetPosition's engine-side use; SimNetworkPuppet hands it to
+    // the owning peer.
     void TeleportTo(Placement placement) => ((SimCharacter)this).SetPosition(placement);
+
+    // SimNetworkPuppet hands it to the owning peer.
+    void CarryTo(Vector3 destination, CarryMode mode = CarryMode.Native);
 }
 
 // Bridges the party-member death model onto SimCharacter-typed call sites. Party

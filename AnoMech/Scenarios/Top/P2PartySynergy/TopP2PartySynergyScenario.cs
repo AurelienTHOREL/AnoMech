@@ -68,15 +68,10 @@ public sealed class TopP2PartySynergyScenario : IMultiplayerReplayable
     private void Run_InstanceEvents()
     {
         var index = (byte)(state.NewNorthA.Index() + 1);
-        // Prewarm: the floor SGB's async streaming can still be mid-load when the real 7.93s
-        // call needs it, leaving the floor stuck mid-transition (seen on host/solo; a peer's
-        // own latency happens to buy enough time). Same State as the real first call, Flags=0
-        // so this only starts streaming, it doesn't spawn/show/hide/despawn early.
-        world.Events.Add(0f, () => world.Map.AddEffect(packetFlags: 0x00020000U, index: index));
-        world.Events.Add(7.93f, () => world.Map.AddEffect(packetFlags: 0x00020002U, index: index));
+        world.Events.Add(7.93f, () => world.Map.AddEffect(packetFlags: 0x00020001U, index: index));
         world.Events.Add(17.95f, () => world.Map.AddEffect(packetFlags: 0x00800040U, index: index));
         world.Events.Add(20.67f, () => world.Map.AddEffect(packetFlags: 0x10000001U, index: index));
-        world.Events.Add(26.82f, () => world.Map.AddEffect(packetFlags: 0x00080008U, index: index));
+        world.Events.Add(26.82f, () => world.Map.AddEffect(packetFlags: 0x00080004U, index: index));
     }
 
     private void Run_PlayerTethers(bool solo)

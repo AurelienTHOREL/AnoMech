@@ -614,10 +614,10 @@ public sealed class TopP5DeltaScenario : IMultiplayerReplayable
 
     // Delta arena transition animation (index 0x07).
     // Real game fires at +8/+24/+27/+42s relative to "Run: mi (Delta Version)" cast.
-    private void EyeSpawn() => world.Map.AddEffect(0x00000002, state.EyeSpawn.EffectIndex);
+    private void EyeSpawn() => world.Map.AddEffect(0x00020001, state.EyeSpawn.EffectIndex);
     private void EyeStartCharging()  => world.Map.AddEffect(0x00800040, state.EyeSpawn.EffectIndex);
     private void EyeDoneCharging()  => world.Map.AddEffect(0x10000001, state.EyeSpawn.EffectIndex);
-    private void EyeDespawn()    => world.Map.AddEffect(0x00000008, state.EyeSpawn.EffectIndex);
+    private void EyeDespawn()    => world.Map.AddEffect(0x00080004, state.EyeSpawn.EffectIndex);
 
     public MpMessage? BuildReplayStateMessage()
         => LastState is { } s ? new TopP5DeltaAiReplayStateMessage(

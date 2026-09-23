@@ -131,24 +131,35 @@ public sealed unsafe partial class ZoneSession
     // which asks again, so a change between the click and the deferred start is caught too. A
     // restart inside a loaded zone changes nothing the server can see, so only a tripped guard
     // refuses it.
-    public static string? StartBlockedReason()
+    public static string? StartBlockedReason() => StartBlockedReason(out _);
+
+    // `settling` names what the start is waiting on when that passes by itself within a few
+    // seconds, so a caller can retry instead of refusing.
+    public static string? StartBlockedReason(out string? settling)
     {
+        settling = null;
         if (Current is { IsActive: true } active)
             return active.tripReason is { } tripped ? $"the session guard tripped ({tripped})" : null;
         // The previous stay's delayed lift is still pending; a new stay under it would lose its
         // firewall a second in.
-        if (Current is { guardArmed: true }) return "the previous run is still settling -- wait a moment";
+        if (Current is { guardArmed: true }) return Settling("the previous run", out settling);
         if (!Plugin.ClientState.IsLoggedIn || Plugin.ObjectTable.LocalPlayer is not { } player) return "not logged in";
         if (!IsInInn()) return "not in an inn";
         var c = Plugin.Condition;
         if (c[ConditionFlag.BetweenAreas] || c[ConditionFlag.BetweenAreas51]) return "zoning";
-        if (SecondsSince(lastTerritoryChangeAt) < SettleSeconds) return "the zone just loaded -- wait a moment";
+        if (SecondsSince(lastTerritoryChangeAt) < SettleSeconds) return Settling("the zone", out settling);
         if (player.IsCasting) return $"casting {ActionLookup.Name(player.CastActionId)}";
         if (zoneChangePressedAt is { } pressed)
             return $"{ActionLookup.Name(zoneChangeActionId)} was used {Stopwatch.GetElapsedTime(pressed).TotalSeconds:F0}s ago and has not resolved";
         if (IsPlayerBusy()) return "busy (cutscene, NPC event, crafting, trading, zoning, combat, mounted, queued, etc.)";
-        if (SecondsSince(lastBusyAt) < SettleSeconds) return "the last action is still settling -- wait a moment";
+        if (SecondsSince(lastBusyAt) < SettleSeconds) return Settling("the last action", out settling);
         return null;
+    }
+
+    private static string Settling(string subject, out string? settling)
+    {
+        settling = subject;
+        return $"{subject} is still settling";
     }
 
     // ---- Session guard ------------------------------------------------------------------

@@ -920,7 +920,7 @@ public unsafe class UltimateSuppressionScenario : IMultiplayerReplayable
         if (mistralSongs.Any(r => r is null) || eruptions.Any(r => r is null)) return null;
         return new UltimateSuppressionAiReplayStateMessage(
             lightPillar, mistralSongs.Select(r => r!.Value).ToArray(),
-            eruptions.Select(r => r!.Value).ToArray(), gaol, flamingCrush);
+            eruptions.Select(r => r!.Value).ToArray(), gaol, flamingCrush, s.SuppressionSpotOrder);
     }
 
     private static PartyRole? RoleOf(SimCharacter? member) => (member as ISimPartyMember)?.Role;
@@ -931,7 +931,8 @@ public unsafe class UltimateSuppressionScenario : IMultiplayerReplayable
     {
         if (message is not UltimateSuppressionAiReplayStateMessage msg || aiIndex < 0 || aiIndex >= AiStrats.Count) return null;
         var shadowState = UltimateSuppressionState.FromNetworkReplay(
-            replayWorld.Party, msg.LightPillar, msg.MistralSongs, msg.Eruptions, msg.Gaol, msg.FlamingCrush);
+            replayWorld.Party, msg.LightPillar, msg.MistralSongs, msg.Eruptions, msg.Gaol, msg.FlamingCrush,
+            msg.SuppressionSpotOrder);
         if (shadowState == null) return null;
         ((IScenarioAi<UltimateSuppressionState>)AiStrats[aiIndex]).Run(shadowState, replayWorld);
         return shadowState;

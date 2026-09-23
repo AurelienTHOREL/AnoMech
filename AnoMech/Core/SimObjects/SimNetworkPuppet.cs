@@ -146,6 +146,13 @@ public sealed unsafe class SimNetworkPuppet : SimNpc, ISimPartyMember
 
     public void ClearPendingNetworkTeleport() => PendingNetworkTeleport = null;
 
+    // The owner's client performs the carry; this copy follows their reported poses.
+    public (Vector3 Destination, Native.CarryMode Mode)? PendingNetworkCarry { get; private set; }
+
+    public override void CarryTo(Vector3 destination, Native.CarryMode mode = Native.CarryMode.Native) => PendingNetworkCarry = (destination, mode);
+
+    public void ClearPendingNetworkCarry() => PendingNetworkCarry = null;
+
     // Only a forced follow reaches the owner: an unforced one is a strat walking its bots, and
     // the person in this seat is playing, not being driven. A release always propagates -- it
     // only ever hands control back. Never applied locally either: this copy's position is the

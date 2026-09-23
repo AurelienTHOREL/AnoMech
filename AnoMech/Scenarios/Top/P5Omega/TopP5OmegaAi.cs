@@ -149,13 +149,9 @@ public class TopP5OmegaAi : IScenarioAi<TopP5OmegaState>
         move.MultiplyX(state.MonitorSide.Mul);
     }
 
-    // state.MonitorTargets is resolved once in TopP5OmegaState's own constructor (see its doc
-    // comment) instead of here -- it used to be rolled live per-Ai-instance, which let a
-    // peer's own replay disagree with the host on which two roles took the monitor-soak spots.
     private RoleList solveHelloWorld1(SimParty party)
     {
-        var jumpTargets = RoleList.AllExcept(party, state.MonitorTargets[0], state.MonitorTargets[1], state.HelloWorldTargets[0],
-                                             state.HelloWorldTargets[1]);
+        var jumpTargets = state.HelloWorld1JumpOrder;
         return new RoleList(party,
             [
                 state.HelloWorldTargets[0], state.HelloWorldTargets[1], state.MonitorTargets[0], state.MonitorTargets[1],

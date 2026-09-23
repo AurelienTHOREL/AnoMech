@@ -59,6 +59,41 @@ public abstract unsafe class SimCharacter(Coordinates coordinates) : ISimObject,
         statusList.Update(deltaSeconds);
         vfx.Update(deltaSeconds);
         Movement.Tick(deltaSeconds);
+        TickCarry(deltaSeconds);
+    }
+
+    // The real client's carry: still for 0.2s, settled by 0.9s. The client ignores an injected
+    // one, so a native carry that hasn't moved by the check is finished by the sim's slide.
+    private const float CarryStartDelay = 0.2f;
+    private const float CarrySlideSeconds = 0.7f;
+    private const float CarryCheckSeconds = 0.35f;
+    private const float CarryMinProgress = 0.5f;
+    private Vector3 carryStart;
+    private Vector3? carryDestination;
+    private float carryElapsed;
+
+    public virtual void CarryTo(Vector3 destination, CarryMode mode = CarryMode.Native)
+    {
+        if (mode == CarryMode.Push)
+        {
+            Movement.Carry(destination, CarryStartDelay, CarrySlideSeconds);
+            return;
+        }
+        ForcedMovement.CarryTo(EntityId, Coordinates.ToGlobal(destination), Rotation, selfTarget: mode == CarryMode.NativeSelfTarget);
+        carryStart = Position;
+        carryDestination = destination;
+        carryElapsed = 0f;
+    }
+
+    private void TickCarry(float deltaSeconds)
+    {
+        if (carryDestination is not { } destination) return;
+        carryElapsed += deltaSeconds;
+        if (carryElapsed < CarryCheckSeconds) return;
+        carryDestination = null;
+        if (Vector3.Distance(Position, carryStart) >= CarryMinProgress) return;
+        DiagnosticLog.Warn($"[SimCharacter] {GetType().Name} 0x{EntityId:X} was not carried by the client ({Vector3.Distance(Position, carryStart):F2}y in {CarryCheckSeconds:F2}s) -- sliding it the remaining {Vector3.Distance(Position, destination):F1}y instead.");
+        Movement.Carry(destination, 0f, CarryStartDelay + CarrySlideSeconds - CarryCheckSeconds);
     }
 
     public virtual void Despawn()

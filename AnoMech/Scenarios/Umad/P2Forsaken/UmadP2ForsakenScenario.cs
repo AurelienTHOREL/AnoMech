@@ -93,18 +93,11 @@ public sealed class UmadP2ForsakenScenario : IMultiplayerReplayable
     {
         
         world.Events.Add(timeBase, () => world.Map.AddEffect(packetFlags: 0x00020001U, index: (byte)(direction.Index() + 1)));
-        world.Events.Add(timeBase + 3f, () => world.Map.AddEffect(packetFlags: 0x00020008U, index: (byte)(direction.Index() + 1)));
+        world.Events.Add(timeBase + 3f, () => world.Map.AddEffect(packetFlags: 0x00080004U, index: (byte)(direction.Index() + 1)));
     }
     
     private void Run_InstanceEvents()
     {
-        
-        world.Events.Add(1f, () =>
-        {
-            for (int i = 0; i < 8; i++)
-                world.Map.AddEffect(packetFlags: 0x00000004U, index: (byte)(i + 1));
-        });
-        world.Events.Add(1f, () => world.Map.AddEffect(packetFlags: 0x00080004U, index: (byte)0x00));
         world.Events.Add(2.37f, () => world.Map.AddEffect(packetFlags: 0x00080004U, index: (byte)0x11));
         world.Events.Add(9.43f, () => world.Map.AddEffect(packetFlags: 0x00020001U, index: (byte)0x11));
         world.Events.Add(11.04f, () => world.Map.AddEffect(packetFlags: 0x00040001U, index: (byte)0x12));

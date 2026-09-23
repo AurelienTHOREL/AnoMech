@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using AnoMech.Core.Game;
 using AnoMech.Core.Game.Party;
 using AnoMech.Core.SimObjects;
@@ -19,13 +20,17 @@ public class UltimateSuppressionState
 
     public SimTether? MesohighTether = null;
 
+    public const int SuppressionSpots = 6;
+    // Which spread spot each non-tank takes, resolved here so a peer's replay can't re-roll it.
+    public int[] SuppressionSpotOrder { get; private init; } = [];
+
     // LightPillarPlacement is resolved mid-run on the host and never read by the Ai, so it stays
     // at its default here.
     public static UltimateSuppressionState? FromNetworkReplay(
         SimParty party, PartyRole lightPillar, IReadOnlyList<PartyRole> mistralSongs,
-        IReadOnlyList<PartyRole> eruptions, PartyRole gaol, PartyRole flamingCrush)
+        IReadOnlyList<PartyRole> eruptions, PartyRole gaol, PartyRole flamingCrush, int[] suppressionSpotOrder)
     {
-        if (mistralSongs.Count != 2 || eruptions.Count != 2) return null;
+        if (mistralSongs.Count != 2 || eruptions.Count != 2 || suppressionSpotOrder is not { Length: SuppressionSpots }) return null;
         return new UltimateSuppressionState
         {
             PlayerLightPillar = party.Get(lightPillar),
@@ -33,6 +38,7 @@ public class UltimateSuppressionState
             PlayerEruptions = [party.Get(eruptions[0]), party.Get(eruptions[1])],
             PlayerGaol = party.Get(gaol),
             PlayerFlamingCrush = party.Get(flamingCrush),
+            SuppressionSpotOrder = suppressionSpotOrder,
         };
     }
 
@@ -61,5 +67,6 @@ public class UltimateSuppressionState
         PlayerEruptions[1] = roles.Get(index++);
         PlayerGaol = (doOverride && overrides.Assignment == UltimateSuppressionAssignment.Gaol) ? party.Player : roles.Get(index++);
         PlayerFlamingCrush = party.Get(Rng.NextDpsRole());
+        SuppressionSpotOrder = Rng.Shuffle(Enumerable.Range(0, SuppressionSpots).ToArray()).ToArray();
     }
 }

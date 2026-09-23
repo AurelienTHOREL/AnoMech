@@ -82,7 +82,7 @@ public sealed class UmadP3BlackHoleAi(UmadP3BlackHoleAi.TetherOrder tetherOrder)
         world.Events.Add(66f, () => ReturnToMiddle(playerIndex: 4));
         world.Events.Add(69f, () => GrabTether(tetherIndex: 1, playerIndex: 1, intercept: 1f));
         world.Events.Add(71f, () => ReturnToMiddle(playerIndex: 0));
-        ai.Move(74f, DodgeEdictAndLookUpon);
+        ai.Move(73.1f, DodgeEdictAndLookUpon);
         ai.Move(80f, StackCentre);
         // Only an InvulnsBoth plan grants a scripted invuln; a Share relies on mitigation.
         if (ThunderIIIPlanning.InvulnRole(state.ThunderSet2) is { } set2InvulnRole)
@@ -306,7 +306,7 @@ public sealed class UmadP3BlackHoleAi(UmadP3BlackHoleAi.TetherOrder tetherOrder)
         var axis = new Vector2(-MathF.Sin(theta), MathF.Cos(theta));     // Look-Upon line direction
         var lookRight = new Vector2(MathF.Cos(theta), MathF.Sin(theta)); // perpendicular to it
         const float lookSafe = 11f;   // past the 8y half-width, with margin
-        const float behind = 8f;      // distance to stand behind the boss
+        const float behind = 3f;      // distance to stand behind the boss
 
         var boss = state.ScenarioObjects.Chaos;
         if (boss is null) return AiMove.All(lookRight * lookSafe);

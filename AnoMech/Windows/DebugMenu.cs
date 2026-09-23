@@ -61,11 +61,12 @@ internal sealed unsafe class DebugMenu
     private string debugStatusDurationText = "0";
     private string debugStatusStacksText = "1";
     private string debugMapEffectIndexText = "0x00";
-    private string debugMapEffectStatusText = "0x0000";
-    private string debugMapEffectFlagText = "0x00";
+    private string debugMapEffectStateText = "0x0000";
+    private string debugMapEffectTimelineText = "0x0000";
     private string debugDirectorCategoryText = "0x8000001E";
     private string debugDirectorArg1Text = "0x2AC";
     private string debugBgmIdText = "964";
+    private float debugBgmSeekSeconds = 17.73f;
     private string debugWeatherIdText = "77";
     private float debugDayTimeSeconds = 43200f; // noon
     // EObj 1EB83C (decimal 2013244) = the TOP P5 Sigma falling-orb tower; useful default.
@@ -461,19 +462,19 @@ internal sealed unsafe class DebugMenu
         ImGui.SetNextItemWidth(80 * uiScale);
         ImGui.InputText("Index", ref debugMapEffectIndexText, 16);
         ImGui.SetNextItemWidth(80 * uiScale);
-        ImGui.InputText("Status", ref debugMapEffectStatusText, 16);
+        ImGui.InputText("State", ref debugMapEffectStateText, 16);
         ImGui.SetNextItemWidth(80 * uiScale);
-        ImGui.InputText("Flag", ref debugMapEffectFlagText, 16);
+        ImGui.InputText("Timeline", ref debugMapEffectTimelineText, 16);
         if (ImGui.Button("Apply map effect"))
         {
             if (!TryParseId(debugMapEffectIndexText, out var idx) || idx > 0xFF)
                 Plugin.Log.Warning($"Map effect: can't parse Index '{debugMapEffectIndexText}'");
-            else if (!TryParseId(debugMapEffectStatusText, out var status) || status > 0xFFFF)
-                Plugin.Log.Warning($"Map effect: can't parse Status '{debugMapEffectStatusText}'");
-            else if (!TryParseId(debugMapEffectFlagText, out var flag) || flag > 0xFF)
-                Plugin.Log.Warning($"Map effect: can't parse Flag '{debugMapEffectFlagText}'");
+            else if (!TryParseId(debugMapEffectStateText, out var mapState) || mapState > 0xFFFF)
+                Plugin.Log.Warning($"Map effect: can't parse State '{debugMapEffectStateText}'");
+            else if (!TryParseId(debugMapEffectTimelineText, out var timeline) || timeline > 0xFFFF)
+                Plugin.Log.Warning($"Map effect: can't parse Timeline '{debugMapEffectTimelineText}'");
             else
-                plugin.Game.World.Map.AddEffect((status << 16) | (flag & 0xFFu), (byte)idx);
+                plugin.Game.World.Map.AddEffect((timeline << 16) | mapState, (byte)idx);
         }
 
         ImGui.Spacing();
@@ -554,6 +555,12 @@ internal sealed unsafe class DebugMenu
         }
         ImGui.SameLine();
         if (ImGui.Button("Stop##bgm")) plugin.Game.Bgm.Reset();
+        ImGui.SetNextItemWidth(80 * uiScale);
+        ImGui.InputFloat("s##bgmseek", ref debugBgmSeekSeconds, 0f, 0f, "%.2f");
+        ImGui.SameLine();
+        if (ImGui.Button("Sync##bgm")) plugin.Game.Bgm.Sync(debugBgmSeekSeconds);
+        ImGui.SameLine();
+        if (ImGui.Button("Where##bgm")) plugin.Game.Bgm.LogPosition("debug");
     }
 
     // Live read-only flag readout: green when set, dimmed when clear.
