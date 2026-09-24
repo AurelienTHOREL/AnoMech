@@ -410,6 +410,9 @@ public sealed unsafe partial class ZoneSession : IDisposable
         // A tripped stay never reaches the inn reload: the client would be shown a zone the
         // server doesn't have it in.
         if (tripReason is { } tripped) Die(tripped);
+        // Outside a session sessionSave is stale: the delayed position re-assert would move the
+        // real character with the firewall down.
+        if (!IsActive) return;
         if (guardArmed) AnoMech.Core.DiagnosticLog.Info(StateSnapshot($"revert starting (dispose={dispose})"));
 
         // We need to wait before calling DisableFirewall(), so we'll set the Occupied condition to be sure the Player doesn't do anything in the meantime.

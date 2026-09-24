@@ -301,24 +301,15 @@ public unsafe class MainWindow : Window, IDisposable
         ImGui.SameLine();
         DrawResetLeaveButtons();
 
-        var blocked = ZoneSession.StartBlockedReason(out var settling);
-        var waiting = game.StartWaitingOn;
-        var envReady = (blocked == null || settling != null) && waiting == null;
-        var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
         if (_selectedScenario.SupportsSolo)
         {
-            ImGui.BeginDisabled(!envReady || mpBlocked);
-            if (ImGui.Button($"{(waiting != null ? "Waiting to start..." : "Start Solo")}###startSolo"))
-                game.RunScenario(_selectedScenario, _roleOverride, selectedAi: null, _selectedWaymark);
+            var refusal = plugin.StartRefusal(solo: true);
+            ImGui.BeginDisabled(refusal != null);
+            if (ImGui.Button($"{(game.StartWaitingOn != null ? "Waiting to start..." : "Start Solo")}###startSolo"))
+                plugin.StartSelectedScenario(solo: true);
             ImGui.EndDisabled();
-            if ((!envReady || mpBlocked) && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-            {
-                ImGui.SetTooltip(mpBlocked
-                    ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
-                    : waiting != null
-                        ? $"Waiting for {waiting} to settle before starting..."
-                        : $"Cannot start: {blocked}.");
-            }
+            if (refusal != null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip(refusal);
         }
 
         // God mode, speed and the solo scenario config are disabled while a session is being set
@@ -403,56 +394,25 @@ public unsafe class MainWindow : Window, IDisposable
     internal void DrawSoloStartButton()
     {
         if (_selectedScenario == null) return;
-        var blocked = ZoneSession.StartBlockedReason(out var settling);
-        var waiting = plugin.Game.StartWaitingOn;
-        var hasStrat = HasStartableStrat();
-        // The solo path bypasses MultiplayerManager: a host would run the fight without a
-        // StartMessage, a peer would start a second independent simulation.
-        var mpBlocked = _selectedScenario.SupportsMultiplayer && plugin.Multiplayer.IsConnected;
-        var canStart = (blocked == null || settling != null) && waiting == null && hasStrat && !mpBlocked;
-        ImGui.BeginDisabled(!canStart);
-        if (ImGui.Button($"{(waiting != null ? "Waiting to start..." : "Start")}###start"))
-            plugin.Game.RunScenario(_selectedScenario, _roleOverride, _selectedStrat, _selectedWaymark);
+        var refusal = plugin.StartRefusal(solo: false);
+        ImGui.BeginDisabled(refusal != null);
+        if (ImGui.Button($"{(plugin.Game.StartWaitingOn != null ? "Waiting to start..." : "Start")}###start"))
+            plugin.StartSelectedScenario(solo: false);
         ImGui.EndDisabled();
-        if (!canStart && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-        {
-            ImGui.SetTooltip(mpBlocked
-                ? "Connected to a multiplayer session -- use Start in the Multiplayer window instead."
-                : waiting != null
-                    ? $"Waiting for {waiting} to settle before starting..."
-                    : blocked != null
-                        ? $"Cannot start: {blocked}."
-                        : "No strat available for this region yet.");
-        }
+        if (refusal != null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(refusal);
     }
 
     // Reset, plus Leave while in-instance; a connected peer's clicks route through the host.
     internal void DrawResetLeaveButtons()
     {
-        var game = plugin.Game;
-        // A peer's own Game.Reset() would only clear their local view.
         if (ImGui.Button("Reset"))
-        {
-            if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
-                plugin.Multiplayer.RequestReset();
-            else
-                game.Reset();
-        }
-        if (game.World.Map.IsInInstance)
+            plugin.ResetScenario();
+        if (plugin.Game.World.Map.IsInInstance)
         {
             ImGui.SameLine();
-            // A peer's own Game.Leave() would leave the host simulating for a torn-down world.
             if (ImGui.Button("Leave"))
-            {
-                if (plugin.Multiplayer.IsConnected && !plugin.Multiplayer.IsHost)
-                    plugin.Multiplayer.RequestLeaveInstance();
-                else
-                {
-                    game.Leave();
-                    // A prior Reset consumed Tick()'s one-shot end trigger (see NotifyLeftInstance).
-                    plugin.Multiplayer.NotifyLeftInstance();
-                }
-            }
+                plugin.LeaveInstance();
         }
     }
 

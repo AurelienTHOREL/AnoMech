@@ -271,10 +271,10 @@ public sealed class Plugin : IDalamudPlugin
                 StartSelectedScenario(solo: true);
                 break;
             case "reset":
-                Game.Reset();
+                ResetScenario();
                 break;
             case "leave":
-                Game.Leave();
+                LeaveInstance();
                 break;
             default:
                 MainWindow.Toggle();
@@ -282,27 +282,53 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    private void StartSelectedScenario(bool solo)
+    internal string? StartRefusal(bool solo)
     {
+        if (MainWindow.SelectedScenario is not { } scenario) return "No scenario selected.";
+        if (solo && !scenario.SupportsSolo) return $"{scenario.Name} does not support Solo mode.";
+        // Starting here bypasses MultiplayerManager: a host would run the fight without a
+        // StartMessage, a peer would start a second independent simulation.
+        if (scenario.SupportsMultiplayer && Multiplayer.IsConnected)
+            return "Connected to a multiplayer session -- use Start in the Multiplayer window instead.";
+        if (Game.StartWaitingOn is { } waiting) return $"Waiting for {waiting} to settle before starting...";
         // A settle only delays the start; Game.RunScenario waits it out.
         if (ZoneSession.StartBlockedReason(out var settling) is { } blocked && settling == null)
+            return $"Cannot start: {blocked}.";
+        if (!solo && !MainWindow.HasStartableStrat()) return "No strat available for this region yet.";
+        return null;
+    }
+
+    internal void StartSelectedScenario(bool solo)
+    {
+        if (StartRefusal(solo) is { } refusal)
         {
-            Log.Warning($"Cannot start a scenario: {blocked}.");
+            Log.Warning(refusal);
             return;
         }
-        if (MainWindow.SelectedScenario is not { } scenario)
-            return;
-        if (solo && !scenario.SupportsSolo)
+        Game.RunScenario(MainWindow.SelectedScenario!, MainWindow.SelectedRoleOverride, solo ? null : MainWindow.SelectedStrat, MainWindow.SelectedWaymark);
+    }
+
+    internal void ResetScenario()
+    {
+        // A peer's own Game.Reset() would only clear their local view.
+        if (Multiplayer.IsConnected && !Multiplayer.IsHost)
+            Multiplayer.RequestReset();
+        else
+            Game.Reset();
+    }
+
+    internal void LeaveInstance()
+    {
+        if (!Game.World.Map.IsInInstance) return;
+        // A peer's own Game.Leave() would leave the host simulating for a torn-down world.
+        if (Multiplayer.IsConnected && !Multiplayer.IsHost)
+            Multiplayer.RequestLeaveInstance();
+        else
         {
-            Log.Warning($"{scenario.Name} does not support Solo mode.");
-            return;
+            Game.Leave();
+            // A prior Reset consumed Tick()'s one-shot end trigger (see NotifyLeftInstance).
+            Multiplayer.NotifyLeftInstance();
         }
-        if (!solo && MainWindow.SelectedStrat < 0)
-        {
-            Log.Warning("No strat selected for the current region.");
-            return;
-        }
-        Game.RunScenario(scenario, MainWindow.SelectedRoleOverride, solo ? null : MainWindow.SelectedStrat, MainWindow.SelectedWaymark);
     }
 
     public void ToggleConfigUi() => ConfigWindow.Toggle();
