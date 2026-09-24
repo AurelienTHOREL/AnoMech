@@ -60,13 +60,17 @@ public sealed class RunningSimWindow : Window
         if (inSession)
             plugin.MultiplayerWindow.DrawLeaveSessionButton();
 
+#if DEBUG
         // The only window on screen mid-scenario, so the test bench has to be reachable here.
         ImGui.Separator();
         TimelineDebug.DrawControls();
+#endif
         if (inSession)
         {
             DrawRoster();
+#if DEBUG
             DrawRelayUsage();
+#endif
         }
     }
 
@@ -94,6 +98,7 @@ public sealed class RunningSimWindow : Window
         }
     }
 
+#if DEBUG
     // What this client is spending against the relay's per-connection caps, plus the traffic
     // either way. Debug readout: the relay enforces these, the plugin only reports them.
     private void DrawRelayUsage()
@@ -159,4 +164,5 @@ public sealed class RunningSimWindow : Window
         => value >= 1024 * 1024 ? $"{value / (1024f * 1024f):F2} MB"
             : value >= 1024 ? $"{value / 1024f:F1} KB"
             : $"{value} B";
+#endif
 }

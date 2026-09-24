@@ -28,6 +28,7 @@ public sealed class UmadP5FloodSettingsWindow
     private static readonly string[] QuadrantLabels = ["Random", "North", "East", "South", "West"];
     private static readonly string[] RotationLabels = ["Random", "Clockwise", "Counter-clockwise"];
 
+#if DEBUG
     // Index-aligned with FloodCarrierMode.
     private static readonly string[] CarrierLabels =
         ["Chaos, draw hidden", "Chaos, model hidden", "Chaos, visible", "Empty human (480)", "Real packet (9020)"];
@@ -35,6 +36,7 @@ public sealed class UmadP5FloodSettingsWindow
     // Index-aligned with FloodWaveDelivery.
     private static readonly string[] DeliveryLabels =
         ["Native effect", "Raw packet replay", "Effect + loop hold", "Effect + base hold", "Direct timeline"];
+#endif
 
     public void Draw()
     {
@@ -85,6 +87,7 @@ public sealed class UmadP5FloodSettingsWindow
             if (ImGui.Combo("##rotationdir", ref rotIdx, RotationLabels, RotationLabels.Length))
                 Overrides.RotationClockwise = rotIdx switch { 1 => true, 2 => false, _ => null };
 
+#if DEBUG
             SettingsGrid.Row("Wave carrier (debug):");
             var carrierIdx = (int)Overrides.CarrierMode;
             SettingsGrid.ItemWidth(160);
@@ -118,6 +121,7 @@ public sealed class UmadP5FloodSettingsWindow
             if (ImGui.Checkbox("Trace every VFX create and destroy##vfxrenderlog", ref vfxLog)) Overrides.VfxRenderLog = vfxLog;
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Hooks a game destructor that runs for every VFX in the world. Only for investigating what did or didn't render.");
+#endif
 
             SettingsGrid.End();
         }

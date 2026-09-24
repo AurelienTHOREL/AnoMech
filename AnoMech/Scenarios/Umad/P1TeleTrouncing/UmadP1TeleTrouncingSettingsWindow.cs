@@ -8,10 +8,12 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
 {
     public UmadP1TeleTrouncingStateOverrides Overrides { get; } = new();
 
+#if DEBUG
     // Index-aligned with PropBeatMode, ArrowSoakMode and CarryMode.
     private static readonly string[] BeatModeLabels = ["ActorControl 413", "PlayAnimation", "SetSharedTimelineState"];
     private static readonly string[] SoakModeLabels = ["ActorControl 106", "SetSharedTimelineState", "Despawn"];
     private static readonly string[] CarryModeLabels = ["ActorControl 241", "ActorControl 241, self-targeted", "Sim slide"];
+#endif
 
     // fireAppear/fireWindUp: fire the statue beats right now (null while no run is active), so
     // the props can be exercised without waiting out the timeline each time.
@@ -28,14 +30,17 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
             TriStateRow("Thunder orb:", "thunlie", "Lie", "Truth", Overrides.ThunderIsLie, v => Overrides.ThunderIsLie = v);
             TriStateRow("Thunder flip:", "thunflip", "Flipped", "Normal", Overrides.ThunderOrientationFlipped, v => Overrides.ThunderOrientationFlipped = v);
             DrawThunderOffset();
+#if DEBUG
             DrawPropKnobs();
             DrawPropBeatRow(fireAppear, fireWindUp);
             DrawArrowRows();
             DrawHazeRow();
+#endif
             SettingsGrid.End();
         }
     }
 
+#if DEBUG
     private void DrawPropBeatRow(Action? fireAppear, Action? fireWindUp)
     {
         SettingsGrid.Row("Statue beats (debug):");
@@ -64,6 +69,7 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
         if (ImGui.Combo("##arrowcarry", ref carryIdx, CarryModeLabels, CarryModeLabels.Length))
             Overrides.ArrowCarry = (AnoMech.Core.Native.CarryMode)carryIdx;
     }
+#endif
 
     private void ResetAll()
     {
@@ -84,6 +90,7 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
         UmadZone.SuppressP1Scenery = false;
     }
 
+#if DEBUG
     private void DrawHazeRow()
     {
         SettingsGrid.Row("Zone (debug):");
@@ -106,6 +113,7 @@ public sealed class UmadP1TeleTrouncingSettingsWindow
         var direct = Overrides.PropsStaticVfxTest;
         if (ImGui.Checkbox("Direct VFX test##propvfx", ref direct)) Overrides.PropsStaticVfxTest = direct;
     }
+#endif
 
     private void DrawDifferentArrows()
     {

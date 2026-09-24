@@ -481,8 +481,7 @@ internal sealed unsafe class DebugMenu
         ImGui.TextUnformatted("Weather lab (sky-tint only -- writes EnvManager.ActiveWeather, never WeatherManager)");
         ImGui.Separator();
         ImGui.TextWrapped("This zone's own catalog (read live from EnvScene._weatherIds): 2 Fair Skies, "
-            + "77/78/79/89/174/175/176 all \"Dimensional Disruption\". One click each -- compare against the "
-            + "real fight and tell Claude which (if any) is right, or type any other id below to try it anyway.");
+            + "77/78/79/89/174/175/176 all \"Dimensional Disruption\". One click each, or type any other id below.");
         foreach (var id in (ReadOnlySpan<byte>)[2, 77, 78, 79, 89, 174, 175, 176])
         {
             if (ImGui.Button($"{id}##weatherquick")) plugin.Game.World.SetWeather(id);
