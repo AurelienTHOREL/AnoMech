@@ -64,6 +64,12 @@ public sealed class Game : IDisposable
     // Set by Game.Kill once the post-first-death freeze timer fires. While true,
     // Tick is a no-op so scenario events, scheduler, and world all stop.
     public bool Paused { get; set; }
+    public bool IsScenarioActive => activeScenario is not null;
+    public bool HasScenarioMistake => lastMistakeElapsed is not null;
+    public bool HasScenarioFailed => deathOccurredThisRun;
+    public bool HasScenarioSucceeded => mechanicResultReported
+        && !deathOccurredThisRun
+        && lastMistakeElapsed is null;
 
     // When true, Game.Kill still posts the chat line for learning but skips every
     // gameplay side effect (HP=0, KO timeline, stun hooks, freeze timer).
@@ -90,6 +96,15 @@ public sealed class Game : IDisposable
     private const float MechanicResultSettleSeconds = 1f;
     private float? scenarioFinishedElapsed;
     private bool mechanicResultReported;
+
+    // Bardam's Mettle's Success/Failure marks (Checkmark/X).
+    private const string MechanicSuccessVfx = "vfx/monster/gimmick2/eff/e3d2_b2_g04t0x.avfx";
+    private const string MechanicFailureVfx = "vfx/monster/gimmick2/eff/e3d2_b2_g05t0x.avfx";
+
+    // When the last mistake was marked, null while the run is still clean. Godmode deaths return
+    // before deathOccurredThisRun is set, so this is the only mistake signal spanning both modes.
+    private const float MistakeMarkCooldownSeconds = 1f;
+    private float? lastMistakeElapsed;
 
     // Set by Kill on any real death, scoped to the current run (cleared by ResetInternal).
     // IsFinished can go true on a queue that Kill's own freeze-timer event never touches
@@ -460,7 +475,12 @@ public sealed class Game : IDisposable
         if (scenarioFinishedElapsed < MechanicResultSettleSeconds) return;
         mechanicResultReported = true;
         if (deathOccurredThisRun) return;
-        MechanicStreak++;
+        if (lastMistakeElapsed is null)
+        {
+            MechanicStreak++;
+            if (Plugin.Config.EnableMechanicResultMarks)
+                World.Party.Player?.AddVfx(MechanicSuccessVfx, persistent: false);
+        }
         if (AutoRestart && lastRun is { } p)
             RunScenario(p);
     }
@@ -498,6 +518,14 @@ public sealed class Game : IDisposable
         {
             firstDeathScheduled = true;
             ShowFirstDeathOverlay(target, cause);
+        }
+        // Above the godmode return so every swallowed mistake marks.
+        // Prevent Mark stacking by enforcing a cooldown.
+        if (lastMistakeElapsed is not { } last || scenarioElapsed - last > MistakeMarkCooldownSeconds)
+        {
+            lastMistakeElapsed = scenarioElapsed;
+            if (Plugin.Config.EnableMechanicResultMarks)
+                World.Party.Player?.AddVfx(MechanicFailureVfx, persistent: false);
         }
 
         if (GodMode)
@@ -625,6 +653,7 @@ public sealed class Game : IDisposable
         scenarioFinishedElapsed = null;
         mechanicResultReported = false;
         deathOccurredThisRun = false;
+        lastMistakeElapsed = null;
 #if DEBUG
         periodicDumpTimer = 0f;
         AnoMech.Windows.DamageDebugWindow.Instance?.ResetFreeze();

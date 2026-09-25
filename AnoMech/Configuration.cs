@@ -9,10 +9,14 @@ public class Configuration : IPluginConfiguration
 {
     public int Version { get; set; } = 0;
 
+    
     public bool OpenSimMenuOnInn { get; set; } = true;
     public bool OpenSimMenuOnSupportedInstanceSolo { get; set; } = false;
     public bool EnableEventLogging { get; set; } = false;
     public bool SuppressBgm { get; set; } = true;
+    public bool EnableMechanicResultMarks { get; set; } = false;
+    public bool AutoCollapseWhileRunning { get; set; } = false;
+    public string LastSelectedScenario { get; set; } = "";
 
     // Multiplayer relay address (see Relay/README.md) -- remembered across
     // sessions so the user only has to type it once.

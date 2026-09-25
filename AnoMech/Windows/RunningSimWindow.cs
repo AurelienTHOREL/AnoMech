@@ -36,16 +36,15 @@ public sealed class RunningSimWindow : Window
 
         // ActiveScenario is never set for a peer; Paused clears neither signal.
         var scenarioActive = inSession ? mp.IsRunning : plugin.Game.ActiveScenario != null;
-        var running = scenarioActive && !plugin.Game.Paused;
-        ImGui.TextColored(
-            running ? new Vector4(0.4f, 0.9f, 0.4f, 1f) : new Vector4(1f, 0.4f, 0.4f, 1f),
-            running ? "Running sim" : "Sim paused, wiped, reset, or leave");
+        MainWindow.DrawStatus(plugin.Game.Paused, scenarioActive);
 
         if (inSession)
         {
             if (!mp.Session.Started)
             {
+                MainWindow.PushSemanticColors(MainWindow.StartColor);
                 plugin.MultiplayerWindow.DrawStartButton();
+                MainWindow.PopSemanticColors();
                 ImGui.SameLine();
             }
         }
@@ -55,10 +54,14 @@ public sealed class RunningSimWindow : Window
             ImGui.SameLine();
         }
 
-        Plugin.MainWindow.DrawResetLeaveButtons();
+        Plugin.MainWindow.DrawStopLeaveButtons();
 
         if (inSession)
+        {
+            MainWindow.PushSemanticColors(MainWindow.StopColor);
             plugin.MultiplayerWindow.DrawLeaveSessionButton();
+            MainWindow.PopSemanticColors();
+        }
 
 #if DEBUG
         // The only window on screen mid-scenario, so the test bench has to be reachable here.

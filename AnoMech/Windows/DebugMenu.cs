@@ -57,6 +57,7 @@ internal sealed unsafe class DebugMenu
     private string debugCastActionIdText = "0";
     private string debugCastAnimVariationText = "0";
     private string debugLockonIdText = "0";
+    private string debugVfxPathText = "vfx/lockon/eff/lockon_en_01v.avfx";
     private string debugStatusIdText = "0";
     private string debugStatusDurationText = "0";
     private string debugStatusStacksText = "1";
@@ -342,6 +343,14 @@ internal sealed unsafe class DebugMenu
                 AttachLockonOnTarget(lockonId);
             else Plugin.Log.Warning($"Lockon: can't parse LockonId '{debugLockonIdText}'");
         }
+
+        ImGui.Spacing();
+        ImGui.TextUnformatted("Spawn VFX path on target");
+        ImGui.Separator();
+        ImGui.SetNextItemWidth(320 * uiScale);
+        ImGui.InputText("VfxPath", ref debugVfxPathText, 256);
+        if (ImGui.Button("Spawn VFX on target"))
+            SpawnVfxOnTarget(debugVfxPathText);
 
         ImGui.Spacing();
         ImGui.TextUnformatted("Set ModelState on target");
@@ -630,6 +639,44 @@ internal sealed unsafe class DebugMenu
         }
         chara.AttachLockonVfx(lockonId, persistent: false);
         Plugin.Log.Info($"Lockon: attached {lockonId} ({iconName}) on '{target.Name}'");
+    }
+
+    // Attaches a raw VFX path to the targeted sim character — enemy doppel, party doppel, or
+    // the player if self-targeted — falling back to the player when nothing tracked is targeted,
+    // since testing a mark on yourself is the common case. Fire-and-forget (persistent: false):
+    // the game owns the VFX lifetime, the sim doesn't track or remove it.
+    private void SpawnVfxOnTarget(string path)
+    {
+        path = path.Trim();
+        if (path.Length == 0)
+        {
+            Plugin.Log.Warning("Spawn VFX: empty path");
+            return;
+        }
+        if (!VfxFunctions.VfxPathExists(path)) return;
+
+        SimCharacter? chara = null;
+        var who = "player";
+        var target = Plugin.TargetManager.Target;
+        if (target != null)
+        {
+            chara = ResolveSimCharacter(target.GameObjectId);
+            if (chara != null) who = target.Name.ToString();
+        }
+        chara ??= plugin.Game.World.Party.Player;
+        if (chara == null)
+        {
+            Plugin.Log.Warning("Spawn VFX: no tracked target and no player; start a scenario first");
+            return;
+        }
+        if (!chara.IsActive)
+        {
+            Plugin.Log.Warning($"Spawn VFX: '{who}' is not active");
+            return;
+        }
+
+        chara.AddVfx(path, persistent: false);
+        Plugin.Log.Info($"Spawn VFX: '{path}' on '{who}'");
     }
 
     private void SetModelStateOnTarget(byte value)

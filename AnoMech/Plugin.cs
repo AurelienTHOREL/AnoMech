@@ -93,6 +93,7 @@ public sealed class Plugin : IDalamudPlugin
 
             WindowSystem.AddWindow(ConfigWindow);
             WindowSystem.AddWindow(MainWindow);
+            WindowSystem.AddWindow(MainWindow.ScenarioPanel);
             WindowSystem.AddWindow(MultiplayerWindow);
             WindowSystem.AddWindow(RunningSimWindow);
 #if DEBUG

@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using AnoMech.Core.Game.Party;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 
 namespace AnoMech.Scenarios;
 
@@ -16,7 +17,7 @@ internal static class SettingsGrid
     // Widths of the panels' combos, scaled down inside the lobby's compact settings section.
     public static float WidthScale = 1f;
 
-    public static void ItemWidth(float width) => ImGui.SetNextItemWidth(width * WidthScale);
+    public static void ItemWidth(float width) => ImGui.SetNextItemWidth(width * WidthScale * ImGuiHelpers.GlobalScale);
 
     private static readonly string[] RoleLabels = ["MT", "OT", "H1", "H2", "M1", "M2", "R1", "R2"];
 
